@@ -214,8 +214,13 @@ class Database:
         open and are no longer reported are closed as machine-resolved; unknowns already
         closed by a human or marked undeterminable are never reopened by a machine report.
         """
-        items = list(items)
-        subjects = {item["subject"] for item in items}
+        unique: dict[str, dict] = {}
+        for item in items:  # one row per subject (the table's key): of two reports the more severe is kept
+            known = unique.get(item["subject"])
+            if known is None or float(item.get("severity", 1.0)) > float(known.get("severity", 1.0)):
+                unique[item["subject"]] = item
+        items = list(unique.values())
+        subjects = set(unique)
         opened = closed = kept = 0
         with self.transaction() as connection:
             existing = {row["subject"]: row for row in connection.execute(

@@ -403,3 +403,13 @@ def test_timeline_expects_the_lap_a_stage_asked_for(env):
 
 def test_timeline_of_a_workspace_without_rounds(env):
     assert env.engine.timeline() == {"round": None, "steps": [], "expected": [], "history": []}
+
+
+def test_two_reports_of_one_subject_are_one_unknown(env):
+    """The ledger has one row per (kind, subject): a stage that reports a subject twice must not crash the round."""
+    env.harness.behavior["solve"] = lambda context: StageResult(unknowns={"association": [
+        {"subject": "a", "severity": 1.0, "detail": {"n": 1}}, {"subject": "a", "severity": 3.0, "detail": {"n": 2}}]})
+    summary = env.engine.advance()
+    assert summary["stopped"] is None and states(env)["solve"] == "done"
+    rows = env.db.unknowns(kind="association")
+    assert len(rows) == 1 and rows[0]["severity"] == 3.0

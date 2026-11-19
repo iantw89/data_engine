@@ -181,9 +181,14 @@ class Engine:
             message = f"Stage {stage.name} reported unknown kinds it does not own: {foreign}"
             self.db.finish_stage(run_id, "failed", message=message)
             raise RuntimeError(message)
-        for kind, items in result.unknowns.items():
-            change = self.db.report_unknowns(stage.name, kind, items, round_number)
-            context.log(f"unknowns[{kind}]: {len(items)} open (+{change['opened']} / -{change['closed']})")
+        try:
+            for kind, items in result.unknowns.items():
+                change = self.db.report_unknowns(stage.name, kind, items, round_number)
+                context.log(f"unknowns[{kind}]: {len(items)} open (+{change['opened']} / -{change['closed']})")
+        except Exception as exc:  # the stage ran but its report could not be stored: failed, not left running
+            self.db.finish_stage(run_id, "failed", message=f"could not record unknowns: {type(exc).__name__}: {exc}")
+            context.log(f"failed while recording unknowns: {type(exc).__name__}: {exc}; " + traceback.format_exc(), level="error")
+            return StageResult(status="failed", message=f"could not record unknowns: {exc}")
         manifest = self.workspace.write_manifest(
             stage.name, round_number, status=result.status,
             config={section: RECIPE[section] for section in stage.recipe}, inputs=result.inputs,

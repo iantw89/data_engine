@@ -52,7 +52,7 @@ def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: C
                               same_rows=constraints.same, embed=embed)
     (context.workspace.round_dir(context.round) / "swap_check.json").write_text(
         json.dumps(result, indent=1), encoding="utf-8")
-    unknowns = []
+    unknowns, subjects = [], set()
     for entry in result["entries"]:
         if entry["status"] == "verified" or not entry.get("reference_keys") or not entry.get("after_a_keys"):
             continue
@@ -73,8 +73,17 @@ def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: C
             "cues for a swap: " + ", ".join(entry["swap_cues"]) if entry["swap_cues"] else "",
             "cues against: " + ", ".join(entry["stay_cues"]) if entry["stay_cues"] else "",
             "" if entry["swap_cues"] or entry["stay_cues"] else "no independent cue could decide"]))
+        # The subject is the identity's reference detection before the moment. One identity can meet two
+        # others within the same seconds: those are separate questions, told apart by the other party.
+        subject = f"identity_swap:{entry['reference_keys'][0]}"
+        if subject in subjects:
+            other = (entry.get("before_b_keys") or entry.get("after_b_keys") or [f"identity {entry['b']}"])[0]
+            subject = f"{subject}|{other}"
+        if subject in subjects:
+            continue  # the same pair at the same reference twice: one question
+        subjects.add(subject)
         unknowns.append({
-            "subject": f"identity_swap:{entry['reference_keys'][0]}",
+            "subject": subject,
             # exchanges and flagged crossings first, then the closest unverified ones
             "severity": float({"flagged": 2000, "unverified": 1000}[entry["status"]]
                               + 500 * max(0.0, 1.0 - (entry["min_distance_m"] or 0.0))),
