@@ -351,6 +351,15 @@ the next round usually resolves many remaining unknowns by itself.
   1,108 recovered): the gain there is consolidation and purity, not coverage. Autofit is
   cheap here (2.5 min golden, 13 min per felix hour, CPU); the cost of a lap is the solve
   and recovery that follow, hence the conditions in `RECIPE["autofit_refresh"]`.
+* **2026-11-19 - the lap on the felix hour; share threshold 0.1% -> 0.5%.** Lap 1: 83,262
+  new detections (5.9% of Autofit's input), Autofit track ids 550 -> 394, identities
+  317 -> 270, identity-link questions 226 -> 193, about an hour (Autofit 12 min, solve
+  11, recovery 40). Lap 2: 4,172 new detections (0.28%), Autofit track ids unchanged,
+  identities 270 -> 279, identity-link 193 -> 197, 66 min. The rule had let lap 2 run
+  because lap 1 paid; it could only have been stopped by its size. `min_new_share` is now
+  0.5%: it keeps golden's lap (0.7%) and felix lap 1 and drops felix lap 2. Positions
+  barely move in any lap (felix 408,991 -> 408,748 in total); the lap buys consolidation.
+  Table in `experiments/coverage/REPORT.md` section 9.
 * **2026-11-19 - hand-offs singled out by the 2D trackers.** 38 track endings on the felix
   hour had another track born at the same spot within a few frames - one person tracked
   twice - that neither the hand-off merge nor identity linking joined: in a crowd the

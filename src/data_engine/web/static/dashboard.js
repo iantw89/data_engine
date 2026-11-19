@@ -170,18 +170,27 @@ function timeline(s) {
   const runningStep = t.steps.find((x) => x.status === 'running');
   const processAlive = s.run.running || !!runningStep;
   const all = [...t.steps, ...(active ? t.expected.map((x) => ({ ...x, status: 'expected' })) : [])];
-  const laps = [...new Set(all.map((x) => x.lap))].sort((a, b) => a - b);
+  const inRound = all.filter((x) => !x.after_round);
+  const afterRound = all.filter((x) => x.after_round);
+  const laps = [...new Set(inRound.map((x) => x.lap))].sort((a, b) => a - b);
   const state = !active ? `finished ${fmtTime(t.finished)}, took ${fmtDuration(t.finished - t.started)}`
     : processAlive ? `running for ${fmtDuration(Date.now() / 1000 - t.started)}`
       : 'not finished and nothing is running (interrupted) - run the round again to continue';
-  const now = runningStep ? `Now: ${runningStep.title}${runningStep.lap ? ` (lap ${runningStep.lap})` : ''}.`
+  const now = runningStep
+    ? (runningStep.after_round ? `Now: ${runningStep.title}, started on its own after the round finished - not a new round.`
+      : `Now: ${runningStep.title}${runningStep.lap ? ` (lap ${runningStep.lap})` : ''}.`)
     : active ? '' : 'Nothing is running now.';
   const next = active && t.expected.length ? ` Then: ${t.expected.map((x) => x.title).join(', ')}.` : '';
   const mayLap = active && all.some((x) => x.stage === 'recover' && x.status !== 'done')
     ? ' The coverage recovery decides at its end whether another lap is worth it, so the list can grow.' : '';
   const rows = laps.map((lap) => h('div', { class: 'lap-row' },
     h('div', { class: 'lap-label' }, lapName(lap), lap ? h('div', { class: 'muted small' }, 'repeat within the round') : null),
-    h('div', { class: 'lap-steps' }, all.filter((x) => x.lap === lap).flatMap((x, i) => [i ? h('span', { class: 'arrow', 'aria-hidden': 'true' }) : null, stepChip(x)]))));
+    h('div', { class: 'lap-steps' }, inRound.filter((x) => x.lap === lap).flatMap((x, i) => [i ? h('span', { class: 'arrow', 'aria-hidden': 'true' }) : null, stepChip(x)]))));
+  if (afterRound.length) {
+    rows.push(h('div', { class: 'lap-row' },
+      h('div', { class: 'lap-label' }, 'After the round', h('div', { class: 'muted small' }, 'run on its own')),
+      h('div', { class: 'lap-steps' }, afterRound.flatMap((x, i) => [i ? h('span', { class: 'arrow', 'aria-hidden': 'true' }) : null, stepChip(x)]))));
+  }
   return h('div', {},
     header(`${active ? 'This round' : 'Last round'}: round ${t.round}`, `${t.trigger} - started ${fmtTime(t.started)} - ${state}`),
     terms,
@@ -195,8 +204,9 @@ function roundHistory(s) {
   const sequence = (r) => {
     const parts = [];
     let lap = 0;
+    let after = false;
     r.steps.forEach((x, i) => {
-      if (x.lap !== lap) { lap = x.lap; parts.push(h('span', { class: 'lap-sep' }, ` | lap ${lap}: `)); } else if (i) parts.push(' \u2192 ');
+      if (x.after_round && !after) { after = true; parts.push(h('span', { class: 'lap-sep' }, ' | after the round: ')); } else if (!x.after_round && x.lap !== lap) { lap = x.lap; parts.push(h('span', { class: 'lap-sep' }, ` | lap ${lap}: `)); } else if (i) parts.push(' \u2192 ');
       parts.push(h('span', { class: `seq sp-${x.status}` }, `${x.title}${x.duration_s !== null && x.duration_s !== undefined ? ` ${fmtDuration(x.duration_s)}` : ''}`));
     });
     return parts.length ? parts : h('span', { class: 'muted' }, 'nothing needed to run');
@@ -208,7 +218,7 @@ function roundHistory(s) {
         h('tbody', {}, history.map((r) => h('tr', {},
           h('td', {}, h('strong', {}, r.round), h('div', { class: 'muted small' }, r.trigger)),
           h('td', {}, fmtTime(r.started)),
-          h('td', {}, r.duration_s !== null && r.duration_s !== undefined ? fmtDuration(r.duration_s) : 'not finished'),
+          h('td', {}, r.duration_s !== null && r.duration_s !== undefined ? fmtDuration(r.duration_s) : 'interrupted'),
           h('td', { class: 'small' }, sequence(r), r.stopped ? h('div', { class: 'warn-text' }, `stopped: ${r.stopped}`) : null),
           h('td', { class: 'num' }, r.open_total ?? '-'))))))) : null);
 }

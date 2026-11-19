@@ -1,6 +1,7 @@
 """State machine tests with a small fake stage registry (no real stage runs)."""
 
 import sys
+import time
 import types
 
 import pytest
@@ -399,6 +400,22 @@ def test_timeline_expects_the_lap_a_stage_asked_for(env):
     timeline = env.engine.timeline()
     assert timeline["lap_requested"] == ["detect"]
     assert [(item["stage"], item["lap"]) for item in timeline["expected"]][:2] == [("detect", 1), ("solve", 1)]
+
+
+def test_a_stage_run_on_its_own_after_the_round_is_not_a_lap_of_it(env):
+    """`data-engine publish` after a round is recorded under that round; the timeline says it came after."""
+    env.engine.advance()
+    time.sleep(0.05)  # stages take no time here; the clock has to move past the round's end
+
+    def publish(context):
+        time.sleep(0.05)
+        return StageResult()
+    env.harness.behavior["publish"] = publish
+    env.engine.run_stage(engine_module.STAGE["publish"], env.db.current_round())
+    timeline = env.engine.timeline()
+    assert [step["stage"] for step in timeline["steps"] if step["after_round"]] == ["publish"]
+    assert timeline["laps"] == 0 and timeline["history"][-1]["steps"][-1]["after_round"]
+    assert not any(step["after_round"] for step in timeline["steps"][:-1])
 
 
 def test_timeline_of_a_workspace_without_rounds(env):

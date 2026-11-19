@@ -103,7 +103,9 @@ STAGES: list[Stage] = [
     Stage("recover", "Coverage recovery",
           "Read poses where tracked people must be (guided ViTPose crops) and triangulate them: fills gaps "
           "left by detector misses without interpolating.",
-          "recover", requires=("solve",), recipe=("coverage", "geometry", "autofit_refresh"), every_round=True),
+          # RECIPE["autofit_refresh"] is not an input: it decides about a lap after the recovery and changes no
+          # recovered position, so tuning it must not make an hour of recovery out of date.
+          "recover", requires=("solve",), recipe=("coverage", "geometry"), every_round=True),
     Stage("tasks", "Human tasks", "Turn the remaining unknowns into the smallest set of human questions.",
           "tasks", requires=("solve",), every_round=True),
     Stage("publish", "Publish", "Publish alignment, 2D tracklets and 3D tracks as data_management label sets.",
@@ -301,10 +303,12 @@ class Engine:
 
     # ------------------------------------------------------------------ what ran when
     @staticmethod
-    def _sequence(runs: list[dict]) -> list[dict]:
+    def _sequence(runs: list[dict], finished: float | None = None) -> list[dict]:
         """Stage runs of one round in the order they ran, each with the lap it belongs to (0 = first pass).
 
-        A round walks the stages in order; when it goes back to an earlier stage, a lap begins."""
+        A round walks the stages in order; when it goes back to an earlier stage, a lap begins. A stage started
+        after the round had finished (one stage run on its own, e.g. the label-set drafts) is recorded under that
+        round but is not part of it: ``after_round``."""
         position = {stage.name: index for index, stage in enumerate(STAGES)}
         steps, lap, previous = [], 0, -1
         for run in runs:
@@ -316,6 +320,9 @@ class Engine:
             steps.append({
                 "stage": run["stage"], "title": stage.title if stage else run["stage"], "status": run["status"],
                 "lap": lap, "started": run["started"], "finished": run["finished"],
+                # the round's own last stage can start and end on the clock tick the round finishes at
+                "after_round": bool(finished is not None and run["started"] >= finished
+                                    and (run["finished"] is None or run["finished"] > finished)),
                 "duration_s": round(run["finished"] - run["started"], 1) if run["finished"] else None,
                 "message": run["message"] or ""})
         return steps
@@ -334,7 +341,7 @@ class Engine:
         for run in self.db.stage_runs():
             by_round.setdefault(run["round"], []).append(run)
         current = rounds[-1]
-        steps = self._sequence(by_round.get(current["round"], []))
+        steps = self._sequence(by_round.get(current["round"], []), current["finished"])
         running = next((step for step in steps if step["status"] == "running"), None)
         if running is not None:
             running["progress"] = self.progress(STAGE[running["stage"]]) if running["stage"] in STAGE else None
@@ -363,18 +370,20 @@ class Engine:
                 expected.append({"stage": name, "title": stage.title, "lap": lap, "reason": reason})
         history = []
         for entry in rounds[-8:]:
-            sequence = self._sequence(by_round.get(entry["round"], []))
+            sequence = self._sequence(by_round.get(entry["round"], []), entry["finished"])
             summary = entry["summary"] or {}
             history.append({
                 "round": entry["round"], "trigger": entry["trigger"], "started": entry["started"],
                 "finished": entry["finished"],
                 "duration_s": round(entry["finished"] - entry["started"], 1) if entry["finished"] else None,
-                "laps": max((step["lap"] for step in sequence), default=0),
-                "steps": [{key: step[key] for key in ("stage", "title", "status", "lap", "duration_s")} for step in sequence],
+                "laps": max((step["lap"] for step in sequence if not step["after_round"]), default=0),
+                "steps": [{key: step[key] for key in ("stage", "title", "status", "lap", "duration_s", "after_round")}
+                          for step in sequence],
                 "answers_applied": summary.get("answers_applied"), "open_total": summary.get("open_total"),
                 "stopped": summary.get("stopped")})
         return {"round": current["round"], "trigger": current["trigger"], "started": current["started"],
-                "finished": current["finished"], "laps": max((step["lap"] for step in steps), default=0),
+                "finished": current["finished"],
+                "laps": max((step["lap"] for step in steps if not step["after_round"]), default=0),
                 "steps": steps, "expected": expected, "history": history,
                 "lap_requested": sorted(self.db.get_meta(RERUN_KEY, []))}
 
@@ -417,7 +426,10 @@ class Engine:
             lap = f", lap {step['lap']}" if step and step["lap"] else ""
             after = [item["title"] for item in timeline["expected"]]
             phase = "running"
-            detail = f"Round {timeline['round']}{lap}: {title} is running" + (f"; then {', '.join(after)}" if after else "")
+            if step and step["after_round"]:
+                detail = f"{title} is running on its own (round {timeline['round']} has finished; this is not a new round)"
+            else:
+                detail = f"Round {timeline['round']}{lap}: {title} is running" + (f"; then {', '.join(after)}" if after else "")
         elif any(v in ("failed", "blocked") for v in states.values()):
             bad = next(s for s in stages if s["status"] in ("failed", "blocked"))
             phase, detail = "blocked", f"{bad['title']}: {bad['message']}"

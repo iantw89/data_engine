@@ -144,7 +144,11 @@ RECIPE: dict[str, Any] = {
         # input) took its track ids per labelled person from 45 to 39 and the solve from 31 to 27
         # identities with fewer impure observations (84 -> 50). A lap costs about a round, so it runs
         # only with enough new detections, and again only while laps keep removing identities.
-        "enabled": True, "min_new_detections": 500, "min_new_share": 0.001, "max_laps_per_round": 2,
+        # min_new_share 0.001 -> 0.005 (2026-11-19, felix): laps with 0.7% (golden) and 5.9% (felix) of
+        # Autofit's input removed 12% and 15% of the identities; a second felix lap with 0.28% (4,172
+        # detections) cost 66 min and changed nothing in its favour (270 -> 279 identities, positions
+        # +0.1%). Three laps are all the evidence for this threshold.
+        "enabled": True, "min_new_detections": 500, "min_new_share": 0.005, "max_laps_per_round": 2,
         "min_gain": 0.02,
     },
     "coverage": {

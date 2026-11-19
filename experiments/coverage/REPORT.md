@@ -104,6 +104,18 @@ Golden: 749 positions in one pass -> 1,125 in 7 passes (931 from three or more c
 person, 9 on another person (2.1%; it was 1.9% for a single pass), 6 low overlap. Missing
 inside tracks 4,561 -> 3,483.
 
+Felix hour: 16,940 positions in the first pass -> 32,411 in 61 passes (29,367 from three or
+more cameras, 3,044 from two); the last pass accepted nothing, the pass limit (400) is only a
+safety bound. Positions 376,580 -> 408,991 (+8.6%); missing inside tracks 49,127 -> 22,645.
+Continuity of the recursive result: recovered root to the same person's adjacent measured
+root 0.07 m at the median, 0.49 m at p99, 0.78 m maximum - the same as for a single pass.
+
+Beyond track ends (felix): 2,431 of the recovered positions lie before a track's first or
+after its last measured position, in 94 extensions; 13 are longer than 5 s, the longest
+38 s. These have a known pose on one side only (see limits in `docs/DESIGN.md`). Nine
+rendered sheets of the five longest (`recovered_sanity.py --pick`) show the same, mostly
+stationary, person throughout.
+
 ## 7. What is still missing, and what would change it (`rejected_impact.py`, golden)
 
 Of the 3,483 instants still missing inside tracks:
@@ -130,6 +142,62 @@ So a yes/no review would add at most about 58% of the gate-rejected instants, on
 per run (a run is consecutive frames of one person). None of it is needed for a track to
 exist or to carry its identity: these are isolated frames inside tracks that already have
 positions around them.
+
+Felix hour, same breakdown (no labels, so no "same person under another identity" figure).
+28,411 instants remain missing inside or next to tracks after the recursion: 7,469 were never
+within reach of a known pose; 20,942 were looked at (15,141 of them inside tracks): 9,053
+gave no consistent pose in two cameras, 1,694 had crops that follow another person, 10,195
+(in 4,180 runs) triangulated but failed the gate:
+
+| Why the gate rejected it (felix) | Instants | Runs |
+|---|---|---|
+| Poor measurement | 4,872 | 2,842 |
+| Measurement fine, proof missing (a yes/no would add them) | 4,129 | 1,877 |
+| Another identity is already measured at that place | 1,194 | 624 |
+
+1,877 yes/no questions for 4,129 frames (1% of the positions) is too much review for what it
+adds; these are not turned into tasks. They are kept in `recover_rejected.npz`.
+
+## 8. Recovered poses and the detections under them (`coinciding_detections.py`, golden)
+
+1,288 recovered camera poses lie on a kept raw detection (box IoU of at least 0.5). 1,043 of
+those detections already belong to the same identity. 206 are unassigned and show the same
+pose (median joint distance at most 5% of the box height): at publication they take the
+track's identity instead of a second detection being written on top of them; where golden
+labels exist the identity is right for 50 of 52. 24 belong to another identity and 9 show a
+different pose: those detections are left as they are and counted; 6 would be adopted by two
+identities and are adopted by neither.
+
+## 9. Recovered poses as detections for Autofit (the lap; `experiments/autofit/augmented.py`)
+
+A recovered pose that does not lie on a kept detection is a detection the detector missed.
+Autofit gets all kept detections plus these (without identities) and tracks the whole
+recording again; the solve and the recovery then run on its new track ids.
+
+| | Golden 10 min | Felix hour, lap 1 | Felix hour, lap 2 |
+|---|---|---|---|
+| New detections for Autofit (share of its input) | 2,240 (0.7%) | 83,262 (5.9%) | 4,172 (0.28%) |
+| Given detections Autofit put on a track (cumulative) | - | 81,181 of 83,262 | 84,917 of 87,434 |
+| Autofit track ids | 45 -> 39 per 17 labelled people | 550 -> 394 | 394 -> 394 |
+| Identities of the solve | 33 -> 29 | 317 -> 270 | 270 -> 279 |
+| Open identity-link questions | 17 -> 15 (bench) | 226 -> 193 | 193 -> 197 |
+| Open association questions | - | 110 -> 105 | 105 -> 108 |
+| Open swap questions | - | 43 -> 49 | 49 -> 35 |
+| Measured positions | 79,558 -> 79,552 | 376,580 -> 376,791 | 376,791 -> 376,917 |
+| Recovered positions | 1,125 -> 1,108 | 32,411 -> 31,549 | 31,549 -> 31,831 |
+| Missing inside tracks after recovery | - | 22,645 -> 21,719 | 21,719 -> 21,474 |
+| Cost (Autofit + solve + recovery) | 2.5 min + solve + recovery | 12 + 11 + 40 min | 12 + 17 + 37 min |
+
+Golden: recovered poses on another golden person 9 of 422 -> 2 of 416 checkable views; bench
+impure observations 84 -> 50. The gain of a lap is fewer, longer identities and fewer
+identity questions, not more positions: totals stay within 0.2%.
+
+The second felix lap did not pay: Autofit's tracks did not change in number and the solve
+came out with 9 more identities, which is within what tracking the hour again changes. The
+decision rule let it run because the first lap had paid and 4,172 detections were above its
+thresholds (500 and 0.1% of Autofit's input); the share threshold is now 0.5%, which keeps
+the golden and first felix laps and drops this one. Three laps are the whole evidence for
+that number. After lap 2 the recovery found 2,299 new detections (0.15%) and declined.
 
 ## Reproduce
 

@@ -61,7 +61,7 @@ def test_saved_detections_belong_to_one_alignment_and_calibration(tmp_path):
 
 
 def decide(**changes):
-    values = {"new": 5000, "fed": 1_000_000, "identities": 300, "history": [], "laps_this_round": 0, "recipe": RULES}
+    values = {"new": 5000, "fed": 200_000, "identities": 300, "history": [], "laps_this_round": 0, "recipe": RULES}
     return autofit_refresh.decide(**{**values, **changes})
 
 
@@ -70,6 +70,14 @@ def test_a_lap_needs_enough_new_detections():
     assert not decide(new=100)["refresh"]  # below the count
     assert not decide(new=600, fed=5_000_000)["refresh"]  # below the share of Autofit's input
     assert "too few" in decide(new=100)["reason"]
+
+
+def test_the_felix_laps():
+    """The laps run on the felix hour: 5.9% of Autofit's input paid off, 0.28% did not and is no longer asked for."""
+    assert decide(new=83_262, fed=1_402_700, identities=321)["refresh"]
+    first = [{"round": 11, "new": 83_262, "identities_before": 321, "identities_after": 273}]
+    answer = decide(new=4_172, fed=1_485_962, identities=273, history=first, laps_this_round=1)
+    assert not answer["refresh"] and "too few" in answer["reason"]
 
 
 def test_laps_per_round_are_limited():
