@@ -112,6 +112,13 @@ RECIPE: dict[str, Any] = {
         # NEW: automatic links need a unique continuation within a short gap and tight radius;
         # candidates offered for human review are searched up to candidate_gap_s.
         "auto_gap_s": 5.0, "auto_speed_mps": 2.0, "auto_radius_m": 0.75, "candidate_gap_s": 120.0,
+        # NEW 2026-11-19: an automatic link never spans more than this, however long the gap. The radius
+        # above grows to 10 m over 5 s; golden only exercised it up to 1.39 m (10 links, all right). On
+        # the felix hour 18 of 115 links spanned more than 2 m, and of the 7 viewed beyond 3.5 m six join
+        # two different people: the earlier person was still there, no longer tracked, and the only track
+        # born within the radius was somebody else's (experiments/coverage/link_sheets.py --measured).
+        # Farther candidates still count as competitors; they are just never accepted automatically.
+        "auto_max_distance_m": 1.5,
         # NEW, adopted 2026-11-18 on the golden bench: someone measured again at the same spot
         # (within 0.4 m) up to 60 s later is the same person if nobody else was measured within
         # 1 m of the spot in between and no other track starts or ends there.
@@ -129,6 +136,10 @@ RECIPE: dict[str, Any] = {
         # twice; a track ending within ending_radius_m of a continuing one is checked one-sided.
         # The survivor must have been measured established_frames in the window before the ending.
         "duplicate_m": 0.3, "ending_radius_m": 0.5, "established_frames": 30,
+        # "use_recovered": True would add the coverage recovery's positions to the measured ones. Evaluated
+        # 2026-11-19 on the felix hour and left off (key absent = off): 19 crossings stop being ambiguous by
+        # continuity, but they were already verified by the cues, and the open questions go 38 -> 42
+        # (experiments/switches/REPORT.md section 3c).
         # A cue says "swap" above flag, "stay" below stay. Units: heading m/s, body within-person
         # sigma, appearance cosine. Body and appearance were fitted on the golden recording
         # (flag = 98th percentile of untouched encounters, stay = 2nd percentile of injected
@@ -157,7 +168,14 @@ RECIPE: dict[str, Any] = {
         # links it could not accept on the measured positions (felix hour: 8), the round takes an identity
         # lap: the solve decides identity again on its kept association (seconds, not minutes), and the
         # recovery looks again only around the tracks that were joined. Laps repeat while they join tracks.
-        "enabled": True, "max_laps_per_round": 6,
+        #
+        # "apply": False (2026-11-19): the eight links this added on the felix hour were viewed
+        # (experiments/coverage/link_sheets.py): two join two different people. In both the earlier person
+        # is still there, no longer tracked, and somebody else's track begins nearby - the rule takes a
+        # unique feasible continuation for the same person. So these links are PROPOSED: the candidate is
+        # shown first in the re-identification question and nothing is joined. With "apply": True they are
+        # joined (the machinery is tested); that needs an independent check of each link first.
+        "enabled": True, "apply": False, "max_laps_per_round": 6,
     },
     "coverage": {
         # NEW 2026-11-18 (solve/coverage.py, experiments/coverage): recover positions inside and next

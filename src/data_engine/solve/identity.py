@@ -87,6 +87,7 @@ def link_components(summaries: list[ComponentSummary | None], recipe: dict, *, T
     reach_speed, slack = temporal["max_speed_mps"], temporal["slack_m"]
     auto_gap, auto_speed, auto_radius = temporal["auto_gap_s"], temporal["auto_speed_mps"], temporal["auto_radius_m"]
     candidate_gap = temporal["candidate_gap_s"]
+    auto_max = float(temporal.get("auto_max_distance_m", float("inf")))
     # "Same spot" rule (off unless same_spot_gap_s > 0): someone measured at a spot, unmeasured
     # for a while, and measured again at that spot is the same person if nobody else was
     # measured near the spot in between and no other track starts or ends there.
@@ -204,6 +205,8 @@ def link_components(summaries: list[ComponentSummary | None], recipe: dict, *, T
             later_label, gap, distance = near[0]
             if len(tight(predecessors.get(later_label, []))) != 1:
                 continue
+            if distance > auto_max:
+                continue  # unique, but too far to take "the only track born nearby" for the same person
             if compatible(earlier_label, later_label):
                 join(earlier_label, later_label)
                 accepted.append({"from": int(earlier_label), "to": int(later_label), "gap_s": round(gap, 2),

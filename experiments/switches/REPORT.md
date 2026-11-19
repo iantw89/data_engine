@@ -88,6 +88,33 @@ The three missed takeovers were injected at moments the check flags on the real 
 track is already inconsistent there, so exchanging the labels makes it look consistent.
 Golden: all 6 moments verified, 0 questions; every injected swap still flagged.
 
+## 3c. Recovered positions in the swap check (2026-11-19): not adopted
+
+The coverage recovery measures positions where the tracker had none, often inside the very
+crossings the check examines. `run_swap_check.py --recovered` adds them to the measured
+positions (felix hour, solution r012 after the Autofit laps, appearance on):
+
+| | measured positions | + 31,831 recovered |
+|---|---|---|
+| Pairs ever within 1 m | 341 | 407 |
+| Duplicate pairs / hand-off overlaps skipped | 20 / 13 | 37 / 29 |
+| Moments (crossing / exchange / ending) | 89 (77 / 6 / 6) | 70 (58 / 4 / 8) |
+| Verified by two independent cues | 51 | 28 |
+| Review questions | 38 (15 flagged, 23 unverified) | 42 (20 flagged, 22 unverified) |
+| Injected swap while apart: flagged | 100 / 100 | 100 / 100 |
+| Injected takeover while apart: flagged or reviewed | 100 / 100 | 99 / 100 |
+| Injected swap at a crossing: verified (missed) | 0 / 77 | 0 / 58 |
+| Injected takeover at a crossing: verified (missed) | 2 / 77 | 3 / 58 |
+
+With positions through the gap, 19 crossings stop being ambiguous by continuity alone. Those
+were crossings the cues already verified, so no question goes away: the open questions go
+from 38 to 42. And a crossing that continuity declares unambiguous is no longer tested by
+the independent cues, while the recovered positions inside it were themselves placed by
+continuity (each is read where the track was expected): that is the weaker test of the two.
+The recovered positions also bring more pairs close together, half of them one person
+tracked twice (duplicates 20 -> 37). `RECIPE["swap_check"]["use_recovered"]` exists and is
+off. The five additional flags were not viewed.
+
 ## 4. Limits
 
 * Injection exchanges labels, so it validates the continuity part and the before/after

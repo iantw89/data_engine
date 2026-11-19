@@ -272,7 +272,12 @@ def identify(scene: Scene, associated: Associated, recipe: dict, constraints: Co
              recovered: dict | None = None, log=print) -> Solved:
     """Identity across gaps. ``recovered``: positions the coverage recovery measured for these components
     (``component``, ``t``, ``root``); they move where and when a track is first and last known, which can make
-    the unique continuation of a track decidable. Links accepted on the measured positions alone are kept."""
+    the unique continuation of a track decidable. Links accepted on the measured positions alone are kept.
+
+    The links only the recovered positions make decidable are applied when ``recipe["relink"]["apply"]`` is
+    set; otherwise they are proposals (``links_proposed_after_recovery`` in the identity event) and the
+    identities are those of the measured positions.
+    """
     association, labels, frames = associated.association, associated.labels, associated.frames
     duplicates, events, timings = associated.duplicates, list(associated.events), dict(associated.timings)
     started = time.time()
@@ -296,11 +301,15 @@ def identify(scene: Scene, associated: Associated, recipe: dict, constraints: Co
         known = frames_with_recovered(frames, recovered, n_labels)
         extended = summarise(known, n_labels)
         measured_links = links
-        links = link_components(extended, recipe, T=scene.T, must_link=must, cannot_link=cannot, frames=known,
-                                keep=[link for link in measured_links.accepted if link.get("source") != "human"])
+        apply = bool(recipe.get("relink", {}).get("apply", False))
+        with_recovered = link_components(
+            extended, recipe, T=scene.T, must_link=must, cannot_link=cannot, frames=known,
+            keep=[link for link in measured_links.accepted if link.get("source") != "human"])
+        if apply:
+            links = with_recovered
         before = {(link["from"], link["to"]) for link in measured_links.accepted}
         added = []
-        for link in links.accepted:
+        for link in with_recovered.accepted:
             if (link["from"], link["to"]) in before:
                 continue
             # how far the recovery moved the two ends this link joins
@@ -320,10 +329,11 @@ def identify(scene: Scene, associated: Associated, recipe: dict, constraints: Co
                       "links_on_measured_positions": len(measured_links.accepted),
                       "open_ends_on_measured_positions": len(measured_links.open_ends),
                       "recovered_positions_used": int(len(known.t) - len(frames.t)),
-                      "links_after_recovery": added})
+                      "links_after_recovery": added if apply else [],
+                      "links_proposed_after_recovery": [] if apply else added})
         log(f"identity with {event['recovered_positions_used']} recovered positions: {len(added)} more links "
-            f"({len(measured_links.accepted)} on measured positions), open ends "
-            f"{len(measured_links.open_ends)} -> {len(links.open_ends)}")
+            f"{'accepted' if apply else 'proposed for review, not applied'} "
+            f"({len(measured_links.accepted)} on measured positions)")
     timings["identity"] = time.time() - started
     events.append(event)
     return Solved(scene, association, labels, frames, summaries, links, links.identity, duplicates, events, timings)

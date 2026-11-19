@@ -6,11 +6,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
+from synthetic_scene import HAVE_CALIBRATION, SceneBuilder, walking
 
 from data_engine.config import RECIPE
 from data_engine.solve import coverage
 from data_engine.solve.identity import link_components, links_between_identities, summarise
-from data_engine.solve.pipeline import frames_with_recovered
+from data_engine.solve.pipeline import frames_with_recovered, solve
 from data_engine.solve.tracks3d import PersonFrames
 from data_engine.stages import recover as recover_stage
 from data_engine.stages import solve as solve_stage
@@ -236,3 +238,44 @@ def test_the_kept_association_is_only_used_for_the_inputs_it_was_made_from(tmp_p
     assert solve_stage.load_state(context, "other inputs") is None
     (tmp_path / "solve_state" / "associated.pkl").write_bytes(b"not a pickle")
     assert solve_stage.load_state(context, "key") is None and "unusable" in messages[-1]
+
+
+# --------------------------------------------------------------------------- applied or proposed (whole solve)
+
+
+@pytest.mark.skipif(not HAVE_CALIBRATION, reason="standard calibration not available")
+def test_links_through_recovered_positions_are_proposed_unless_the_recipe_applies_them():
+    """Someone walks 0.8 m while no camera has them for 11 s: no automatic link on the measured positions."""
+    n = 200
+    sim = SceneBuilder(n, seed=1)
+    person = sim.add_person(walking((-100, -50), (-40, -50), n))
+    sim.see(person, ["0", "1", "2"], 0, 40)
+    sim.see(person, ["0", "1", "2"], 150, n)
+    scene = sim.build()
+    quiet = dict(log=lambda *args: None)
+
+    def label_at(solved, t):
+        camera, row = scene.endpoint(person, "0", t)
+        return int(solved.labels.label[camera][row])
+
+    measured = solve(scene.scene, RECIPE, **quiet)
+    first, second = label_at(measured, 10), label_at(measured, 170)
+    assert first != second and not measured.links.accepted
+    assert measured.identity_of_label[first] != measured.identity_of_label[second]
+
+    t = np.arange(40, 120)  # the recovery followed the walk for 8 s: 3 s and 0.2 m short of the second track
+    hips = sim.persons[person].xyz[t][:, [11, 12]].mean(axis=1)
+    recovered = {"component": np.full(len(t), first), "t": t, "root": hips}
+
+    proposed = solve(scene.scene, {**RECIPE, "relink": {**RECIPE["relink"], "apply": False}}, recovered=recovered, **quiet)
+    event = proposed.log[-1]
+    assert [(link["from"], link["to"]) for link in event["links_proposed_after_recovery"]] == [(first, second)]
+    assert not event["links_after_recovery"] and not proposed.links.accepted
+    assert proposed.identity_of_label[first] != proposed.identity_of_label[second], "proposed, not joined"
+    assert [end["t"] for end in proposed.links.open_ends] == [end["t"] for end in measured.links.open_ends]
+
+    applied = solve(scene.scene, {**RECIPE, "relink": {**RECIPE["relink"], "apply": True}}, recovered=recovered, **quiet)
+    assert applied.identity_of_label[first] == applied.identity_of_label[second] >= 0
+    link = applied.links.accepted[0]
+    assert link["after_recovery"] and link["end_moved_s"] == 8.0 and link["gap_s"] == 3.1
+    assert not applied.log[-1]["links_proposed_after_recovery"]

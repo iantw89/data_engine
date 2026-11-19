@@ -95,7 +95,7 @@ STAGES: list[Stage] = [
     Stage("solve", "3D association and identity",
           "Cross-camera association, 3D tracks, identity across gaps and triangulation, iterated to a fixpoint.",
           "solve", requires=("tracklets", "align", "calibration", "autofit"),
-          recipe=("geometry", "association", "temporal", "refine", "swap_check"),
+          recipe=("geometry", "association", "temporal", "refine", "swap_check", "relink"),
           constraints=("same", "different", "split", "not_person", "duplicate", "undeterminable"),
           owns=("association", "identity_link", "unassigned", "tracklet_purity", "pose_ownership", "coverage",
                 "alignment", "identity_swap"),
@@ -128,7 +128,9 @@ class Engine:
         rows = [(c["id"], c["kind"]) for kind in kinds for c in self.db.constraints(kind)]
         return stable_hash(sorted(rows))
 
-    def input_hash(self, stage: Stage) -> str:
+    def input_hash(self, stage: Stage, sections: tuple[str, ...] | None = None) -> str:
+        """``sections``: hash these recipe sections instead of the stage's own (a stage that keeps an
+        intermediate result uses it to say what that result depends on)."""
         upstream = []
         for name in stage.requires:
             run = self.db.latest_stage_run(name, "done")
@@ -136,7 +138,7 @@ class Engine:
             upstream.append((name, identity))
         dataset = self.workspace.dataset_json
         return stable_hash({
-            "recipe": {section: RECIPE[section] for section in stage.recipe},
+            "recipe": {section: RECIPE[section] for section in (stage.recipe if sections is None else sections)},
             "upstream": upstream,
             # The resolved stream layout is an input of everything indexed by native frame.
             "dataset": file_sha256(dataset) if stage.requires and dataset.is_file() else None,

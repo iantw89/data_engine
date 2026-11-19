@@ -28,7 +28,10 @@ remaining unknowns into tasks and closes the round with a summary. A stage may a
 *lap*: earlier stages run again within the same round because it produced something they
 consume (`StageResult.rerun`). The stage judges whether a lap is worth its cost; the engine
 bounds the laps of a round and keeps an unserved request for the next one. Tasks are built
-once, after the last lap.
+once, after the last lap. The recover stage asks for two kinds of lap: an *Autofit lap*
+(Autofit, the whole solve, the recovery: about an hour per recorded hour) and an *identity
+lap* (the solve decides identity again on its kept association, the recovery continues
+from its previous result: seconds to minutes).
 
 | Stage | Runs | Produces | Owns unknowns |
 |---|---|---|---|
@@ -38,8 +41,8 @@ once, after the last lap.
 | `align` | once, again when calibration geometry changes | `alignment.json` (label payload), `sync_table.npz`, report | `alignment` |
 | `tracklets` | once | post-filter + BoT-SORT + over-split, per camera | - |
 | `autofit` | once; again as a lap when `recover` produced enough detections it has not seen | `evidence/autofit/labels.npz`: Autofit raw track id per detection (CPU; 13 min for the felix hour, 2.5 min for golden's 10 min); input: the kept detections plus `evidence/autofit/extra.npz` (recovered poses) | - |
-| `solve` | every round | `solution.npz`, `tracks3d.npz`, `solve.json`, `alignment_check.json`, `swap_check.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage`, `alignment`, `identity_swap` |
-| `recover` | every round, after `solve` | `tracks3d_recovered.npz` (positions triangulated from poses read at each track's expected place), `recover_rejected.npz`, `recover.json` (incl. the decision about an Autofit lap); crop poses cached in `recovered/` | - |
+| `solve` | every round; again as an identity lap when `recover` measured positions that make more tracks linkable (association reused from `solve_state/`) | `solution.npz`, `tracks3d.npz`, `solve.json`, `alignment_check.json`, `swap_check.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage`, `alignment`, `identity_swap` |
+| `recover` | every round, after `solve` | `tracks3d_recovered.npz` (positions triangulated from poses read at each track's expected place), `recover_rejected.npz`, `recover.json` (incl. the decisions about an Autofit lap and an identity lap); crop poses cached in `recovered/`. After an identity lap it keeps its previous positions and looks again only around the people whose tracks were joined | - |
 | `tasks` | every round | human tasks | - |
 | `publish` | on request | label-set drafts / published sets | - |
 
@@ -138,7 +141,8 @@ the next round usually resolves many remaining unknowns by itself.
    unique in both directions within walking reach, or when the person is measured again at
    the same spot (0.4 m) within 60 s and nobody else was measured within 1 m in between;
    lifetimes that overlap are never linked. Other starts inside the recording are reported
-   with their candidates.
+   with their candidates. Where a track was "last measured" includes the positions of the
+   coverage recovery once they exist (item 12).
 8. **Alignment check** (`solve/alignment_check.py`): per camera and 5-minute block, the
    estimated offset must be the best-agreeing frame shift; blocks that disagree are the only
    alignment unknowns.
@@ -174,6 +178,20 @@ the next round usually resolves many remaining unknowns by itself.
    removed identities, and the round's laps are not used up. The detections accumulate
    across laps (valid for one alignment and calibration), so Autofit's input never
    shrinks.
+12. **Identity lap** (`stages/recover.py: consider_relink`, `pipeline.identify`). The
+   recovery measures positions before a track's first and after its last measured
+   position. Two tracks that were too far apart in time or space for the linking rule of
+   item 6 can then be a unique continuation of each other. After a recovery that does not
+   warrant an Autofit lap, the recover stage runs the linking rule on the identities with
+   and without the recovered positions; if the recovered positions add a link, it asks for
+   an identity lap. The solve then reuses its association (`solve_state/`, valid for the
+   hash of the stage's inputs), adds the recovered positions to the person-frames the
+   identity step summarises, keeps every link it accepted on the measured positions and
+   accepts the new ones under the same rule (`after_recovery` in `solve.json`). The
+   recovery that follows starts from its previous result - positions are tied to
+   components, not identity numbers - and looks again only around the joined people, where
+   the gap between the two tracks is now inside one track and has a known pose on both
+   sides. Laps repeat while they join tracks (`RECIPE["relink"]`).
 7. **Unknowns** (`stages/solve.py`): free pieces with hypotheses → `association`; free
    pieces without → `unassigned` (short ones are grouped into one policy question per
    camera); unexplained starts → `identity_link`; co-located duplicates → `pose_ownership`.
@@ -198,9 +216,11 @@ the next round usually resolves many remaining unknowns by itself.
   linked 3D tracks is planned. One-frame shifts barely change residuals in this scene.
 * Coverage: recovery stops where the frames at the frontier of what is known do not yield
   an accepted pose; poses that triangulate but fail the acceptance gate are recorded
-  (`recover_rejected.npz`) and not shown to a person; recovered positions do not feed back
-  into the next solve (they could let it attach more detections; today only the detection
-  directly under a recovered pose takes the identity, at publication). A track followed
+  (`recover_rejected.npz`) and not shown to a person; recovered positions feed back into
+  identity (item 12) but not into association: they do not let the solve attach more
+  detections (only the detection directly under a recovered pose takes the identity, at
+  publication), and a recovered pose that lies on another identity's detection is counted,
+  not used (`experiments/coverage/REPORT.md` section 10). A track followed
   beyond its end has no measured pose on the far side to anchor it: nothing but frame-to-
   frame continuity and the absence of another measured identity ties a 30 s extension to
   the same person (the nine longest on felix were viewed and are the same person).

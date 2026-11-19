@@ -244,3 +244,19 @@ def test_identity_ids_are_dense_by_first_appearance_and_missing_labels_get_minus
             0: {"t0": 200, "t1": 240, "xy": (-10.0, 5.0)}}
     summaries, links = run(spec, n_labels=5)
     assert list(links.identity[[3, 1, 0]]) == [0, 1, 2] and links.identity[2] == -1 and links.identity[4] == -1
+
+
+def test_a_unique_continuation_far_away_is_a_candidate_not_a_link():
+    """The automatic radius grows with the gap, but 'the only track born nearby' is no proof far from where the
+    earlier track ended: the earlier person may still be there, untracked (felix hour, 2026-11-19)."""
+    def scene(x):
+        return {0: {"t0": 20, "t1": 100, "xy": (0.0, 0.0)}, 1: {"t0": 140, "t1": 220, "xy": (x, 0.0)}}
+    _, near = run(scene(1.4))
+    assert identity_pairs(near) == {(0, 1)}
+    _, far = run(scene(3.0))
+    assert not far.accepted
+    start = next(end for end in far.open_ends if end["component"] == 1 and end["end"] == "start")
+    assert [candidate["component"] for candidate in start["candidates"]] == [0]
+    relaxed = {**RECIPE, "temporal": {**RECIPE["temporal"], "auto_max_distance_m": 10.0}}
+    frames = frames_of(scene(3.0))
+    assert identity_pairs(link_components(summarise(frames, 2), relaxed, T=T)) == {(0, 1)}

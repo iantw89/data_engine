@@ -34,14 +34,16 @@ from ..store import parse_det_key
 from ..workspace import stable_hash
 
 STATE_VERSION = 1  # layout of the kept association; a change makes every kept state unusable
+ASSOCIATION_RECIPE = ("geometry", "association", "refine")  # what associate_and_refine and the alignment check read
 
 
 def association_key(context: Context, step: int) -> str:
     """Hash of everything the association depends on: the stage's inputs as the engine sees them."""
     from ..engine import STAGE, Engine
 
-    return stable_hash({"inputs": Engine(context.workspace).input_hash(STAGE["solve"]), "step": step,
-                        "version": STATE_VERSION})
+    # Only the recipe sections the association reads: a change to the identity or swap-check rules leaves it valid.
+    return stable_hash({"inputs": Engine(context.workspace).input_hash(STAGE["solve"], ASSOCIATION_RECIPE),
+                        "step": step, "version": STATE_VERSION})
 
 
 def load_state(context: Context, key: str):
@@ -448,6 +450,8 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
     for summary in summaries.values():
         identity_size[int(identity[summary.label])] = identity_size.get(int(identity[summary.label]), 0) + summary.detections
     brief = {"count": 0, "detections": 0, "examples": []}
+    # Links only the recovered positions make decidable, not applied (RECIPE["relink"]["apply"]): later component -> link
+    proposed = {link["to"]: link for event in solved.log for link in event.get("links_proposed_after_recovery", [])}
     for end in solved.links.open_ends:
         if end["end"] != "start":
             continue
@@ -470,6 +474,18 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
             if other_keys:
                 candidates.append({"component": int(other.label), "identity": int(identity[other.label]),
                                    "gap_s": option["gap_s"], "distance_m": option["distance_m"], "keys": other_keys})
+        proposal = proposed.get(label)
+        if proposal is not None and proposal["from"] in summaries:
+            other = summaries[proposal["from"]]
+            other_keys = component_keys_at(scene, labels, other.label, other.t_last - 5, count=3, tolerance=40)
+            if other_keys:
+                candidates = [c for c in candidates if c["component"] != other.label]
+                candidates.insert(0, {"component": int(other.label), "identity": int(identity[other.label]),
+                                      "gap_s": proposal["gap_s"], "distance_m": proposal["distance_m"],
+                                      "keys": other_keys, "proposed_after_recovery": True,
+                                      "rule": proposal["source"].split(":")[-1]})
+            else:
+                proposal = None
         unknowns["identity_link"].append({
             "subject": f"identity_link:{keys[0]}", "severity": float(summaries[label].detections),
             "detail": {"component": int(label), "identity": int(identity[label]), "t": int(end["t"]),
@@ -478,7 +494,12 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
                        "why": "this person appears inside the recording; "
                               + ("several earlier people could have reached this spot" if len(end["candidates"]) > 1
                                  else "one earlier person could have reached this spot but not within the automatic gate"
-                                 if end["candidates"] else "nobody tracked earlier could have reached this spot"),
+                                 if end["candidates"] else "nobody tracked earlier could have reached this spot")
+                              + ("; with the positions recovered around both tracks, the first candidate is the only "
+                                 "one that fits (gap and distance are measured from those positions) - proposed, not "
+                                 "applied: such links have joined two people when the earlier person was still "
+                                 "there, untracked" if proposal is not None else ""),
+                       "proposed_after_recovery": proposal is not None,
                        "resolve_by": "a human picks the earlier person, or says it is someone not tracked before"}})
 
     if brief["count"] and "policy:short_identities" not in resolved_keys:
@@ -593,6 +614,7 @@ def run(context: Context) -> StageResult:
     solved = identify(units, associated, RECIPE, constraints, recovered=recovered, log=context.log)
     identity_event = next(event for event in reversed(solved.log) if event.get("step") == "identity")
     after_recovery = identity_event.get("links_after_recovery", [])
+    proposed_links = identity_event.get("links_proposed_after_recovery", [])
     outputs = save_solution(context, solved, {
         "association_reused": state is not None,
         "recovered": {"positions_sha256": recovered["positions_sha256"], "count": recovered["count"]} if recovered else None})
@@ -644,7 +666,7 @@ def run(context: Context) -> StageResult:
                "swap_check": swaps["summary"], "association_reused": state is not None,
                "identity_after_recovery": {
                    "recovered_positions_used": identity_event.get("recovered_positions_used", 0),
-                   "links": len(after_recovery),
+                   "links": len(after_recovery), "links_proposed": len(proposed_links),
                    "open_ends": [identity_event.get("open_ends_on_measured_positions", identity_event["open_ends"]),
                                  identity_event["open_ends"]]},
                "refinement": [{k: v for k, v in e.items() if not isinstance(v, list)} for e in solved.log],
@@ -654,8 +676,10 @@ def run(context: Context) -> StageResult:
                f"in 3D tracks, {coverage['person_frames_with_3d_root']} person-frames with 3D")
     if state is not None:
         message += "; association reused, identity decided again"
-    if recovered:
+    if recovered and RECIPE["relink"].get("apply"):
         message += f"; {len(after_recovery)} tracks linked through recovered positions"
+    elif recovered:
+        message += f"; {len(proposed_links)} links proposed for review through recovered positions"
     return StageResult(metrics=metrics, message=message, outputs=outputs,
                        inputs={"constraints": info["used"], "evidence_step": 2 if long_recording else 1},
                        unknowns=unknowns)

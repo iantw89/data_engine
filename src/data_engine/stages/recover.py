@@ -358,8 +358,9 @@ def consider_relink(context: Context, directory: Path, tracks: dict, arrays: dic
                                            f"{rules['max_laps_per_round']}); the next round will look again", **facts}
     history.append({"round": context.round, "links_expected": len(links)})
     context.db.set_meta(RELINK_KEY, history[-200:])
+    what = "decidable" if rules.get("apply") else "decidable; they will be proposed for review, not applied"
     return {"relink": True, "reason": f"with the recovered positions {len(links)} more track "
-                                      f"{'link is' if len(links) == 1 else 'links are'} decidable", **facts}
+                                      f"{'link is' if len(links) == 1 else 'links are'} {what}", **facts}
 
 
 def run(context: Context) -> StageResult:
