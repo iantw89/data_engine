@@ -18,6 +18,13 @@ Outputs, next to the solution they belong to (``rounds/rNNN``):
     recover.json             counts per pass and per reason
 Poses read from crops are cached in ``recovered/poses_cache.npz`` (keyed by camera, frame and box),
 so a later pass or round only reads what changed.
+
+Two things can follow a recovery, both as a lap of the round (``StageResult.rerun``):
+* enough recovered poses that are detections Autofit has not seen: Autofit, the solve and the recovery
+  run again (``autofit_refresh.py``);
+* otherwise, recovered positions that let the identity rule link tracks it could not link before: the
+  solve decides identity again on its kept association, and this stage then starts from its previous
+  result (``load_seed``) and looks only around the tracks that were joined.
 """
 
 from __future__ import annotations
@@ -34,8 +41,9 @@ from .. import autofit_refresh
 from ..config import RECIPE
 from ..engine import Context, StageResult
 from ..solve import coverage
+from ..solve.identity import links_between_identities
 from ..solve.scene import load_scene
-from ..workspace import file_sha256
+from ..workspace import file_sha256, stable_hash
 from .ingest import WORKERS, log_tail, run_worker
 
 REASONS = ("no pose read in two cameras", "crops follow another person", "no consistent pose in two cameras",
@@ -141,16 +149,102 @@ class CropReader:
             self.dirty = False
 
 
-def save_recovered(directory: Path, scene, arrays: dict, tracks_sha: str) -> int:
+def recipe_signature(model_sha: str) -> str:
+    """What a recovery result depends on besides the positions it started from."""
+    return stable_hash({"coverage": RECIPE["coverage"], "geometry": RECIPE["geometry"], "model": model_sha})
+
+
+def load_rejected(path: Path, identity_of_component: np.ndarray) -> dict:
+    """The still-missing instants of an earlier recovery as ``recover_iteratively`` keeps them, with today's identities."""
+    if not path.is_file():
+        return {}
+    with np.load(path) as data:
+        if "component" not in data.files:
+            return {}
+        stored = {name: data[name] for name in data.files}
+    reasons, out = [str(reason) for reason in stored["reasons"]], {}
+    component = stored["component"].astype(np.int64)
+    known = (component >= 0) & (component < len(identity_of_component))
+    identity = np.where(known, identity_of_component[np.clip(component, 0, len(identity_of_component) - 1)], -1)
+    for index in np.flatnonzero(identity >= 0):
+        record = {"reason": reasons[int(stored["reason"][index])], "hint_kind": int(stored["hint_kind"][index]),
+                  "hint_frames": int(stored["hint_frames"][index])}
+        if np.isfinite(stored["root"][index]).all():
+            record["features"] = {name: float(value) for name, value in zip(FEATURES, stored["features"][index])}
+            record["root"], record["xyz"] = stored["root"][index], stored["xyz"][index]
+            record["failed"] = [part for part in str(stored["failed"][index]).split("; ") if part]
+        if str(stored["tier_tried"][index]):
+            record["tier_tried"] = str(stored["tier_tried"][index])
+        out[(int(identity[index]), int(stored["t"][index]))] = record
+    return out
+
+
+def load_seed(workspace_root: Path, tracks: dict, measured_sha: str, recipe_sha: str, cameras: int) -> dict | None:
+    """The previous recovery, if it can be continued: it started from exactly these measured person-frames,
+    under the same recipe, and today's identities only join identities of then (never split one).
+
+    Returns its arrays with today's identities, its still-missing instants, and ``changed``: the identities
+    that are several identities of then - the only people for whom anything is different now.
+    """
+    found = sorted(glob.glob(str(workspace_root / "rounds" / "*" / "tracks3d_recovered.npz")))
+    if not found:
+        return None
+    path = Path(found[-1])
+    with np.load(path) as data:
+        if "source_measured_sha256" not in data.files or str(data["source_measured_sha256"]) != measured_sha \
+                or str(data["recipe_sha256"]) != recipe_sha:
+            return None
+        old = {name: data[name] for name in data.files}
+    size = int(max(tracks["component"].max(initial=-1), old["source_component_identity"][:, 0].max(initial=-1))) + 1
+    now = np.full(size, -1, np.int64)
+    now[tracks["component"]] = tracks["identity"]
+    joined: dict[int, set[int]] = {}
+    became: dict[int, int] = {}
+    for component, then in old["source_component_identity"]:
+        today = int(now[component])
+        if today < 0 or became.setdefault(int(then), today) != today:
+            return None  # a component lost its identity, or an identity of then is split now
+        joined.setdefault(today, set()).add(int(then))
+    changed = {today for today, parts in joined.items() if len(parts) > 1}
+    component = old["component"].astype(np.int64)
+    identity = np.where(component >= 0, now[np.clip(component, 0, size - 1)], -1)
+    used = ((old["used"][:, None, :] >> np.arange(cameras, dtype=np.uint8)[None, :, None]) & 1).astype(bool)
+    arrays = {"identity": identity, "t": old["t"].astype(np.int64), "xyz": old["xyz"].astype(np.float64), "used": used,
+              "residual": np.where(used, old["residual"][:, None, :].astype(np.float64), np.nan),
+              "root": old["root"].astype(np.float64), "tier": old["tier"], "pass": old["pass"],
+              "hint_kind": old["hint_kind"], "hint_frames": old["hint_frames"],
+              "pose_frame": old["pose_frame"].astype(np.int64), "pose_keypoints": old["pose_keypoints"].astype(np.float64),
+              "pose_box": old["pose_box"].astype(np.float64)}
+    # One position per person and instant: a measured one wins, then the first recovered one.
+    measured = (tracks["identity"] >= 0) & np.isfinite(tracks["root"]).all(axis=1)
+    taken = set(zip(tracks["identity"][measured].tolist(), tracks["t"][measured].tolist()))
+    keep = np.zeros(len(identity), bool)
+    for index, key in enumerate(zip(identity.tolist(), arrays["t"].tolist())):
+        if key[0] >= 0 and key not in taken:
+            taken.add(key)
+            keep[index] = True
+    arrays = {name: values[keep] for name, values in arrays.items()}
+    return {"arrays": arrays, "rejected": load_rejected(path.parent / "recover_rejected.npz", now), "changed": changed,
+            "dropped": int((~keep).sum()), "path": path}
+
+
+def save_recovered(directory: Path, scene, arrays: dict, tracks_sha: str, tracks: dict, signatures: dict) -> int:
     count, cameras = len(arrays["t"]), len(scene.cameras)
     bits = np.zeros((count, 17), np.uint8)
     for camera_index in range(cameras):
         bits |= (arrays["used"][:, camera_index].astype(np.uint8) << camera_index)
     with np.errstate(all="ignore"):
         worst = np.nanmax(np.where(arrays["used"], arrays["residual"], np.nan), axis=1) if count else np.zeros((0, 17))
+    pairs = np.unique(np.stack([tracks["component"], tracks["identity"]], axis=1)[tracks["identity"] >= 0], axis=0)
     np.savez_compressed(
         directory / "tracks3d_recovered.npz",
-        component=np.full(count, -1, np.int32), identity=arrays["identity"].astype(np.int32),
+        # the component of the person's nearest person-frame: ties a position to the association, so that it
+        # survives identities being renumbered or joined
+        component=coverage.nearest_component(tracks["identity"], tracks["t"], tracks["component"],
+                                             arrays["identity"], arrays["t"]).astype(np.int32),
+        source_measured_sha256=np.array(signatures["measured"]), recipe_sha256=np.array(signatures["recipe"]),
+        positions_sha256=np.array(signatures["positions"]), source_component_identity=pairs.astype(np.int32),
+        identity=arrays["identity"].astype(np.int32),
         t=arrays["t"].astype(np.int32), rows=np.full((count, cameras), -1, np.int32),
         xyz=arrays["xyz"].astype(np.float32), used=bits, residual=np.asarray(worst, np.float32),
         root=arrays["root"].astype(np.float32), tier=arrays["tier"], hint_kind=arrays["hint_kind"],
@@ -162,7 +256,7 @@ def save_recovered(directory: Path, scene, arrays: dict, tracks_sha: str) -> int
     return count
 
 
-def save_rejected(directory: Path, rejected: dict) -> dict:
+def save_rejected(directory: Path, rejected: dict, tracks: dict) -> dict:
     """Write the still-missing instants that were looked at; returns counts per reason and per failed condition."""
     keys = sorted(rejected)
     records = [rejected[key] for key in keys]
@@ -178,6 +272,9 @@ def save_rejected(directory: Path, rejected: dict) -> dict:
     np.savez_compressed(
         directory / "recover_rejected.npz",
         identity=np.array([key[0] for key in keys], np.int32), t=np.array([key[1] for key in keys], np.int32),
+        component=coverage.nearest_component(
+            tracks["identity"], tracks["t"], tracks["component"], np.array([key[0] for key in keys], np.int64),
+            np.array([key[1] for key in keys], np.int64)).astype(np.int32),
         reason=np.array([REASONS.index(record["reason"]) for record in records], np.int8), reasons=np.array(REASONS),
         features=features, feature_names=np.array(FEATURES),
         failed=np.array(["; ".join(record.get("failed", [])) for record in records]),
@@ -229,6 +326,42 @@ def consider_autofit_refresh(context: Context, scene, arrays: dict, identities: 
     return decision
 
 
+RELINK_KEY = "relink_history"
+
+
+def consider_relink(context: Context, directory: Path, tracks: dict, arrays: dict, positions_sha: str, total: int) -> dict:
+    """Should the solve decide identity again, now that these positions are known?
+
+    Yes when the solve has not seen exactly these recovered positions and the linking rule, run on today's
+    identities, accepts at least one link with them that it does not accept without them.
+    """
+    rules = RECIPE["relink"]
+    if not rules.get("enabled", True):
+        return {"relink": False, "reason": "disabled in the recipe"}
+    if not len(arrays["t"]):
+        return {"relink": False, "reason": "nothing was recovered"}
+    try:
+        used = json.loads((directory / "solve.json").read_text(encoding="utf-8")).get("recovered") or {}
+    except (OSError, ValueError):
+        used = {}
+    if used.get("positions_sha256") == positions_sha:
+        return {"relink": False, "reason": "the identity step has already used exactly these recovered positions"}
+    history = list(context.db.get_meta(RELINK_KEY, []))
+    laps = sum(1 for lap in history if lap["round"] == context.round)
+    links = links_between_identities(tracks["identity"].astype(np.int64), tracks["t"].astype(np.int64), tracks["rows"],
+                                     tracks["root"], arrays, RECIPE, T=total)
+    facts = {"links_expected": len(links), "links": links[:50], "laps_this_round": laps}
+    if not links:
+        return {"relink": False, "reason": "the recovered positions make no further track linkable", **facts}
+    if laps >= rules["max_laps_per_round"]:
+        return {"relink": False, "reason": f"{laps} identity laps already run in this round (limit "
+                                           f"{rules['max_laps_per_round']}); the next round will look again", **facts}
+    history.append({"round": context.round, "links_expected": len(links)})
+    context.db.set_meta(RELINK_KEY, history[-200:])
+    return {"relink": True, "reason": f"with the recovered positions {len(links)} more track "
+                                      f"{'link is' if len(links) == 1 else 'links are'} decidable", **facts}
+
+
 def run(context: Context) -> StageResult:
     workspace = context.workspace
     site = workspace.site
@@ -242,22 +375,32 @@ def run(context: Context) -> StageResult:
     model_sha = file_sha256(vitpose)
     scene = load_scene(workspace, joint_peak=geometry["joint_peak"], rays=False)
     with np.load(directory / "tracks3d.npz") as data:
-        tracks = {name: data[name] for name in ("identity", "t", "root", "xyz")}
+        tracks = {name: data[name] for name in ("identity", "t", "root", "xyz", "component", "rows")}
     tracks_sha = file_sha256(directory / "tracks3d.npz")
+    signatures = {"measured": coverage.measured_signature(tracks["component"], tracks["t"], tracks["root"]),
+                  "recipe": recipe_signature(model_sha)}
+    seed = load_seed(workspace.root, tracks, signatures["measured"], signatures["recipe"], len(scene.cameras))
+    if seed is not None:
+        context.log(f"the measured positions are those of the previous recovery: its {len(seed['arrays']['t'])} positions "
+                    f"are kept; looking again only around {len(seed['changed'])} people whose tracks were joined since")
     inputs = {"solution": str(directory.relative_to(workspace.root)), "tracks3d_sha256": tracks_sha,
               "vitpose_onnx_sha256": model_sha}
     reader = CropReader(context, [camera.camera for camera in scene.cameras], vitpose, model_sha, recipe["box_margin"])
     started = time.time()
     try:
-        result = coverage.recover_iteratively(scene, tracks["identity"].astype(np.int64), tracks["t"].astype(np.int64),
-                                              tracks["root"], tracks["xyz"], reader, geometry, recipe, log=reader.note)
+        result = coverage.recover_iteratively(
+            scene, tracks["identity"].astype(np.int64), tracks["t"].astype(np.int64), tracks["root"], tracks["xyz"],
+            reader, geometry, recipe, log=reader.note, seed=seed["arrays"] if seed else None,
+            seed_rejected=seed["rejected"] if seed else None, only_identities=seed["changed"] if seed else None)
     except WorkerFailed as exc:
         reader.save()
         return StageResult(status="failed", inputs=inputs, message=str(exc))
     reader.save()
     arrays = result["arrays"]
-    count = save_recovered(directory, scene, arrays, tracks_sha)
-    remaining = save_rejected(directory, result["rejected"])
+    signatures["positions"] = coverage.positions_signature(arrays["t"], arrays["root"])
+    count = save_recovered(directory, scene, arrays, tracks_sha, tracks, signatures)
+    remaining = save_rejected(directory, result["rejected"], tracks)
+    kept = result["seeded"]
     tiers = {name: int((arrays["tier"] == name).sum()) for name in ("A", "B")}
     first_pass = int((arrays["pass"] == 0).sum()) if count else 0
     summary = {"first_plan": result["first_plan"], "passes": result["passes"], "recovered": count,
@@ -267,12 +410,18 @@ def run(context: Context) -> StageResult:
                "missing_inside_tracks_before": result["inside_missing_before"],
                "missing_inside_tracks_after": result["inside_missing_after"],
                "still_missing_after_looking": remaining, "stopped_by_pass_limit": result["stopped_by_pass_limit"],
+               "kept_from_previous_recovery": kept, "recovered_now": count - kept,
+               "people_looked_at_again": len(seed["changed"]) if seed else None,
                "crops_read_now": reader.read_now,
                "worker_seconds": round(reader.worker_seconds, 1), "seconds": round(time.time() - started, 1)}
     solved_identity = tracks["identity"][tracks["identity"] >= 0]
     refresh = consider_autofit_refresh(context, scene, arrays, int(len(np.unique(solved_identity))))
     summary["autofit_refresh"] = refresh
     context.log(("another Autofit lap: " if refresh["refresh"] else "no Autofit lap: ") + refresh["reason"])
+    relink = {"relink": False, "reason": "an Autofit lap comes first"} if refresh["refresh"] else \
+        consider_relink(context, directory, tracks, arrays, signatures["positions"], scene.T)
+    summary["relink"] = relink
+    context.log(("another identity lap: " if relink["relink"] else "no identity lap: ") + relink["reason"])
     (directory / "recover.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     context.log(f"recovered {count} positions in {len(result['passes'])} passes ({tiers['A']} from three or more "
                 f"cameras, {tiers['B']} from two); missing inside tracks {result['inside_missing_before']} -> "
@@ -280,9 +429,11 @@ def run(context: Context) -> StageResult:
     if result["stopped_by_pass_limit"]:
         context.log("recovery stopped at the pass limit while still finding positions (coverage.max_passes)", level="warning")
     relative = str(directory.relative_to(workspace.root)).replace("\\", "/")
+    how = f"{count} positions recovered from pixels in {len(result['passes'])} passes" if seed is None else \
+        (f"{count} positions recovered from pixels: {kept} kept from the previous recovery, {count - kept} new around "
+         f"{len(seed['changed'])} people whose tracks were joined")
     return StageResult(
         metrics=summary, inputs=inputs,
-        message=f"{count} positions recovered from pixels in {len(result['passes'])} passes; missing inside tracks "
-                f"{result['inside_missing_before']} -> {result['inside_missing_after']}",
+        message=f"{how}; missing inside tracks {result['inside_missing_before']} -> {result['inside_missing_after']}",
         outputs={name: f"{relative}/{name}" for name in ("tracks3d_recovered.npz", "recover_rejected.npz", "recover.json")},
-        rerun=("autofit",) if refresh["refresh"] else ())
+        rerun=("autofit",) if refresh["refresh"] else ("solve",) if relink["relink"] else ())

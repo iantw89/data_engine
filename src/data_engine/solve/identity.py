@@ -80,7 +80,9 @@ class Links:
 def link_components(summaries: list[ComponentSummary | None], recipe: dict, *, T: int, fps: float = 10.0,
                     edge_margin: int = 20, must_link: list[tuple[int, int]] = (),
                     cannot_link: list[tuple[int, int]] = (), min_measured: int = 5,
-                    frames: PersonFrames | None = None) -> Links:
+                    frames: PersonFrames | None = None, keep: list[dict] = ()) -> Links:
+    """``keep``: links accepted by an earlier call on less information (records with "from", "to"); they are
+    applied first, with their original record, so that more information only adds links."""
     temporal = recipe["temporal"]
     reach_speed, slack = temporal["max_speed_mps"], temporal["slack_m"]
     auto_gap, auto_speed, auto_radius = temporal["auto_gap_s"], temporal["auto_speed_mps"], temporal["auto_radius_m"]
@@ -138,6 +140,11 @@ def link_components(summaries: list[ComponentSummary | None], recipe: dict, *, T
         if a in eligible_labels and b in eligible_labels and find(a) != find(b):
             join(a, b)
             accepted.append({"from": int(a), "to": int(b), "source": "human"})
+    for link in keep:
+        a, b = int(link["from"]), int(link["to"])
+        if a in eligible_labels and b in eligible_labels and find(a) != find(b):
+            join(a, b)
+            accepted.append(dict(link))
 
     def feasible(earlier: ComponentSummary, later: ComponentSummary) -> tuple[float, float] | None:
         """(gap seconds, distance metres) if ``later`` can be ``earlier`` continued, else None."""
@@ -262,3 +269,38 @@ def link_components(summaries: list[ComponentSummary | None], recipe: dict, *, T
         first_seen.setdefault(int(roots[summary.label]), len(first_seen))
     identity = np.array([first_seen.get(int(r), -1) for r in roots], dtype=np.int32)
     return Links(identity, accepted, open_ends)
+
+
+def links_between_identities(identity: np.ndarray, t: np.ndarray, rows: np.ndarray, root: np.ndarray,
+                             recovered: dict, recipe: dict, *, T: int) -> list[dict]:
+    """Which identities would the linking rule join once the recovered positions are known?
+
+    The rule is run on whole identities (each as one track), with the measured positions and again with the
+    recovered ones added (``recovered``: ``identity``, ``t``, ``root``); returned are the links only the
+    second run accepts, as {"from", "to", "gap_s", "distance_m", "source"} with identity ids. This is the
+    recover stage's cheap test of whether asking the solve to decide identity again can change anything; the
+    solve itself links components and knows the human constraints, so it has the last word.
+    """
+    ids = np.unique(identity[identity >= 0])
+    index = {int(who): position for position, who in enumerate(ids)}
+    use = identity >= 0
+
+    def run(with_recovered: bool) -> set[tuple[int, int]]:
+        label = np.array([index[int(who)] for who in identity[use]], np.int64)
+        times, members, roots = t[use].astype(np.int64), rows[use], root[use].astype(np.float64)
+        if with_recovered:
+            known = np.array([int(who) in index for who in recovered["identity"]], bool)
+            label = np.concatenate([label, np.array([index[int(who)] for who in recovered["identity"][known]], np.int64)])
+            times = np.concatenate([times, recovered["t"][known].astype(np.int64)])
+            members = np.concatenate([members, np.full((int(known.sum()), rows.shape[1]), -1, rows.dtype)])
+            roots = np.concatenate([roots, recovered["root"][known].astype(np.float64)])
+        frames = PersonFrames(label, times, members, np.zeros((0, 17, 3), np.float32), np.zeros((0, 17), np.uint8),
+                              np.zeros((0, 17), np.float32), roots)
+        links = link_components(summarise(frames, len(ids)), recipe, T=T, frames=frames)
+        found.update({(link["from"], link["to"]): link for link in links.accepted})
+        return {(link["from"], link["to"]) for link in links.accepted}
+
+    found: dict[tuple[int, int], dict] = {}
+    before = run(False)
+    after = run(True)
+    return [{**found[pair], "from": int(ids[pair[0]]), "to": int(ids[pair[1]])} for pair in sorted(after - before)]

@@ -151,6 +151,14 @@ RECIPE: dict[str, Any] = {
         "enabled": True, "min_new_detections": 500, "min_new_share": 0.005, "max_laps_per_round": 2,
         "min_gain": 0.02,
     },
+    "relink": {
+        # NEW 2026-11-19 (stages/recover.py, experiments/coverage/links_after_recovery.py): the recovery moves
+        # where and when a track is first and last known. When that makes the linking rule above accept
+        # links it could not accept on the measured positions (felix hour: 8), the round takes an identity
+        # lap: the solve decides identity again on its kept association (seconds, not minutes), and the
+        # recovery looks again only around the tracks that were joined. Laps repeat while they join tracks.
+        "enabled": True, "max_laps_per_round": 6,
+    },
     "coverage": {
         # NEW 2026-11-18 (solve/coverage.py, experiments/coverage): recover positions inside and next
         # to tracks by reading poses where the person must be. A neighbouring measured pose within

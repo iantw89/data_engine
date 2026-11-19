@@ -8,25 +8,101 @@ Outputs (``rounds/rNNN/``):
 
 Unknown subjects are built from detection keys, so they stay stable when tracklets,
 components or identities are renumbered by a later round.
+
+The stage has an expensive part (association and 3D positions) and a cheap one (identity across gaps, the
+swap check, the unknowns). The expensive part is kept in ``solve_state/`` with the hash of everything it
+depends on; when the stage runs again with those inputs unchanged - the lap the recover stage asks for
+after it measured positions beyond track ends - only the cheap part runs, now with the recovered positions.
 """
 
 from __future__ import annotations
 
+import glob
 import json
+import pickle
+import time
 
 import numpy as np
 
 from ..config import RECIPE
 from ..engine import Context, StageResult
+from ..solve import coverage as coverage_module
 from ..solve import recover
-from ..solve.pipeline import Constraints, Solved, coverage_metrics, solve
+from ..solve.pipeline import Associated, Constraints, Solved, associate_and_refine, coverage_metrics, identify, unit_scene
 from ..solve.scene import Scene, load_scene
 from ..store import parse_det_key
+from ..workspace import stable_hash
+
+STATE_VERSION = 1  # layout of the kept association; a change makes every kept state unusable
+
+
+def association_key(context: Context, step: int) -> str:
+    """Hash of everything the association depends on: the stage's inputs as the engine sees them."""
+    from ..engine import STAGE, Engine
+
+    return stable_hash({"inputs": Engine(context.workspace).input_hash(STAGE["solve"]), "step": step,
+                        "version": STATE_VERSION})
+
+
+def load_state(context: Context, key: str):
+    directory = context.workspace.path("solve_state")
+    try:
+        if json.loads((directory / "key.json").read_text(encoding="utf-8")).get("key") != key:
+            return None
+        with open(directory / "associated.pkl", "rb") as handle:
+            state = pickle.load(handle)
+        return state["associated"], state["alignment_check"]
+    except (OSError, ValueError, KeyError, pickle.UnpicklingError, AttributeError, EOFError) as exc:
+        if (directory / "key.json").is_file():
+            context.log(f"kept association unusable ({type(exc).__name__}: {exc}); solving again", level="warning")
+        return None
+
+
+def save_state(context: Context, key: str, associated: Associated, alignment: dict) -> None:
+    directory = context.workspace.path("solve_state")
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "key.json").unlink(missing_ok=True)  # never a key next to another state
+    temporary = directory / "associated.pkl.tmp"
+    with open(temporary, "wb") as handle:
+        pickle.dump({"associated": associated, "alignment_check": alignment}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    temporary.replace(directory / "associated.pkl")
+    (directory / "key.json").write_text(json.dumps({"key": key, "saved": time.time()}), encoding="utf-8")
+
+
+def multi_camera(scene: Scene, labels: recover.Labels) -> np.ndarray:
+    """Per component: is it seen by at least two cameras (only those are 3D tracks)."""
+    multi = np.zeros(labels.next_label() + 1, dtype=bool)
+    for label, cameras in recover.camera_counts(scene, labels).items():
+        multi[label] = len(cameras) >= 2
+    return multi
+
+
+def recovered_positions(context: Context, scene: Scene, associated: Associated) -> dict | None:
+    """The positions the recover stage measured for exactly these person-frames, if any."""
+    frames = associated.frames
+    keep = multi_camera(scene, associated.labels)[frames.label]
+    signature = coverage_module.measured_signature(frames.label[keep], frames.t[keep], frames.root[keep])
+    found = sorted(glob.glob(str(context.workspace.root / "rounds" / "*" / "tracks3d_recovered.npz")))
+    if not found:
+        return None
+    with np.load(found[-1]) as data:
+        if "source_measured_sha256" not in data.files or str(data["source_measured_sha256"]) != signature \
+                or not len(data["t"]):
+            return None
+        return {"component": data["component"].astype(np.int64), "t": data["t"].astype(np.int64),
+                "root": data["root"].astype(np.float64), "xyz": data["xyz"].astype(np.float32),
+                "positions_sha256": str(data["positions_sha256"]),
+                "count": int(len(data["t"]))}
 
 WINDOW = 20  # sync frames per evidence window (2 s)
 def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: Constraints,
-                  resolved_keys: set[str]) -> dict:
-    """Run ``solve/swap_check`` on the solution; flagged and unverified moments become unknowns."""
+                  resolved_keys: set[str], recovered: dict | None = None) -> dict:
+    """Run ``solve/swap_check`` on the solution; flagged and unverified moments become unknowns.
+
+    ``recovered`` (positions of the coverage recovery for these components) are added to the measured
+    positions when ``RECIPE["swap_check"]["use_recovered"]`` is set: two people measured through a
+    crossing leave less room for an exchange than two people lost in it.
+    """
     from ..solve import swap_check
 
     cams = recover.camera_counts(solved.scene, solved.labels)
@@ -47,9 +123,20 @@ def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: C
     except Exception as exc:  # the cue is optional: never fail the solve over it
         context.log(f"appearance cue unavailable ({exc})", level="warning")
         embed = None
-    result = swap_check.check(scene, row_identity, solved.identity_of_label[frames.label[keep]].astype(np.int64),
-                              frames.t[keep], frames.root[keep], frames.xyz[keep], RECIPE["swap_check"],
+    tr_identity = solved.identity_of_label[frames.label[keep]].astype(np.int64)
+    tr_t, tr_root, tr_xyz = frames.t[keep], frames.root[keep], frames.xyz[keep]
+    added = 0
+    if recovered is not None and RECIPE["swap_check"].get("use_recovered"):
+        component = recovered["component"]
+        use = (component >= 0) & (component < len(multi)) & multi[np.clip(component, 0, len(multi) - 1)]
+        added = int(use.sum())
+        tr_identity = np.concatenate([tr_identity, solved.identity_of_label[component[use]].astype(np.int64)])
+        tr_t = np.concatenate([tr_t, recovered["t"][use].astype(tr_t.dtype)])
+        tr_root = np.concatenate([tr_root, recovered["root"][use].astype(tr_root.dtype)])
+        tr_xyz = np.concatenate([tr_xyz, recovered["xyz"][use].astype(tr_xyz.dtype)])
+    result = swap_check.check(scene, row_identity, tr_identity, tr_t, tr_root, tr_xyz, RECIPE["swap_check"],
                               same_rows=constraints.same, embed=embed)
+    result["summary"]["recovered_positions_used"] = added
     (context.workspace.round_dir(context.round) / "swap_check.json").write_text(
         json.dumps(result, indent=1), encoding="utf-8")
     unknowns, subjects = [], set()
@@ -438,14 +525,11 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
     return unknowns
 
 
-def save_solution(context: Context, solved: Solved) -> dict[str, str]:
+def save_solution(context: Context, solved: Solved, notes: dict | None = None) -> dict[str, str]:
     scene = solved.scene
     directory = context.workspace.round_dir(context.round)
     arrays = {"cameras": np.array([c.camera for c in scene.cameras]), "component_identity": solved.identity_of_label}
-    cams = recover.camera_counts(scene, solved.labels)
-    multi = np.zeros(solved.labels.next_label() + 1, dtype=bool)
-    for label, cameras in cams.items():
-        multi[label] = len(cameras) >= 2
+    multi = multi_camera(scene, solved.labels)
     for camera in scene.cameras:
         component = solved.labels.label[camera.index]
         identity = np.where((component >= 0) & multi[np.clip(component, 0, None)],
@@ -467,7 +551,7 @@ def save_solution(context: Context, solved: Solved) -> dict[str, str]:
         native=scene.native, cameras=np.array([c.camera for c in scene.cameras]))
     log = {"events": solved.log, "links": solved.links.accepted, "timings": solved.timings,
            "switch_events": solved.association.switch_events,
-           "accepted_edges": len(solved.association.solution.accepted)}
+           "accepted_edges": len(solved.association.solution.accepted), **(notes or {})}
     (directory / "solve.json").write_text(json.dumps(log, indent=1, default=int), encoding="utf-8")
     root = context.workspace.root
     return {name: str((directory / name).relative_to(root)) for name in ("solution.npz", "tracks3d.npz", "solve.json")}
@@ -490,12 +574,29 @@ def run(context: Context) -> StageResult:
     # Evidence at every sync frame up to about an hour (the golden bench was scored that way);
     # only longer recordings subsample to 5 Hz to bound memory.
     long_recording = scene.T > 40000
-    solved = solve(scene, RECIPE, constraints=constraints, step=2 if long_recording else 1, log=context.log)
-    outputs = save_solution(context, solved)
-    unknowns = extract_unknowns(solved, info["resolved_keys"])
-    # Alignment: the generator's "stale" spans are replaced by a direct geometric check.
+    step = 2 if long_recording else 1
     from ..solve import alignment_check
-    checked = alignment_check.verify(scene, RECIPE)
+
+    units, unit_stats = unit_scene(scene, RECIPE, constraints)
+    key = association_key(context, step)
+    state = load_state(context, key)
+    if state is None:
+        associated = associate_and_refine(units, RECIPE, constraints, step=step, log=context.log, unit_stats=unit_stats)
+        # Alignment: the generator's "stale" spans are replaced by a direct geometric check.
+        checked = alignment_check.verify(scene, RECIPE)
+        save_state(context, key, associated, checked)
+    else:
+        associated, checked = state
+        context.log("detections, calibration, alignment and constraints are unchanged since the last solve: "
+                    "its association is reused; identity, the swap check and the open questions are decided again")
+    recovered = recovered_positions(context, units, associated)
+    solved = identify(units, associated, RECIPE, constraints, recovered=recovered, log=context.log)
+    identity_event = next(event for event in reversed(solved.log) if event.get("step") == "identity")
+    after_recovery = identity_event.get("links_after_recovery", [])
+    outputs = save_solution(context, solved, {
+        "association_reused": state is not None,
+        "recovered": {"positions_sha256": recovered["positions_sha256"], "count": recovered["count"]} if recovered else None})
+    unknowns = extract_unknowns(solved, info["resolved_keys"])
     (workspace.round_dir(context.round) / "alignment_check.json").write_text(json.dumps(checked, indent=1), encoding="utf-8")
     unknowns["alignment"] = []
     decided = {c["a"][0] for c in context.db.constraints("alignment") if c["a"]}
@@ -535,17 +636,26 @@ def run(context: Context) -> StageResult:
     # Identity swaps: every moment two tracks could have exchanged people, tested with cues that do
     # not come from the 3D tracker. ``scene`` still has the 2D tracker's own tracklets (the solver
     # works on a copy cut at Autofit id changes).
-    swaps = swap_unknowns(context, scene, solved, constraints, info["resolved_keys"])
+    swaps = swap_unknowns(context, scene, solved, constraints, info["resolved_keys"], recovered)
     unknowns["identity_swap"] = swaps["unknowns"]
     context.log(f"swap check: {swaps['summary']}")
     coverage = coverage_metrics(solved)
     metrics = {"coverage": coverage, "constraints_used": info["used"], "alignment_check": alignment_summary,
-               "swap_check": swaps["summary"],
+               "swap_check": swaps["summary"], "association_reused": state is not None,
+               "identity_after_recovery": {
+                   "recovered_positions_used": identity_event.get("recovered_positions_used", 0),
+                   "links": len(after_recovery),
+                   "open_ends": [identity_event.get("open_ends_on_measured_positions", identity_event["open_ends"]),
+                                 identity_event["open_ends"]]},
                "refinement": [{k: v for k, v in e.items() if not isinstance(v, list)} for e in solved.log],
                "timings_s": {k: round(v, 1) for k, v in solved.timings.items()},
                "open_unknowns": {kind: len(items) for kind, items in unknowns.items()}}
     message = (f"{coverage['identities']} identities, {coverage['share_detections_in_3d_tracks']:.0%} of detections "
                f"in 3D tracks, {coverage['person_frames_with_3d_root']} person-frames with 3D")
+    if state is not None:
+        message += "; association reused, identity decided again"
+    if recovered:
+        message += f"; {len(after_recovery)} tracks linked through recovered positions"
     return StageResult(metrics=metrics, message=message, outputs=outputs,
                        inputs={"constraints": info["used"], "evidence_step": 2 if long_recording else 1},
                        unknowns=unknowns)

@@ -1,6 +1,10 @@
 """Run the engine's swap check (src/data_engine/solve/swap_check.py) on a saved solution.
 
-    python experiments/switches/run_swap_check.py WORKSPACE [--inject N] [--out FILE]
+    python experiments/switches/run_swap_check.py WORKSPACE [--inject N] [--out FILE] [--recovered]
+
+--recovered adds the positions of the coverage recovery (tracks3d_recovered.npz) to the measured ones, as
+the solve does when it decides identity again after a recovery. Under injection they are exchanged with
+the measured positions: a recovered pose is a triangulation of pixels, it stays with the physical person.
 
 With --inject N two recall tests that need no golden labels (labels exchanged, physical data unchanged):
   apart    - at N random instants where two identities are within the radius but NOT at a crossing,
@@ -27,11 +31,16 @@ from data_engine.solve.scene import load_scene  # noqa: E402
 from data_engine.workspace import Workspace  # noqa: E402
 
 
-def load(workspace_id: str):
+def load(workspace_id: str, recovered: bool = False):
     workspace = Workspace(workspace_id)
     scene = load_scene(workspace, joint_peak=RECIPE["geometry"]["joint_peak"], rays=False)
     directory = Path(sorted(glob.glob(str(workspace.root / "rounds" / "*" / "tracks3d.npz")))[-1]).parent
     tracks = dict(np.load(directory / "tracks3d.npz"))
+    if recovered:
+        extra = dict(np.load(directory / "tracks3d_recovered.npz"))
+        print(f"adding {len(extra['t'])} recovered positions to {int(np.isfinite(tracks['root'][:, 0]).sum())} measured ones")
+        tracks = {name: np.concatenate([tracks[name], extra[name].astype(tracks[name].dtype)])
+                  for name in ("identity", "t", "root", "xyz")}
     solution = dict(np.load(directory / "solution.npz"))
     row_identity = [solution[f"identity_{camera.camera}"].astype(np.int64) for camera in scene.cameras]
     return scene, row_identity, tracks, directory
@@ -71,8 +80,9 @@ def main() -> None:
     parser.add_argument("--inject", type=int, default=0)
     parser.add_argument("--out")
     parser.add_argument("--appearance", action="store_true", help="add the appearance cue (fast-reid, GPU) for every moment")
+    parser.add_argument("--recovered", action="store_true", help="add the recovered positions to the measured ones")
     args = parser.parse_args()
-    scene, row_identity, tracks, directory = load(args.workspace)
+    scene, row_identity, tracks, directory = load(args.workspace, args.recovered)
     recipe = RECIPE["swap_check"]
     identity = tracks["identity"].astype(np.int64)
     embeddings = None

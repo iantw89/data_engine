@@ -112,7 +112,7 @@ STAGES: list[Stage] = [
           "publish", requires=("solve",)),
 ]
 STAGE = {stage.name: stage for stage in STAGES}
-MAX_LAPS = 4  # hard bound on laps per round, whatever the stages ask for
+MAX_LAPS = 10  # hard bound on laps per round, whatever the stages ask for
 RERUN_KEY = "rerun_requested"  # stages asked to run again; persisted so an interrupted round resumes the lap
 
 

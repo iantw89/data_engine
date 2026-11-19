@@ -202,14 +202,17 @@ class Plan:
 
 
 def plan(scene: Scene, presence: Presence, recipe: dict, min_angle_deg: float,
-         only: set[tuple[int, int]] | None = None) -> Plan:
+         only: set[tuple[int, int]] | None = None, identities: set[int] | None = None) -> Plan:
     """Cases and crops for the missing instants (``only``: restrict to these (identity, t) - used when a
-    later pass looks again around positions that were just recovered)."""
+    later pass looks again around positions that were just recovered; ``identities``: restrict to these
+    people - used when only they changed since an earlier recovery)."""
     cases, jobs = [], []
     counts = {"missing_instants": 0, "without_hint": 0, "seen_by_fewer_than_2_cameras": 0}
     centers = [camera.cam.center if camera.cam is not None else None for camera in scene.cameras]
     for who, t in missing_instants(presence, scene.T, int(recipe["end_frames"])):
         if only is not None and (who, t) not in only:
+            continue
+        if identities is not None and who not in identities:
             continue
         counts["missing_instants"] += 1
         hint = make_hint(presence, who, t, int(recipe["reach_frames"]))
@@ -488,8 +491,56 @@ def accept(scene: Scene, presence: Presence, tr_identity: np.ndarray, tr_t: np.n
 # --------------------------------------------------------------------------- recursion from the edges
 
 
+ARRAYS = ("identity", "t", "xyz", "used", "residual", "root", "tier", "pass", "hint_kind", "hint_frames",
+          "pose_frame", "pose_keypoints", "pose_box")
+
+
+def measured_signature(component: np.ndarray, t: np.ndarray, root: np.ndarray) -> str:
+    """Identifies the measured person-frames a recovery belongs to, whatever identities they are grouped into."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for array, kind in ((component, np.int32), (t, np.int32), (root, np.float32)):
+        digest.update(np.ascontiguousarray(array, dtype=kind).tobytes())
+    return digest.hexdigest()
+
+
+def positions_signature(t: np.ndarray, root: np.ndarray) -> str:
+    """Identifies a set of recovered positions, whatever identities and components they are attached to."""
+    import hashlib
+
+    # as stored (float32), so that a set of positions has one signature before and after it was written
+    stored = np.asarray(root, np.float32).astype(np.float64)
+    table = np.concatenate([np.asarray(t, np.float64)[:, None], np.round(stored, 2)], axis=1)
+    table = table[np.lexsort(table.T[::-1])] if len(table) else table
+    return hashlib.sha256(np.ascontiguousarray(table).tobytes()).hexdigest()
+
+
+def nearest_component(identity: np.ndarray, t: np.ndarray, component: np.ndarray,
+                      query_identity: np.ndarray, query_t: np.ndarray) -> np.ndarray:
+    """For every (identity, t) asked about: the component of that identity's person-frame nearest in time
+    (-1 when the identity has none). Ties go to the earlier frame."""
+    out = np.full(len(query_t), -1, np.int64)
+    order = np.lexsort((t, identity))
+    identity, t, component = identity[order], t[order], component[order]
+    bounds = np.flatnonzero(np.concatenate(([True], identity[1:] != identity[:-1], [True]))) if len(identity) else np.zeros(1, np.int64)
+    span = {int(identity[s]): (int(s), int(e)) for s, e in zip(bounds[:-1], bounds[1:])}
+    for who in np.unique(query_identity):
+        if int(who) not in span:
+            continue
+        s, e = span[int(who)]
+        mine = np.flatnonzero(query_identity == who)
+        times = t[s:e]
+        after = np.clip(np.searchsorted(times, query_t[mine]), 0, len(times) - 1)
+        before = np.clip(after - 1, 0, len(times) - 1)
+        pick = np.where(np.abs(times[before] - query_t[mine]) <= np.abs(times[after] - query_t[mine]), before, after)
+        out[mine] = component[s:e][pick]
+    return out
+
+
 def recover_iteratively(scene: Scene, identity: np.ndarray, t: np.ndarray, root: np.ndarray, xyz: np.ndarray,
-                        read, geometry: dict, recipe: dict, log=print) -> dict:
+                        read, geometry: dict, recipe: dict, log=print, *, seed: dict | None = None,
+                        seed_rejected: dict | None = None, only_identities: set[int] | None = None) -> dict:
     """Recover positions pass after pass, each pass looking around what the previous one found.
 
     A pass can only look where a known pose is at most ``reach_frames`` away. Every accepted recovery is
@@ -499,6 +550,11 @@ def recover_iteratively(scene: Scene, identity: np.ndarray, t: np.ndarray, root:
     pass accepts nothing (or after ``max_passes``).
 
     ``read(plan) -> (keypoints (J, 17, 3), boxes (J, 4))`` reads the crops of a plan.
+
+    ``seed``: the arrays of an earlier recovery on the same measured positions, with today's identities
+    (``ARRAYS``). They are known poses from the start and are returned again; the first pass then looks only
+    at ``only_identities`` - the people whose tracks were joined since - and later passes around what was
+    found, as always. ``seed_rejected`` are the earlier recovery's still-missing instants.
     Returns the recovered person-frames (arrays), the per-pass log and, for every instant that was looked
     at and is still missing, why (``rejected``: {(identity, t): record}).
     """
@@ -507,14 +563,27 @@ def recover_iteratively(scene: Scene, identity: np.ndarray, t: np.ndarray, root:
     known_root, known_xyz = root[measured].astype(np.float64), xyz[measured].astype(np.float64)
     ranges = bone_ranges(known_xyz)  # from measured poses only: recoveries must not widen their own gate
     cameras = len(scene.cameras)
-    out = {name: [] for name in ("identity", "t", "xyz", "used", "residual", "root", "tier", "pass", "hint_kind",
-                                 "hint_frames", "pose_frame", "pose_keypoints", "pose_box")}
+    out = {name: [] for name in ARRAYS}
     rejected: dict[tuple[int, int], dict] = {}
     passes, only, first_counts, exhausted = [], None, None, False
     reach = int(recipe["reach_frames"])
-    for number in range(int(recipe["max_passes"])):
+    first_pass, limit_to = 0, None
+    if seed is not None:
+        limit_to = set(int(who) for who in (only_identities or ()))
+        if len(seed["t"]):
+            for name in ARRAYS:
+                out[name].append(seed[name])
+            known_identity = np.concatenate([known_identity, seed["identity"].astype(np.int64)])
+            known_t = np.concatenate([known_t, seed["t"].astype(np.int64)])
+            known_root = np.concatenate([known_root, seed["root"].astype(np.float64)])
+            known_xyz = np.concatenate([known_xyz, seed["xyz"].astype(np.float64)])
+            first_pass = int(seed["pass"].max()) + 1
+        rejected = {key: record for key, record in (seed_rejected or {}).items() if key[0] not in limit_to}
+        exhausted = not limit_to
+    for number in range(first_pass, first_pass + (int(recipe["max_passes"]) if limit_to is None or limit_to else 0)):
         presence = build_presence(known_identity, known_t, known_root, known_xyz)
-        the_plan = plan(scene, presence, recipe, geometry["min_ray_angle_deg"], only=only)
+        the_plan = plan(scene, presence, recipe, geometry["min_ray_angle_deg"], only=only,
+                        identities=limit_to if number == first_pass else None)
         if first_counts is None:
             first_counts = dict(the_plan.counts)
         if not len(the_plan.t):
@@ -530,7 +599,7 @@ def recover_iteratively(scene: Scene, identity: np.ndarray, t: np.ndarray, root:
         cases = np.array(result.case, np.int64)
         passes.append({"pass": number, "cases": int(len(the_plan.t)), "crops": int(len(the_plan.job_case)),
                        "accepted": int(len(cases)), "outcome": dict(result.reasons)})
-        log(f"pass {number + 1}: {len(the_plan.t)} instants looked at, {len(cases)} positions recovered")
+        log(f"pass {number - first_pass + 1}: {len(the_plan.t)} instants looked at, {len(cases)} positions recovered")
         if not len(cases):
             exhausted = True
             break
@@ -568,7 +637,7 @@ def recover_iteratively(scene: Scene, identity: np.ndarray, t: np.ndarray, root:
     arrays = {name: (np.concatenate(parts) if parts else empty[name]) for name, parts in out.items()}
     final = build_presence(known_identity, known_t, known_root, known_xyz)
     return {"arrays": arrays, "passes": passes, "rejected": rejected, "first_plan": first_counts or {},
-            "stopped_by_pass_limit": not exhausted,
+            "stopped_by_pass_limit": not exhausted, "seeded": int(len(seed["t"])) if seed is not None else 0,
             "inside_missing_before": inside_missing(build_presence(identity[measured], t[measured], root[measured], xyz[measured])),
             "inside_missing_after": inside_missing(final), "positions_before": int(measured.sum())}
 

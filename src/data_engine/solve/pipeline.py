@@ -30,6 +30,19 @@ class Constraints:
 
 
 @dataclass
+class Associated:
+    """The expensive part of a solve: which detections are one person at one time, and their 3D positions.
+    It depends on the detections, the calibration, the alignment and the constraints - not on what the
+    coverage recovery finds - so the identity step can run again on it (``identify``)."""
+    association: Association
+    labels: recover.Labels
+    frames: PersonFrames
+    duplicates: list[tuple[int, int, int]]
+    events: list[dict]
+    timings: dict[str, float]
+
+
+@dataclass
 class Solved:
     scene: Scene
     association: Association
@@ -144,13 +157,29 @@ def external_links(external: list[np.ndarray], atom_rows, atom_camera, atom_t, m
     return sorted(links)
 
 
+def unit_scene(scene: Scene, recipe: dict, constraints: Constraints) -> tuple[Scene, dict | None]:
+    """The scene the solver works on: 2D tracklets cut where the independent tracker changes person."""
+    if constraints.external is None:
+        return scene, None
+    return with_external_units(scene, constraints.external,
+                               rebirth=bool(recipe.get("refine", {}).get("external_rebirth", False)))
+
+
 def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None, step: int = 1,
-          samples: PairSamples | None = None, max_rounds: int = 6, log=print) -> Solved:
+          samples: PairSamples | None = None, max_rounds: int = 6, log=print, recovered: dict | None = None) -> Solved:
     constraints = constraints or Constraints()
+    scene, unit_stats = unit_scene(scene, recipe, constraints)
+    associated = associate_and_refine(scene, recipe, constraints, step=step, samples=samples, max_rounds=max_rounds,
+                                      log=log, unit_stats=unit_stats)
+    return identify(scene, associated, recipe, constraints, recovered=recovered, log=log)
+
+
+def associate_and_refine(scene: Scene, recipe: dict, constraints: Constraints, *, step: int = 1,
+                         samples: PairSamples | None = None, max_rounds: int = 6, log=print,
+                         unit_stats: dict | None = None) -> Associated:
+    """``scene`` is the unit scene (``unit_scene``)."""
     timings, events = {}, []
-    if constraints.external is not None:
-        scene, unit_stats = with_external_units(
-            scene, constraints.external, rebirth=bool(recipe.get("refine", {}).get("external_rebirth", False)))
+    if unit_stats is not None:
         events.append({"step": "external_units", **unit_stats})
     started = time.time()
     samples = samples if samples is not None else pair_samples(scene, recipe, step=step)
@@ -223,7 +252,29 @@ def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None,
         events.append({"step": "duplicates", "pieces": len(marked), "detections": sum(m["rows"] for m in marked),
                        "marked": marked[:300]})
     timings["refine"] = time.time() - started
+    return Associated(association, labels, frames, duplicates, events, timings)
 
+
+def frames_with_recovered(frames: PersonFrames, recovered: dict, n_labels: int) -> PersonFrames:
+    """The person-frames plus the recovered positions (``component``, ``t``, ``root``) as rows without
+    detections: what ``summarise`` and ``link_components`` need to see where a track was last known."""
+    use = (recovered["component"] >= 0) & (recovered["component"] < n_labels) & np.isfinite(recovered["root"]).all(axis=1)
+    count = int(use.sum())
+    return PersonFrames(
+        np.concatenate([frames.label, recovered["component"][use].astype(frames.label.dtype)]),
+        np.concatenate([frames.t, recovered["t"][use].astype(frames.t.dtype)]),
+        np.concatenate([frames.rows, np.full((count, frames.rows.shape[1]), -1, frames.rows.dtype)]),
+        np.zeros((0, 17, 3), np.float32), np.zeros((0, 17), np.uint8), np.zeros((0, 17), np.float32),
+        np.concatenate([frames.root, recovered["root"][use].astype(frames.root.dtype)]))
+
+
+def identify(scene: Scene, associated: Associated, recipe: dict, constraints: Constraints, *,
+             recovered: dict | None = None, log=print) -> Solved:
+    """Identity across gaps. ``recovered``: positions the coverage recovery measured for these components
+    (``component``, ``t``, ``root``); they move where and when a track is first and last known, which can make
+    the unique continuation of a track decidable. Links accepted on the measured positions alone are kept."""
+    association, labels, frames = associated.association, associated.labels, associated.frames
+    duplicates, events, timings = associated.duplicates, list(associated.events), dict(associated.timings)
     started = time.time()
     n_labels = labels.next_label()
     summaries = summarise(frames, n_labels)
@@ -238,10 +289,43 @@ def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None,
                 pairs.add((atom_label[a], atom_label[b]))
         return sorted(pairs)
 
-    links = link_components(summaries, recipe, T=scene.T, must_link=label_pairs(constraints.same),
-                            cannot_link=label_pairs(constraints.different), frames=frames)
+    must, cannot = label_pairs(constraints.same), label_pairs(constraints.different)
+    links = link_components(summaries, recipe, T=scene.T, must_link=must, cannot_link=cannot, frames=frames)
+    event = {"step": "identity", "links": len(links.accepted), "open_ends": len(links.open_ends)}
+    if recovered is not None and len(recovered["t"]):
+        known = frames_with_recovered(frames, recovered, n_labels)
+        extended = summarise(known, n_labels)
+        measured_links = links
+        links = link_components(extended, recipe, T=scene.T, must_link=must, cannot_link=cannot, frames=known,
+                                keep=[link for link in measured_links.accepted if link.get("source") != "human"])
+        before = {(link["from"], link["to"]) for link in measured_links.accepted}
+        added = []
+        for link in links.accepted:
+            if (link["from"], link["to"]) in before:
+                continue
+            # how far the recovery moved the two ends this link joins
+            a, b = link["from"], link["to"]
+            link["after_recovery"] = True
+            if summaries[a] is not None and summaries[a].last_root_t is not None:
+                link["end_moved_s"] = round((extended[a].last_root_t - summaries[a].last_root_t) / 10.0, 1)
+            if summaries[b] is not None and summaries[b].first_root_t is not None:
+                link["start_moved_s"] = round((summaries[b].first_root_t - extended[b].first_root_t) / 10.0, 1)
+            added.append(link)
+        # Open ends are reported where the component's own detections begin and end.
+        for end in links.open_ends:
+            summary = summaries[end["component"]]
+            if summary is not None:
+                end["t"] = summary.t_first if end["end"] == "start" else summary.t_last
+        event.update({"links": len(links.accepted), "open_ends": len(links.open_ends),
+                      "links_on_measured_positions": len(measured_links.accepted),
+                      "open_ends_on_measured_positions": len(measured_links.open_ends),
+                      "recovered_positions_used": int(len(known.t) - len(frames.t)),
+                      "links_after_recovery": added})
+        log(f"identity with {event['recovered_positions_used']} recovered positions: {len(added)} more links "
+            f"({len(measured_links.accepted)} on measured positions), open ends "
+            f"{len(measured_links.open_ends)} -> {len(links.open_ends)}")
     timings["identity"] = time.time() - started
-    events.append({"step": "identity", "links": len(links.accepted), "open_ends": len(links.open_ends)})
+    events.append(event)
     return Solved(scene, association, labels, frames, summaries, links, links.identity, duplicates, events, timings)
 
 

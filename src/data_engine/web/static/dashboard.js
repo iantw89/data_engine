@@ -140,6 +140,9 @@ function banner(s, id, startRun, state) {
 // ------------------------------------------------------------------ this round, step by step
 const STEP_MARK = { done: '\u2713', running: '\u25cf', expected: '\u25cb', failed: '\u2715', blocked: '\u2715', skipped: '\u2013' };
 const lapName = (lap) => (lap ? `Lap ${lap}` : 'First pass');
+// What a lap is for, from the stages it runs: with Autofit it tracks again, without it only identity is decided again.
+const lapKind = (steps) => (steps.some((x) => x.stage === 'autofit') ? 'Autofit lap: tracking again with the recovered detections'
+  : steps.some((x) => x.stage === 'solve') ? 'identity lap: linking tracks with the recovered positions' : 'repeat within the round');
 
 function stepChip(step) {
   const status = step.status || 'expected';
@@ -164,7 +167,9 @@ function timeline(s) {
   const t = s.timeline;
   const terms = h('p', { class: 'muted small terms' },
     h('strong', {}, 'Round'), ': one run of the engine - it applies new answers, runs every stage whose inputs changed, in order, and builds the human tasks. ',
-    h('strong', {}, 'Lap'), ': a repeat inside a round - when the coverage recovery finds enough detections Autofit has not seen, Autofit, the solve and the recovery run once more before the tasks are built.');
+    h('strong', {}, 'Lap'), ': a repeat inside a round, asked for by the coverage recovery before the tasks are built. ',
+    h('strong', {}, 'Identity lap'), ' (short): the recovered positions let more tracks be linked - identity is decided again on the same association, and the recovery looks only around the joined tracks. ',
+    h('strong', {}, 'Autofit lap'), ' (long): the recovery produced enough detections Autofit has not seen - Autofit, the whole solve and the recovery run again.');
   if (t.round === null || t.round === undefined) return h('div', {}, header('This round'), terms, h('p', { class: 'muted' }, 'No round has run yet.'));
   const active = t.finished === null || t.finished === undefined;
   const runningStep = t.steps.find((x) => x.status === 'running');
@@ -184,7 +189,7 @@ function timeline(s) {
   const mayLap = active && all.some((x) => x.stage === 'recover' && x.status !== 'done')
     ? ' The coverage recovery decides at its end whether another lap is worth it, so the list can grow.' : '';
   const rows = laps.map((lap) => h('div', { class: 'lap-row' },
-    h('div', { class: 'lap-label' }, lapName(lap), lap ? h('div', { class: 'muted small' }, 'repeat within the round') : null),
+    h('div', { class: 'lap-label' }, lapName(lap), lap ? h('div', { class: 'muted small' }, lapKind(inRound.filter((x) => x.lap === lap))) : null),
     h('div', { class: 'lap-steps' }, inRound.filter((x) => x.lap === lap).flatMap((x, i) => [i ? h('span', { class: 'arrow', 'aria-hidden': 'true' }) : null, stepChip(x)]))));
   if (afterRound.length) {
     rows.push(h('div', { class: 'lap-row' },
@@ -206,7 +211,8 @@ function roundHistory(s) {
     let lap = 0;
     let after = false;
     r.steps.forEach((x, i) => {
-      if (x.after_round && !after) { after = true; parts.push(h('span', { class: 'lap-sep' }, ' | after the round: ')); } else if (!x.after_round && x.lap !== lap) { lap = x.lap; parts.push(h('span', { class: 'lap-sep' }, ` | lap ${lap}: `)); } else if (i) parts.push(' \u2192 ');
+      if (x.after_round && !after) { after = true; parts.push(h('span', { class: 'lap-sep' }, ' | after the round: ')); } else if (!x.after_round && x.lap !== lap) {
+        const kind = r.steps.some((y) => y.lap === x.lap && y.stage === 'autofit') ? 'Autofit' : 'identity'; lap = x.lap; parts.push(h('span', { class: 'lap-sep' }, ` | lap ${lap} (${kind}): `)); } else if (i) parts.push(' \u2192 ');
       parts.push(h('span', { class: `seq sp-${x.status}` }, `${x.title}${x.duration_s !== null && x.duration_s !== undefined ? ` ${fmtDuration(x.duration_s)}` : ''}`));
     });
     return parts.length ? parts : h('span', { class: 'muted' }, 'nothing needed to run');
