@@ -23,6 +23,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from .. import autofit_refresh
 from ..engine import Context, StageResult
 from ..workspace import file_sha256, stable_hash
 from .ingest import WORKERS, log_tail
@@ -30,12 +31,18 @@ from .ingest import WORKERS, log_tail
 
 def input_signature(context: Context) -> dict:
     workspace = context.workspace
-    return {
+    signature = {
         "sync_table": file_sha256(workspace.path("alignment", "sync_table.npz")),
         "calibration": file_sha256(workspace.path("calibration", "calibration.json")),
         "tracklets": file_sha256(workspace.path("tracklets", "index.npz")),
         "detections": "kept",
     }
+    # Poses the recover stage read (autofit_refresh.py): additional detections, valid for this alignment
+    # and calibration only. The key exists only when there are some, so older runs stay reusable.
+    extra = workspace.path("evidence", "autofit", "extra.npz")
+    if len(autofit_refresh.load(extra, signature)["frame"]):
+        signature["extra_detections"] = file_sha256(extra)
+    return signature
 
 
 def run(context: Context) -> StageResult:
@@ -58,6 +65,9 @@ def run(context: Context) -> StageResult:
         command = [str(interpreter), str(WORKERS / "autofit_tracks.py"), "--workspace", str(workspace.root),
                    "--calibration", str(workspace.path("calibration", "calibration.json")), "--variant", "kept",
                    "--out", str(out), "--progress", str(workspace.path("logs", "autofit_progress.json"))]
+        if "extra_detections" in signature:
+            command += ["--extra", str(out / "extra.npz")]
+            context.log("giving Autofit the recovered poses as additional detections")
         log_path = workspace.path("logs", "autofit.log")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
@@ -75,7 +85,8 @@ def run(context: Context) -> StageResult:
     meta = json.loads((out / "meta.json").read_text(encoding="utf-8")) if (out / "meta.json").is_file() else {}
     metrics = {"available": True, "reused": reused,
                **{key: meta[key] for key in ("frames", "tracking_wall_s", "merger_wall_s", "mean_s_per_frame",
-                                             "p95_s_per_frame") if key in meta}}
+                                             "p95_s_per_frame", "tracker_ids", "detections_fed", "extra_detections",
+                                             "extra_assigned") if key in meta}}
     seconds = meta.get("tracking_wall_s")
     message = ("Autofit raw tracks " + ("reused" if reused else "computed")
                + (f" ({seconds / 60:.0f} min of tracking)" if seconds else ""))

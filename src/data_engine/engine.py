@@ -41,6 +41,10 @@ class StageResult:
     # Identity of what downstream stages consume. Default: every run counts as new output.
     # A stage that can tell its output did not change sets this, so dependants stay fresh.
     output_hash: str | None = None
+    # Earlier stages that should run again in this round because this stage produced something they
+    # consume (a lap: e.g. recovered detections for Autofit). The stage itself judges whether a lap is
+    # worth its cost; the engine only bounds how many a round may take (MAX_LAPS).
+    rerun: tuple[str, ...] = ()
 
 
 @dataclass
@@ -99,13 +103,15 @@ STAGES: list[Stage] = [
     Stage("recover", "Coverage recovery",
           "Read poses where tracked people must be (guided ViTPose crops) and triangulate them: fills gaps "
           "left by detector misses without interpolating.",
-          "recover", requires=("solve",), recipe=("coverage", "geometry"), every_round=True),
+          "recover", requires=("solve",), recipe=("coverage", "geometry", "autofit_refresh"), every_round=True),
     Stage("tasks", "Human tasks", "Turn the remaining unknowns into the smallest set of human questions.",
           "tasks", requires=("solve",), every_round=True),
     Stage("publish", "Publish", "Publish alignment, 2D tracklets and 3D tracks as data_management label sets.",
           "publish", requires=("solve",)),
 ]
 STAGE = {stage.name: stage for stage in STAGES}
+MAX_LAPS = 4  # hard bound on laps per round, whatever the stages ask for
+RERUN_KEY = "rerun_requested"  # stages asked to run again; persisted so an interrupted round resumes the lap
 
 
 class Engine:
@@ -202,25 +208,48 @@ class Engine:
         applied = self.apply_answers(round_number) if pending_answers else 0
         if applied:
             self.db.log(f"round {round_number}: applied {applied} human answers")
-        ran, stopped = [], None
-        for stage in STAGES:
-            if stage.name == "publish":
-                continue  # publication is an explicit action, never a side effect of a round
-            state = self.stage_state(stage)
-            blocked_by = [name for name in stage.requires if self.stage_state(STAGE[name]) != "done"]
-            if blocked_by:
-                stopped = f"{stage.name} waits for {', '.join(blocked_by)}"
-                break
-            rerun = state != "done" or stage.name in force or (stage.every_round and applied)
-            if rerun:
-                result = self.run_stage(stage, round_number)
-                ran.append(stage.name)
-                if result.status != "done":
-                    stopped = f"{stage.name}: {result.status} - {result.message}"
+        ran, stopped, laps = [], None, 0
+        forced, every_round = set(force), bool(applied)
+        while True:
+            lap_from = None
+            for stage in STAGES:
+                if stage.name == "publish":
+                    continue  # publication is an explicit action, never a side effect of a round
+                state = self.stage_state(stage)
+                blocked_by = [name for name in stage.requires if self.stage_state(STAGE[name]) != "done"]
+                if blocked_by:
+                    stopped = f"{stage.name} waits for {', '.join(blocked_by)}"
                     break
-            if until == stage.name:
+                requested = list(self.db.get_meta(RERUN_KEY, []))
+                rerun = state != "done" or stage.name in forced or stage.name in requested \
+                    or (stage.every_round and every_round)
+                if rerun:
+                    result = self.run_stage(stage, round_number)
+                    ran.append(stage.name)
+                    if result.status != "done":
+                        stopped = f"{stage.name}: {result.status} - {result.message}"
+                        break
+                    forced.discard(stage.name)
+                    if stage.name in requested:
+                        self.db.set_meta(RERUN_KEY, [name for name in requested if name != stage.name])
+                    wanted = [name for name in result.rerun if name in STAGE]
+                    if wanted:
+                        self.db.set_meta(RERUN_KEY, sorted(set(self.db.get_meta(RERUN_KEY, [])) | set(wanted)))
+                        if until in (None, "tasks") and laps < MAX_LAPS:
+                            lap_from = stage.name
+                            break
+                        self.db.log(f"{stage.name} asked for another lap ({', '.join(wanted)}); left for the next round",
+                                    level="warning", stage=stage.name)
+                if until == stage.name:
+                    break
+            if lap_from is None:
                 break
+            laps += 1
+            every_round = False  # the lap reruns what its inputs make stale; nothing else
+            self.db.log(f"round {round_number}: lap {laps} - {lap_from} produced input for "
+                        f"{', '.join(self.db.get_meta(RERUN_KEY, []))}")
         summary = self.round_summary(round_number, ran, applied, stopped)
+        summary["laps"] = laps
         self.db.close_round(round_number, summary)
         return summary
 

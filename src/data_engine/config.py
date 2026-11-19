@@ -137,6 +137,16 @@ RECIPE: dict[str, Any] = {
         "stay": {"heading": -0.6, "body": -0.505, "appearance": 0.043},
         "tracklet_contradictions": 1, "tracklet_agreements": 2,
     },
+    "autofit_refresh": {
+        # NEW 2026-11-19 (autofit_refresh.py, experiments/autofit/augmented.py): recovered poses that are
+        # not a detection of the raw store are given to Autofit as detections (no identities), then the
+        # round takes a lap: Autofit -> solve -> recover. Golden: 2,240 such poses (0.7% of Autofit's
+        # input) took its track ids per labelled person from 45 to 39 and the solve from 31 to 27
+        # identities with fewer impure observations (84 -> 50). A lap costs about a round, so it runs
+        # only with enough new detections, and again only while laps keep removing identities.
+        "enabled": True, "min_new_detections": 500, "min_new_share": 0.001, "max_laps_per_round": 2,
+        "min_gain": 0.02,
+    },
     "coverage": {
         # NEW 2026-11-18 (solve/coverage.py, experiments/coverage): recover positions inside and next
         # to tracks by reading poses where the person must be. A neighbouring measured pose within

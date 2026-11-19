@@ -318,3 +318,41 @@ def test_new_constraint_after_publish_makes_solve_stale(env):
     env.db.add_constraint("same", ["a"], ["b"], source="human", round_number=1)
     status = env.engine.status()
     assert states(env)["solve"] == "stale" and status["phase"] == "machine_pending"
+
+
+# --------------------------------------------------------------------------- laps
+
+
+def test_stage_can_ask_for_a_lap_through_an_earlier_stage(env):
+    """solve produced something detect consumes: detect runs again, then what it makes stale, tasks only once."""
+    asked = []
+
+    def solve(context):
+        asked.append(len(asked))
+        return StageResult(rerun=("detect",) if len(asked) == 1 else ())
+    env.harness.behavior["solve"] = solve
+    summary = env.engine.advance()
+    assert env.harness.calls == ["ingest", "detect", "calibration", "solve", "detect", "solve", "tasks"]
+    assert summary["laps"] == 1 and summary["stopped"] is None
+    assert env.db.get_meta(engine_module.RERUN_KEY, []) == []
+    assert all(state == "done" for name, state in states(env).items() if name != "publish")
+
+
+def test_laps_per_round_are_bounded(env, monkeypatch):
+    monkeypatch.setattr(engine_module, "MAX_LAPS", 2)
+    env.harness.behavior["solve"] = lambda context: StageResult(rerun=("detect",))
+    summary = env.engine.advance()
+    assert summary["laps"] == 2 and env.harness.calls.count("solve") == 3 and env.harness.calls[-1] == "tasks"
+    # the request that did not fit is kept: the next round starts with it
+    assert env.db.get_meta(engine_module.RERUN_KEY, []) == ["detect"]
+    env.harness.calls.clear()
+    env.harness.behavior["solve"] = None
+    env.engine.advance()
+    assert env.harness.calls[:2] == ["detect", "solve"]
+
+
+def test_lap_request_survives_a_round_that_stops_early(env):
+    env.harness.behavior["solve"] = lambda context: StageResult(rerun=("detect",))
+    env.engine.advance(until="solve")
+    assert env.harness.calls == ["ingest", "detect", "calibration", "solve"]
+    assert env.db.get_meta(engine_module.RERUN_KEY, []) == ["detect"]

@@ -457,41 +457,92 @@ def _iou_one_to_many(box: np.ndarray, others: np.ndarray) -> np.ndarray:
     return inter / np.maximum(union, 1e-9)
 
 
+def same_pose(recovered_keypoints: np.ndarray, detection_keypoints: np.ndarray, box: np.ndarray, *,
+              tolerance: float = 0.05, min_joints: int = 4, peak: float = 0.3) -> bool:
+    """Do two readings of a pose in one image show the same body? Median distance of the body joints both
+    readings are confident about, as a fraction of the box height (at least ``min_joints`` such joints)."""
+    both = (recovered_keypoints[5:17, 2] >= peak) & (detection_keypoints[5:17, 2] >= peak)
+    if both.sum() < min_joints:
+        return False
+    distance = np.linalg.norm(recovered_keypoints[5:17, :2][both] - detection_keypoints[5:17, :2][both], axis=1)
+    return bool(np.median(distance) / max(float(box[3] - box[1]), 1.0) <= tolerance)
+
+
 def recovered_camera_detections(column: int, recovered: dict | None, detections, kept: np.ndarray,
-                                frame_mask: np.ndarray | None, published: np.ndarray, *, overlap: float = 0.5) -> dict:
+                                frame_mask: np.ndarray | None, published: np.ndarray, *, overlap: float = 0.5,
+                                identity: np.ndarray | None = None) -> dict:
     """The poses the recover stage read in one camera, as detections to publish.
 
     A recovered pose whose box overlaps a kept detection of the raw store in the same frame (IoU >= ``overlap``)
-    is not published a second time: that detection is already in the file (under its own tracklet).
-    Returns frame, box, keypoints, score, identity (sorted by identity, frame) and counts.
+    is not published a second time: that detection is already in the file. With ``identity`` (the solve's
+    identity of every raw row) the coinciding detection is looked at: when it belongs to no identity and its
+    own keypoints show the same pose, it is the detector's view of the recovered person and takes the track's
+    identity (``adopted_rows`` / ``adopted_identity``) - unless two identities claim it or the identity already
+    has a detection in that frame.
+    Returns frame, box, keypoints, score, identity (sorted by identity, frame), the adopted rows and counts.
     """
+    counts = {"read": 0, "already_a_detection": 0, "coincide_with_own_detection": 0, "coincide_with_other_identity": 0,
+              "coincide_unassigned_pose_differs": 0, "adopted": 0, "adoption_conflicts": 0}
     empty = {"frame": np.zeros(0, np.int64), "box": np.zeros((0, 4)), "keypoints": np.zeros((0, 17, 3)),
-             "score": np.zeros(0), "identity": np.zeros(0, np.int64), "read": 0, "already_a_detection": 0}
+             "score": np.zeros(0), "identity": np.zeros(0, np.int64), "adopted_rows": np.zeros(0, np.int64),
+             "adopted_identity": np.zeros(0, np.int64), **counts}
     if recovered is None or not len(recovered["t"]):
         return empty
     frame = recovered["pose_frame"][:, column].astype(np.int64)
     use = np.flatnonzero((frame >= 0) & published[recovered["t"].astype(np.int64)])
     if frame_mask is not None:
         use = use[frame_mask[frame[use]]]
-    keep, duplicate = [], 0
+    counts["read"] = int(len(use))
+    keep, claims = [], {}
     for index in use:
         box = recovered["pose_box"][index, column].astype(np.float64)
         rows = detections.rows(int(frame[index]))
         raw = np.arange(rows.start, rows.stop)
         raw = raw[kept[raw]] if len(raw) else raw
-        if len(raw) and _iou_one_to_many(box, detections.boxes[raw, :4].astype(np.float64)).max() >= overlap:
-            duplicate += 1
+        overlaps = _iou_one_to_many(box, detections.boxes[raw, :4].astype(np.float64)) if len(raw) else np.zeros(0)
+        if not len(raw) or overlaps.max() < overlap:
+            keep.append(index)
             continue
-        keep.append(index)
+        counts["already_a_detection"] += 1
+        if identity is None:
+            continue
+        row, who = int(raw[int(np.argmax(overlaps))]), int(recovered["identity"][index])
+        owner = int(identity[row])
+        if owner == who:
+            counts["coincide_with_own_detection"] += 1
+        elif owner >= 0:
+            counts["coincide_with_other_identity"] += 1
+        elif not same_pose(recovered["pose_keypoints"][index, column], detections.keypoints[row], box):
+            counts["coincide_unassigned_pose_differs"] += 1
+        elif (identity[raw] == who).any():  # the identity already has a detection in this frame
+            counts["adoption_conflicts"] += 1
+        else:
+            claims.setdefault(row, set()).add(who)
+    adopted = sorted((row, next(iter(who))) for row, who in claims.items() if len(who) == 1)
+    counts["adoption_conflicts"] += len(claims) - len(adopted)
+    counts["adopted"] = len(adopted)
+    adoption = {"adopted_rows": np.array([row for row, _ in adopted], np.int64),
+                "adopted_identity": np.array([who for _, who in adopted], np.int64)}
     keep = np.array(keep, np.int64)
     if not len(keep):
-        return {**empty, "read": int(len(use)), "already_a_detection": duplicate}
+        return {**empty, **adoption, **counts}
     order = keep[np.lexsort((frame[keep], recovered["identity"][keep]))]
     keypoints = recovered["pose_keypoints"][order, column].astype(np.float64)
     return {"frame": frame[order], "box": recovered["pose_box"][order, column].astype(np.float64), "keypoints": keypoints,
             # no detector looked at these: the score is the mean heatmap peak of the 12 body joints
             "score": keypoints[:, 5:17, 2].mean(axis=1), "identity": recovered["identity"][order].astype(np.int64),
-            "read": int(len(use)), "already_a_detection": duplicate}
+            **adoption, **counts}
+
+
+def adopt(identity: np.ndarray, atom: np.ndarray, extra: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Identity and piece of every raw row with the adopted detections applied: an adopted row gets the
+    track's identity and leaves its piece (it becomes a tracklet of its own run of frames)."""
+    if not len(extra["adopted_rows"]):
+        return identity, atom
+    identity, atom = identity.copy(), atom.copy()
+    identity[extra["adopted_rows"]] = extra["adopted_identity"]
+    atom[extra["adopted_rows"]] = -1
+    return identity, atom
 
 
 def build_camera_tracklets(camera: str, dataset: str, detections, kept: np.ndarray, atom: np.ndarray, identity: np.ndarray,
@@ -503,7 +554,11 @@ def build_camera_tracklets(camera: str, dataset: str, detections, kept: np.ndarr
     ``recovered`` (from :func:`recovered_camera_detections`) adds the poses read by the recover stage as
     detections with their own provenance and tracklets (one per run of consecutive frames of an identity);
     ``stats["recovered_members"]`` then lists (identity, tracklet id, first frame, last frame) for the 3D tracks.
+    Its ``adopted_rows`` are raw detections that take a track's identity because a recovered pose coincides
+    with them: pass ``identity`` and ``atom`` with those rows already set (:func:`adopt`); their tracklet
+    provenance is the recover stage's.
     """
+    adopted_rows = set(recovered["adopted_rows"].tolist()) if recovered is not None else set()
     frame_of_row = detections.frame_of_row.astype(np.int64)
     raw_ids, id_stats = raw_tracklet_ids(frame_of_row, kept, atom, identity)
     rows = np.flatnonzero(raw_ids >= 0)
@@ -549,9 +604,11 @@ def build_camera_tracklets(camera: str, dataset: str, detections, kept: np.ndarr
     for i in order:
         frame = int(frames[i])
         row = int(rows[i])
-        by_frame.setdefault(frame, []).append({
-            "class": "person", "tracklet_id": int(tids[i]), "bbox": box_list[i], "keypoints": keypoint_list[i],
-            "score": score_list[i], "source_id": f"{camera}/{frame}/{row - int(start[frame])}"})
+        detection = {"class": "person", "tracklet_id": int(tids[i]), "bbox": box_list[i], "keypoints": keypoint_list[i],
+                     "score": score_list[i], "source_id": f"{camera}/{frame}/{row - int(start[frame])}"}
+        if row in adopted_rows and recovered_provenance:
+            detection["tracklet_provenance"] = recovered_provenance  # the identity comes from the recovered pose
+        by_frame.setdefault(frame, []).append(detection)
     return _finish_camera(camera, dataset, by_frame, uniq, stats, dense, extra, recovered_provenance, image_size,
                           position_provenance, tracklet_provenance)
 
@@ -625,14 +682,17 @@ def _members(identity: np.ndarray, dense: np.ndarray, frame_of_row: np.ndarray) 
 
 def build_tracks(dataset: str, solved: Solved, dense: dict[str, np.ndarray], frame_of_row: dict[str, np.ndarray],
                  aligned: np.ndarray, published: np.ndarray, provenance: str, calibration: dict | None,
-                 recovered_members: dict[str, list[tuple[int, int, int, int]]] | None = None) -> tuple[dict, dict]:
+                 recovered_members: dict[str, list[tuple[int, int, int, int]]] | None = None,
+                 identity_of: dict[str, np.ndarray] | None = None) -> tuple[dict, dict]:
     """The three_d_tracks payload and its counts: one track per identity, positions at published sync indices.
 
     ``recovered_members``: per camera the (identity, tracklet id, first frame, last frame) of recovered tracklets.
+    ``identity_of``: per camera the identity of every raw row as published (the solve's, plus adopted detections).
     """
     members: dict[int, list[dict]] = {}
     for camera in solved.cameras:
-        for identity, pieces in _members(solved.identity[camera], dense[camera], frame_of_row[camera]).items():
+        row_identity = (identity_of or {}).get(camera, solved.identity[camera])
+        for identity, pieces in _members(row_identity, dense[camera], frame_of_row[camera]).items():
             for tracklet, low, high in pieces:
                 members.setdefault(identity, []).append({"camera": camera, "tracklet_id": tracklet, "frame_range": [low, high]})
         for identity, tracklet, low, high in (recovered_members or {}).get(camera, []):
@@ -795,11 +855,16 @@ def detect_provenance(root: Path, code: dict) -> dict:
 def solve_provenance(root: Path, solved: Solved, workspace_id: str, db: dict, code: dict, calibration: dict | None) -> dict:
     sections: dict[str, Any] = {}
     manifests = {}
-    for stage in ("tracklets", "solve"):
+    autofit = None
+    for stage in ("tracklets", "autofit", "solve"):
         manifest = latest_manifest(root, stage, solved.round) if stage == "solve" else latest_manifest(root, stage)
         if manifest:
             manifests[stage] = manifest["_file"]
             sections.update(manifest.get("config") or {})
+            if stage == "autofit":
+                # what Autofit tracked: the kept detections and, after a lap, the recovered poses (extra_detections)
+                autofit = {key: value for key, value in (manifest.get("inputs") or {}).items()
+                           if key in ("detections", "extra_detections", "worker_sha256", "calibration", "sync_table", "tracklets")}
     for section in ("postfilter", "tracklets", "geometry", "association", "temporal"):
         sections.setdefault(section, RECIPE[section])
     recipe = {section: sections[section] for section in ("postfilter", "tracklets", "geometry", "association", "temporal")}
@@ -807,7 +872,9 @@ def solve_provenance(root: Path, solved: Solved, workspace_id: str, db: dict, co
     body = {
         "kind": "machine",
         "description": (f"Data Engine solve (round {solved.round}): post-filtered detections, over-split single-camera tracklets "
-                        "(BoT-SORT), cross-camera association, identity across gaps and multi-view triangulated 3D poses. "
+                        "(BoT-SORT), Autofit 3D tracks as independent evidence"
+                        + (" (Autofit also tracked the poses recovered from guided crops)" if (autofit or {}).get("extra_detections")
+                           else "") + ", cross-camera association, identity across gaps and multi-view triangulated 3D poses. "
                         f"Machine output; {counts['human_active_total']} human answer(s) applied as constraints. Cross-view membership "
                         "and identities are provisional unless a person confirmed them."),
         "reproduction": {
@@ -815,7 +882,8 @@ def solve_provenance(root: Path, solved: Solved, workspace_id: str, db: dict, co
             "code": code,
             "config": {"round": solved.round, "recipe": recipe,
                        "recipe_equals_current_config": recipe == {k: RECIPE[k] for k in recipe},
-                       "constraints": counts, "manifests": manifests, "artifact_sha256": solved.artifact_sha256,
+                       "constraints": counts, "manifests": manifests, "autofit_inputs": autofit,
+                       "artifact_sha256": solved.artifact_sha256,
                        "calibration": None if calibration is None else {k: calibration[k] for k in
                                                                          ("sha256", "standard_calibration", "cameras")},
                        "alignment_provenance": (solved.alignment or {}).get("provenance")},
@@ -893,7 +961,11 @@ def build_notes(*, stats: dict, solved: Solved, workspace_id: str, slice_note: s
            "the track's expected place (guided ViTPose crops, triangulated with the same gates); "
            f"{stats.get('recovered_detections', 0)} of those 2D poses are published as detections with their own "
            "provenance and tracklets (source_id '<camera>/<frame>/R<n>'), and "
-           f"{stats.get('recovered_already_a_detection', 0)} coincide with a detection that is already published. "
+           f"{stats.get('recovered_already_a_detection', 0)} coincide with a detection that is already published "
+           f"({stats.get('coincide_with_own_detection', 0)} the track's own; "
+           f"{stats.get('recovered_adopted_detections', 0)} belonged to no identity, show the same pose and take the "
+           "track's identity, with the recover provenance as their tracklet provenance; "
+           f"{stats.get('coincide_with_other_identity', 0)} belong to another identity and are left as they are). "
            if int(solved.tracks.get("recovered_positions", 0)) else "")
         + f"Sampling: {sample}; time as aligned indices of the published frame_alignment set.{unresolved}{mount} "
         "Open unknowns at publication (engine ledger): "
@@ -975,21 +1047,30 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
     unaligned = [c for c, column in zip(cameras, range(len(cameras))) if not (solved.native[:, column] >= 0).any()]
     total_published = in_3d = human_rows = kept_total = off_timeline = 0
     recovered_members: dict[str, list] = {}
-    recovered_published = recovered_duplicates = 0
+    recovered_published = recovered_duplicates = recovered_adopted = 0
+    identity_of: dict[str, np.ndarray] = {}
+    coincide = {"coincide_with_own_detection": 0, "coincide_with_other_identity": 0, "coincide_unassigned_pose_differs": 0,
+                "adoption_conflicts": 0}
     for column, camera in enumerate(cameras):
         detections = load_camera(root / "detections" / "raw", camera, ds.cameras[camera].frame_count)
         frame_of_row[camera] = detections.frame_of_row.astype(np.int64)
         mask = published_frame_mask(detections.frame_count, solved.native, column, published, stride)
         info = ds.cameras[camera]
-        extra = recovered_camera_detections(column, recovered_2d, detections, solved.kept[camera], mask, published)
+        extra = recovered_camera_detections(column, recovered_2d, detections, solved.kept[camera], mask, published,
+                                            identity=solved.identity[camera])
+        identity_of[camera], atom = adopt(solved.identity[camera], solved.atom[camera], extra)
         payload, dense[camera], stats = build_camera_tracklets(
-            camera, dataset, detections, solved.kept[camera], solved.atom[camera], solved.identity[camera], mask,
+            camera, dataset, detections, solved.kept[camera], atom, identity_of[camera], mask,
             (info.width, info.height), detect["name"], solve["name"], recovered=extra,
             recovered_provenance=recover["name"] if recover else None)
         recovered_members[camera] = stats.pop("recovered_members")
         stats["recovered_already_a_detection"] = extra["already_a_detection"]
+        stats["recovered_adopted_detections"] = extra["adopted"]
         recovered_published += stats["recovered_detections"]
         recovered_duplicates += extra["already_a_detection"]
+        recovered_adopted += extra["adopted"]
+        for name in coincide:
+            coincide[name] += extra[name]
         per_camera[camera] = stats
         kept_total += int(solved.kept[camera].sum())
         on_timeline = np.zeros(detections.frame_count, bool)
@@ -998,7 +1079,7 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
         off_timeline += int((solved.kept[camera] & ~on_timeline[frame_of_row[camera]]).sum())
         published_rows = dense[camera] >= 0
         total_published += int(published_rows.sum()) + stats["recovered_detections"]
-        in_3d += int((published_rows & (solved.identity[camera] >= 0)).sum()) + stats["recovered_detections"]
+        in_3d += int((published_rows & (identity_of[camera] >= 0)).sum()) + stats["recovered_detections"]
         human_rows += int((published_rows & (solved.source[camera] == 5)).sum())
         if payload is not None:
             sizes[f"two_d_tracklets/cameras/{camera}.json"] = write_json(
@@ -1007,11 +1088,12 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
         log(f"{camera}: {stats['published_detections']} detections, {stats.get('tracklets', 0)} tracklets")
 
     tracks_payload, track_stats = build_tracks(dataset, solved, dense, frame_of_row, aligned, published, solve["name"],
-                                               calibration, recovered_members)
+                                               calibration, recovered_members, identity_of)
     sizes["three_d_tracks/tracks.json"] = write_json(out / "three_d_tracks" / "tracks.json", tracks_payload)
     stats = {"published_detections": total_published, "detections_in_3d_tracks": in_3d,
              "share_in_3d_tracks": in_3d / total_published if total_published else 0.0, "human_sourced_rows": human_rows,
-             "recovered_detections": recovered_published, "recovered_already_a_detection": recovered_duplicates}
+             "recovered_detections": recovered_published, "recovered_already_a_detection": recovered_duplicates,
+             "recovered_adopted_detections": recovered_adopted, **coincide}
     slice_name = split_workspace_id(workspace_id)[1]
     limit = db["meta"].get("limit_frames")
     slice_note = f"pilot slice '{slice_name}': first {limit} native frames of every camera" if limit else \
@@ -1039,6 +1121,7 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
         "sync_indices": int(len(aligned)), "published_sync_indices": int(published.sum()),
         "detections": {"kept_total": kept_total, "published": total_published, "in_3d_tracks": in_3d,
                        "recovered_published": recovered_published, "recovered_already_a_detection": recovered_duplicates,
+                       "recovered_adopted": recovered_adopted, "recovered_coinciding": coincide,
                        "share_in_3d_tracks": round(stats["share_in_3d_tracks"], 4),
                        "kept_off_common_timeline": off_timeline, "human_sourced": human_rows,
                        "per_camera": per_camera},

@@ -24,7 +24,11 @@ Status: first version, 2026-11-18. Working example: `felix_20251223173052_202512
 Stages are functions of (recipe section, upstream outputs, active constraints). Each run
 stores an input hash; a stage is *fresh* while its hash is unchanged, *stale* otherwise.
 `Engine.advance()` applies answered tasks, runs every stale stage in order, turns the
-remaining unknowns into tasks and closes the round with a summary.
+remaining unknowns into tasks and closes the round with a summary. A stage may ask for a
+*lap*: earlier stages run again within the same round because it produced something they
+consume (`StageResult.rerun`). The stage judges whether a lap is worth its cost; the engine
+bounds the laps of a round and keeps an unserved request for the next one. Tasks are built
+once, after the last lap.
 
 | Stage | Runs | Produces | Owns unknowns |
 |---|---|---|---|
@@ -33,9 +37,9 @@ remaining unknowns into tasks and closes the round with a summary.
 | `calibration` | once, again on a human decision (base: the dataset's stored calibration in data_management, else the site default) | `calibration/calibration.json`, mount check | `calibration` |
 | `align` | once, again when calibration geometry changes | `alignment.json` (label payload), `sync_table.npz`, report | `alignment` |
 | `tracklets` | once | post-filter + BoT-SORT + over-split, per camera | - |
-| `autofit` | once | `evidence/autofit/labels.npz`: Autofit raw track id per detection (CPU, about a third of real time) | - |
+| `autofit` | once; again as a lap when `recover` produced enough detections it has not seen | `evidence/autofit/labels.npz`: Autofit raw track id per detection (CPU; 13 min for the felix hour, 2.5 min for golden's 10 min); input: the kept detections plus `evidence/autofit/extra.npz` (recovered poses) | - |
 | `solve` | every round | `solution.npz`, `tracks3d.npz`, `solve.json`, `alignment_check.json`, `swap_check.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage`, `alignment`, `identity_swap` |
-| `recover` | every round, after `solve` | `tracks3d_recovered.npz` (positions triangulated from poses read at each track's expected place), `recover.json`; crop poses cached in `recovered/` | - |
+| `recover` | every round, after `solve` | `tracks3d_recovered.npz` (positions triangulated from poses read at each track's expected place), `recover_rejected.npz`, `recover.json` (incl. the decision about an Autofit lap); crop poses cached in `recovered/` | - |
 | `tasks` | every round | human tasks | - |
 | `publish` | on request | label-set drafts / published sets | - |
 
@@ -139,18 +143,30 @@ the next round usually resolves many remaining unknowns by itself.
    within reach, or one was unmeasured for a while - is a *crossing*, tested with evidence
    that does not come from the 3D tracker: heading through the crossing, 3D body
    proportions before and after, single-camera tracklets in views where the two stay apart,
-   and appearance when embeddings exist. Two cues for "stay" and none for "swap" verify a
-   crossing; otherwise a person compares before and after. A track that ends within reach
+   and appearance (`appearance.py`: fast-reid embeddings of up to six crops per camera
+   before and after, computed only for the moments the other cues did not verify). Two cues
+   for "stay" and none for "swap" verify a crossing; otherwise a person compares before and
+   after. A track that ends within reach
    of an established one is checked the same way, one-sided (takeover). Pairs that share a
    spot for their whole common life are one person tracked twice and are skipped.
-10. **Coverage recovery** (`stages/recover.py`, `solve/coverage.py`). For every instant
-   missing inside a track (and 1 s beyond its ends) with a measured pose at most 3 s away,
-   that pose says where to look: it is projected into each camera that should see the
+10. **Coverage recovery** (`stages/recover.py`, `solve/coverage.py`), in passes. For every
+   instant missing inside a track (and 1 s beyond its ends) with a known pose at most 3 s
+   away - measured, or recovered by an earlier pass - that pose says where to look: it is
+   projected into each camera that should see the
    person, the top-down pose model reads a pose from each box (twice), and a position is
    accepted only as a gated triangulation of those poses - three or more cameras (tier A),
    or two cameras with strong image evidence inside a bracketed gap (tier B). A crop is
    dropped when another measured person overlaps the box and the pose follows them. The
-   hint never enters a position.
+   hint never enters a position. Passes repeat until one accepts nothing.
+11. **Autofit lap** (`autofit_refresh.py`). A recovered pose that does not coincide with a
+   kept detection is a new detection. Autofit gets these as ordinary detections - without
+   identities; it associates them itself - and tracks again; the solve then works from
+   longer independent tracks and the recovery from fewer, longer identities. The recover
+   stage asks for the lap only when it is worth about a round of compute: enough
+   detections Autofit has not seen (count and share of its input), the previous lap
+   removed identities, and the round's laps are not used up. The detections accumulate
+   across laps (valid for one alignment and calibration), so Autofit's input never
+   shrinks.
 7. **Unknowns** (`stages/solve.py`): free pieces with hypotheses → `association`; free
    pieces without → `unassigned` (short ones are grouped into one policy question per
    camera); unexplained starts → `identity_link`; co-located duplicates → `pose_ownership`.
@@ -175,14 +191,22 @@ the next round usually resolves many remaining unknowns by itself.
   linked 3D tracks is planned. One-frame shifts barely change residuals in this scene.
 * Coverage: recovery stops where the frames at the frontier of what is known do not yield
   an accepted pose; poses that triangulate but fail the acceptance gate are recorded
-  (`recover_rejected.npz`) and not shown to a person; a recovered pose that coincides with
-  an unassigned raw detection does not give that detection the track's identity; recovered
-  positions do not feed back into the next solve (they could let it attach more
-  detections).
+  (`recover_rejected.npz`) and not shown to a person; recovered positions do not feed back
+  into the next solve (they could let it attach more detections; today only the detection
+  directly under a recovered pose takes the identity, at publication). A track followed
+  beyond its end has no measured pose on the far side to anchor it: nothing but frame-to-
+  frame continuity and the absence of another measured identity ties a 30 s extension to
+  the same person (the nine longest on felix were viewed and are the same person).
+* Autofit lap: the recovered detections reach the solver only through Autofit's track ids
+  on the raw detections around them. They are not solver rows, so the single-camera
+  tracker does not see them and the solve does not triangulate from them (their positions
+  come from the recover stage). Making them first-class detections of the store would
+  touch every row-indexed artifact; not done. Autofit's own assignment of each recovered
+  pose (`extra_raw`) is written but not yet used to cross-check the recovery's identity.
 * Swap check: its body and appearance thresholds were fitted on one recording, and its
   recall is known only for injected swaps. A swap of two people who pass within about
-  0.3 m with similar builds rests on the 2D tracklet cue or a person; appearance embeddings
-  are not computed by the engine yet. A confirmed swap cuts the track at the reviewed
+  0.3 m with similar builds and similar clothes rests on the 2D tracklet cue or a person.
+  A confirmed swap cuts the track at the reviewed
   detection (within about 10 s of the swap), not at the exact frame.
 * Tracks that hand off with a short overlap (one person tracked twice for a moment) are
   recognised and skipped by the swap check but are not yet offered to identity linking as
@@ -289,6 +313,37 @@ the next round usually resolves many remaining unknowns by itself.
   Every instant that was looked at and is still missing is written with its reason
   (`recover_rejected.npz`); see `experiments/coverage/REPORT.md` for what a human answer
   would and would not change.
+* **2026-11-19 - appearance cue in the swap check.** Appearance alone is not reliable
+  enough to decide identity, but as one of two required independent cues at a known
+  moment between two known tracks it removes questions: on the felix hour 81 -> 51 swap
+  questions (verified 26 -> 56 of 107 moments). Injected swaps with the cue: 100/100
+  flagged while apart; at crossings 0 of 86 swaps verified, 3 of 86 takeovers verified
+  (all three at moments the check had flagged on the real data, i.e. where the real
+  track already looks swapped). Embeddings are computed only for unverified moments.
+* **2026-11-19 - a detection under a recovered pose takes the identity.** 37% of the
+  recovered pose views on golden coincide with a detection the detector had made: 1,043
+  the track's own single-view detection (the two pose readings agree to 0.6% of the box
+  height at the median), 215 belonging to no identity. Where labelled, those unassigned
+  detections are the track's golden person 50 of 52 times - the same rate as recovery
+  itself - so at publication an unassigned detection whose own keypoints show the same
+  pose (median joint distance <= 5% of box height) takes the track's identity, with the
+  recover provenance as its tracklet provenance (206 on golden). Detections of another
+  identity under a recovered pose (24) are left alone and counted.
+* **2026-11-19 - the pass limit is a safety bound.** With a limit of 40 passes felix was
+  still recovering about 30 positions per pass (two tracks being followed 1 s per pass
+  beyond their ends). The limit is now 400 and the summary says when it is hit.
+* **2026-11-19 - Autofit runs again with the recovered poses (a lap), when worth it.**
+  Experiment on golden (`experiments/autofit/augmented.py`): 2,240 recovered poses that are
+  not kept detections (0.7% of Autofit's input) took Autofit from 45 to 39 track ids over
+  the 17 labelled people (labelled detections on a track that is mostly someone else:
+  0.32% -> 0.29%) and the bench solve from 31 to 27 identities, impure observations
+  84 -> 50, identity questions 17 -> 15. In the engine the lap ran end to end on golden:
+  33 -> 29 identities; recovered poses on another golden person 9 of 422 -> 2 of 416
+  checkable views; the second recovery found 23 new detections and correctly declined a
+  further lap. Positions did not increase on golden (79,558 -> 79,552 measured, 1,125 ->
+  1,108 recovered): the gain there is consolidation and purity, not coverage. Autofit is
+  cheap here (2.5 min golden, 13 min per felix hour, CPU); the cost of a lap is the solve
+  and recovery that follow, hence the conditions in `RECIPE["autofit_refresh"]`.
 * **2026-11-19 - hand-offs singled out by the 2D trackers.** 38 track endings on the felix
   hour had another track born at the same spot within a few frames - one person tracked
   twice - that neither the hand-off merge nor identity linking joined: in a crowd the

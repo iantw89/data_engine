@@ -15,6 +15,7 @@ The golden labels are used for scoring only; nothing from them enters the solver
 from __future__ import annotations
 
 import copy
+import os
 import hashlib
 import json
 import pickle
@@ -81,7 +82,9 @@ VARIANTS: dict[str, dict] = {
                                             "refine": {"merge_handoffs": True, "temporal_reach_frames": 10},
                                             "temporal": {"same_spot_gap_s": 60.0, "same_spot_radius_m": 0.3}},
 }
-AUTOFIT_LABELS = Path("C:/data_engine_data/_scratch/autofit") / WORKSPACE / "kept" / "labels.npz"
+# BENCH_AUTOFIT_LABELS: another Autofit run of the same workspace (e.g. one that also got the recovered poses)
+AUTOFIT_LABELS = Path(os.environ.get("BENCH_AUTOFIT_LABELS") or
+                      Path("C:/data_engine_data/_scratch/autofit") / WORKSPACE / "kept" / "labels.npz")
 
 
 def merged(base: dict, override: dict) -> dict:

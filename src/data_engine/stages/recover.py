@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .. import autofit_refresh
 from ..config import RECIPE
 from ..engine import Context, StageResult
 from ..solve import coverage
@@ -169,6 +170,48 @@ def save_rejected(directory: Path, rejected: dict) -> dict:
     return {"by_reason": dict(Counter(record["reason"] for record in records)), "gate_conditions_failed": dict(failed)}
 
 
+HISTORY_KEY = "autofit_refresh_history"
+
+
+def consider_autofit_refresh(context: Context, scene, arrays: dict, identities: int) -> dict:
+    """Should Autofit run again with the recovered poses as detections (``autofit_refresh.decide``)?
+
+    When yes, the detections Autofit will get are written to ``evidence/autofit/extra.npz`` and the lap is
+    recorded in the workspace's history; the caller asks the engine to rerun Autofit.
+    """
+    workspace = context.workspace
+    evidence = workspace.path("evidence", "autofit")
+    if not (evidence / "labels.npz").is_file() or not (evidence / "meta.json").is_file():
+        return {"refresh": False, "reason": "no Autofit tracks in this workspace"}
+    signature = {"sync_table": file_sha256(workspace.path("alignment", "sync_table.npz")),
+                 "calibration": file_sha256(workspace.path("calibration", "calibration.json"))}
+    known = autofit_refresh.load(evidence / "extra.npz", signature)
+    cameras = [{"name": camera.camera, "frame_of_row": camera.detections.frame_of_row,
+                "boxes": camera.detections.boxes, "kept": camera.kept} for camera in scene.cameras]
+    found = autofit_refresh.new_detections(arrays, cameras)
+    union, added = autofit_refresh.merge(known, found)
+    meta = json.loads((evidence / "meta.json").read_text(encoding="utf-8"))
+    history = list(context.db.get_meta(HISTORY_KEY, []))
+    if history and history[-1].get("identities_after") is None:
+        # this recovery follows the solve of the last lap: it shows what the lap achieved
+        used = json.loads((evidence / "inputs.json").read_text(encoding="utf-8")) if (evidence / "inputs.json").is_file() else {}
+        if (evidence / "extra.npz").is_file() and used.get("extra_detections") == file_sha256(evidence / "extra.npz"):
+            history[-1]["identities_after"] = int(identities)
+            history[-1]["autofit_seconds"] = meta.get("tracking_wall_s")
+    laps = sum(1 for lap in history if lap["round"] == context.round)
+    decision = autofit_refresh.decide(new=added, fed=int(meta.get("detections_fed", 0)), identities=identities,
+                                      history=history, laps_this_round=laps, recipe=RECIPE["autofit_refresh"])
+    decision["detections_autofit_has"] = int(len(known["frame"]))
+    decision["autofit_seconds_last_run"] = meta.get("tracking_wall_s")
+    if decision["refresh"]:
+        autofit_refresh.save(evidence / "extra.npz", union, signature)
+        history.append({"round": context.round, "new": added, "total": int(len(union["frame"])),
+                        "identities_before": int(identities), "identities_after": None})
+    context.db.set_meta(HISTORY_KEY, history)
+    decision["history"] = history
+    return decision
+
+
 def run(context: Context) -> StageResult:
     workspace = context.workspace
     site = workspace.site
@@ -209,6 +252,10 @@ def run(context: Context) -> StageResult:
                "still_missing_after_looking": remaining, "stopped_by_pass_limit": result["stopped_by_pass_limit"],
                "crops_read_now": reader.read_now,
                "worker_seconds": round(reader.worker_seconds, 1), "seconds": round(time.time() - started, 1)}
+    solved_identity = tracks["identity"][tracks["identity"] >= 0]
+    refresh = consider_autofit_refresh(context, scene, arrays, int(len(np.unique(solved_identity))))
+    summary["autofit_refresh"] = refresh
+    context.log(("another Autofit lap: " if refresh["refresh"] else "no Autofit lap: ") + refresh["reason"])
     (directory / "recover.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     context.log(f"recovered {count} positions in {len(result['passes'])} passes ({tiers['A']} from three or more "
                 f"cameras, {tiers['B']} from two); missing inside tracks {result['inside_missing_before']} -> "
@@ -220,4 +267,5 @@ def run(context: Context) -> StageResult:
         metrics=summary, inputs=inputs,
         message=f"{count} positions recovered from pixels in {len(result['passes'])} passes; missing inside tracks "
                 f"{result['inside_missing_before']} -> {result['inside_missing_after']}",
-        outputs={name: f"{relative}/{name}" for name in ("tracks3d_recovered.npz", "recover_rejected.npz", "recover.json")})
+        outputs={name: f"{relative}/{name}" for name in ("tracks3d_recovered.npz", "recover_rejected.npz", "recover.json")},
+        rerun=("autofit",) if refresh["refresh"] else ())

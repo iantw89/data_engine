@@ -624,6 +624,59 @@ def test_recovered_positions_and_their_2d_poses_are_published(tmp_path, monkeypa
         assert pm.check_drafts(drafts)["ok"]
 
 
+def test_unassigned_detection_under_a_recovered_pose_takes_the_identity(tmp_path, monkeypatch):
+    root, _, native = make_workspace(tmp_path)
+    monkeypatch.setattr(pm, "code_identity", lambda: dict(GOOD_CODE))
+    add_recovered(root, native)
+    frame = int(native[5, 1])
+    solution = dict(np.load(root / "rounds/r001/solution.npz"))
+    for name in ("identity_c1", "component_c1", "atom_c1"):  # the solve left c1's detection of person A unassigned there
+        solution[name][2 * frame] = -1
+    np.savez_compressed(root / "rounds/r001/solution.npz", **solution)
+    drafts = pm.build_drafts(root, DATASET, "adopt", tmp_path / "adopt", stride=1)
+    counts = drafts.summary["detections"]
+    assert counts["recovered_adopted"] == 1 and counts["recovered_already_a_detection"] == 1
+    recover_name = next(name for name in drafts.summary["provenance"]["names"] if name.startswith("data_engine.recover."))
+    camera = json.loads((tmp_path / "adopt/two_d_tracklets/cameras/c1.json").read_text(encoding="utf-8"))
+    detections = next(f for f in camera["frames"] if f["frame"] == frame)["detections"]
+    adopted = next(d for d in detections if d["source_id"] == f"c1/{frame}/0")
+    assert adopted["tracklet_provenance"] == recover_name and "position_provenance" not in adopted  # the detector's box
+    assert not [d for d in detections if "/R" in d["source_id"]]
+    tracks = json.loads((tmp_path / "adopt/three_d_tracks/tracks.json").read_text(encoding="utf-8"))["tracks"]
+    track = next(t for t in tracks if t["track_id"] == 0)
+    # it joins the run of this identity's other detections around it (one tracklet per run of consecutive frames)
+    member = next(m for m in track["members"] if m["camera"] == "c1" and m["tracklet_id"] == adopted["tracklet_id"])
+    assert member["frame_range"][0] <= frame <= member["frame_range"][1]
+
+
+def test_a_detection_is_not_adopted_when_the_pose_differs_or_two_identities_claim_it():
+    class Detections:
+        boxes = np.array([[100, 100, 200, 400, 0.9]], np.float32)
+        keypoints = np.stack([np.linspace(110, 190, 17), np.linspace(110, 390, 17), np.full(17, 0.8)], axis=1)[None]
+
+        def rows(self, frame):
+            return range(0, 1) if frame == 3 else range(0, 0)
+
+    def recovered(identities, shift=0.0):
+        count = len(identities)
+        keypoints = np.repeat(Detections.keypoints[None], count, axis=0).astype(np.float64)
+        keypoints[..., 0] += shift
+        return {"t": np.zeros(count, np.int64), "identity": np.array(identities), "pose_frame": np.full((count, 1), 3),
+                "pose_box": np.repeat(np.array([[[100.0, 100, 200, 400]]]), count, axis=0), "pose_keypoints": keypoints}
+
+    kept, published, nobody = np.ones(1, bool), np.ones(1, bool), np.array([-1])
+    one = pm.recovered_camera_detections(0, recovered([4]), Detections(), kept, None, published, identity=nobody)
+    assert one["adopted_rows"].tolist() == [0] and one["adopted_identity"].tolist() == [4] and not len(one["frame"])
+    identity, atom = pm.adopt(nobody, np.array([9]), one)
+    assert identity.tolist() == [4] and atom.tolist() == [-1]
+    moved = pm.recovered_camera_detections(0, recovered([4], shift=40.0), Detections(), kept, None, published, identity=nobody)
+    assert moved["adopted"] == 0 and moved["coincide_unassigned_pose_differs"] == 1
+    two = pm.recovered_camera_detections(0, recovered([4, 5]), Detections(), kept, None, published, identity=nobody)
+    assert two["adopted"] == 0 and two["adoption_conflicts"] == 1
+    taken = pm.recovered_camera_detections(0, recovered([4]), Detections(), kept, None, published, identity=np.array([6]))
+    assert taken["adopted"] == 0 and taken["coincide_with_other_identity"] == 1
+
+
 def test_recovered_positions_of_another_solution_are_ignored(tmp_path, monkeypatch):
     root, _, native = make_workspace(tmp_path)
     monkeypatch.setattr(pm, "code_identity", lambda: dict(GOOD_CODE))

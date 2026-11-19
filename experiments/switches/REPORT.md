@@ -68,14 +68,33 @@ Of the first felix exchanges viewed, one is a real swap (two people at adjacent 
 machines: teal shirt and red shirt change tracks at 37.6-38.7 s). Flagged endings before the
 hand-off exclusion were the same person tracked twice.
 
+## 3b. Appearance cue (2026-11-19)
+
+`src/data_engine/appearance.py` embeds up to six crops per camera of each of the two identities
+before and after the moment (fast-reid SBS R50-NL, MSMT17; boxes at least 48 px tall) and
+compares "labels kept" with "labels exchanged". The solve asks for embeddings only at
+moments the other cues did not verify. Felix hour (solution r006), `--appearance`:
+
+| | without | with appearance |
+|---|---|---|
+| Verified by two independent cues | 26 | 56 |
+| Review questions | 81 | 51 (29 flagged, 22 unverified) |
+| Injected swap while apart: flagged | 100 / 100 | 100 / 100 |
+| Injected takeover while apart: flagged or reviewed | 99 / 100 | 99 / 100 |
+| Injected swap at a crossing: verified (missed) | 0 / 86 | 0 / 86 |
+| Injected takeover at a crossing: verified (missed) | 1 / 86 | 3 / 86 |
+
+The three missed takeovers were injected at moments the check flags on the real data: the
+track is already inconsistent there, so exchanging the labels makes it look consistent.
+Golden: all 6 moments verified, 0 questions; every injected swap still flagged.
+
 ## 4. Limits
 
 * Injection exchanges labels, so it validates the continuity part and the before/after
   cues; it cannot reproduce what a real swap inside Autofit's filter looks like.
 * For two people of similar build who pass within about 0.3 m, heading and body carry
-  little; the decision rests on tracklets in a separated view or on the reviewer.
-  Appearance was the strongest cue at that range on golden (20 cases) and is not computed
-  by the engine yet.
+  little; the decision rests on tracklets in a separated view, appearance (two people in
+  similar clothes defeat it) or the reviewer.
 * Body and appearance thresholds come from 16 golden encounters; heading thresholds are
   round numbers. All are in `RECIPE["swap_check"]` and provisional.
 * Single-row contamination (a neighbour's detection attached for a frame or two) is not a
@@ -87,6 +106,7 @@ hand-off exclusion were the same person tracked twice.
 ```
 python experiments/switches/run_swap_check.py "golden_20250505071549_20250505080000@first600s" --inject 100
 python experiments/switches/run_swap_check.py felix_20251223173052_20251223183103 --inject 100 --out felix.json
+python experiments/switches/run_swap_check.py felix_20251223173052_20251223183103 --inject 100 --appearance
 python experiments/switches/sheets.py felix_20251223173052_20251223183103 felix.json OUT_DIR --kind exchange
 ```
 The research scripts are listed in their docstrings (`build_solutions.py` first).

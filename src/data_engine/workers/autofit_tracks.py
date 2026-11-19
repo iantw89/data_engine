@@ -18,6 +18,11 @@ Output: <out-root>/<workspace-name>/<variant>/labels.npz with, per camera name:
     t_<cam>       int32 (rows,)  sync index at which the row was fed (-1 not fed)
 and the 3D poses: pose_tid, pose_t, pose_state (0 tracked 1 tentative(back-filled) 2 lost), pose_ncam, pose_xyz (N,12,3)
 (inches, z up, Autofit JointIndex order), plus per-frame wall times and a verification of reprojection.
+
+``--extra FILE.npz`` adds detections that are not in the raw store (poses the recover stage read from guided
+crops): arrays ``camera`` (name), ``frame``, ``box`` (N, 4), ``keypoints`` (N, 17, 3), ``score``. They are fed
+like any detection of their frame - without an identity: Autofit associates them itself - and their tracker
+ids are written as ``extra_raw`` / ``extra_global`` / ``extra_t`` in the order of the file.
 """
 from __future__ import annotations
 
@@ -156,7 +161,10 @@ def main() -> int:
     parser.add_argument("--tag", default="")
     parser.add_argument("--out", type=Path, help="write labels.npz/meta.json here instead of <out-root>/<workspace>/<variant>")
     parser.add_argument("--progress", type=Path, help="JSON progress file updated while tracking")
+    parser.add_argument("--extra", type=Path, help="npz of additional detections (camera, frame, box, keypoints, score)")
     args = parser.parse_args()
+    extra = dict(np.load(args.extra)) if args.extra else None
+    extra_rows = {}  # camera index -> rows of the extra file, in the order they were appended
 
     ws = args.workspace
     dataset = json.loads((ws / "dataset.json").read_text(encoding="utf-8"))
@@ -179,6 +187,16 @@ def main() -> int:
             kept = data["kept"]
         assert len(kept) == len(boxes), (names[i], len(kept), len(boxes))
         frame_of_row = np.repeat(np.arange(len(start) - 1, dtype=np.int32), np.diff(start))
+        base_rows = len(boxes)
+        if extra is not None:
+            mine = np.flatnonzero((extra["camera"].astype(str) == names[i]) & (extra["frame"] < len(start) - 1))
+            if len(mine):
+                added = np.column_stack([extra["box"][mine], extra["score"][mine]]).astype(boxes.dtype)
+                boxes = np.concatenate([boxes, added])
+                keypoints = np.concatenate([keypoints, np.nan_to_num(extra["keypoints"][mine]).astype(keypoints.dtype)])
+                frame_of_row = np.concatenate([frame_of_row, extra["frame"][mine].astype(np.int32)])
+                kept = np.concatenate([kept, np.ones(len(mine), bool)])
+                extra_rows[i] = mine
         shown = np.flatnonzero(native[:, i] >= 0)
         sync_of_frame = np.full(len(start) - 1, -1, np.int32)
         frames = native[shown, i]
@@ -198,7 +216,8 @@ def main() -> int:
         rows = rows[np.argsort(t_of_row[rows], kind="stable")]
         row_start = np.searchsorted(t_of_row[rows], np.arange(len(native) + 1))
         cams[i] = dict(boxes=boxes, keypoints=keypoints, rows=rows, row_start=row_start, t_of_row=t_of_row,
-                       covered=covered, sync_of_frame=sync_of_frame, n_rows=len(boxes), frame_count=len(start) - 1)
+                       covered=covered, sync_of_frame=sync_of_frame, n_rows=len(boxes), base_rows=base_rows,
+                       frame_count=len(start) - 1)
 
     camera_meta = [CameraMeta(cid, f"camera_{cid}", 0, (1280, 960)) for cid in cal_ids]
     config = dict(yaml_load(TRACKER_CFG))
@@ -307,9 +326,18 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     arrays = {"cameras": np.array([names[i] for i in used])}
     for i in used:
-        arrays[f"raw_{names[i]}"] = raw[i]
-        arrays[f"global_{names[i]}"] = glob[i]
-        arrays[f"t_{names[i]}"] = tfed[i]
+        base = cams[i]["base_rows"]
+        arrays[f"raw_{names[i]}"] = raw[i][:base]
+        arrays[f"global_{names[i]}"] = glob[i][:base]
+        arrays[f"t_{names[i]}"] = tfed[i][:base]
+    if extra is not None:
+        count = len(extra["frame"])
+        arrays["extra_raw"], arrays["extra_global"] = np.full(count, -1, np.int32), np.full(count, -1, np.int32)
+        arrays["extra_t"] = np.full(count, -1, np.int32)
+        for i, mine in extra_rows.items():
+            base = cams[i]["base_rows"]
+            arrays["extra_raw"][mine], arrays["extra_global"][mine] = raw[i][base:], glob[i][base:]
+            arrays["extra_t"][mine] = tfed[i][base:]
     if poses:
         arrays["pose_tid"] = np.array([p[0] for p in poses], np.int32)
         arrays["pose_t"] = np.array([p[1] for p in poses], np.int32)
@@ -326,6 +354,8 @@ def main() -> int:
         "frames": T - args.t_start, "tracking_wall_s": round(wall_tracking, 1), "merger_wall_s": round(merger_s, 1),
         "mean_s_per_frame": round(float(np.mean(frame_times)), 4), "p95_s_per_frame": round(float(np.percentile(frame_times, 95)), 4),
         "detections_fed": int(sum(det_counts)), "tracker_ids": len(track_frames), "assigned_detections": len(assignments),
+        "extra_detections": int(sum(len(v) for v in extra_rows.values())),
+        "extra_assigned": int((arrays["extra_raw"] >= 0).sum()) if extra is not None else 0,
         "duplicate_assignment_conflicts": conflicts, "merged_tracker_ids": len(sent),
         "global_ids": len({g for s in snapshots for g in s.values()}), "final_tracker_to_global": {str(k): v for k, v in final.items()},
         "torch_threads": torch.get_num_threads(), "device": human_bot_sort.TORCH_DEVICE,
