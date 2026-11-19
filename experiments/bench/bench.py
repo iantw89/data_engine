@@ -75,6 +75,8 @@ VARIANTS: dict[str, dict] = {
                                                                       "only_candidate_speed_mps": float(speed)}}
        for gap, speed in ((10, 3), (30, 3), (60, 3), (120, 3), (30, 12), (120, 12))},
     "adopted+duplicates": {"_external": "raw", "refine": {"mark_duplicates": True}},
+    # hand-offs that position alone cannot single out, singled out by continuing 2D tracklets in N cameras
+    **{f"adopted+handoff_tracklets{n}": {"_external": "raw", "refine": {"handoff_tracklets": n}} for n in (1, 2, 3)},
     "autofit+handoff+temporal10+spot60r30": {"_external": "raw",
                                             "refine": {"merge_handoffs": True, "temporal_reach_frames": 10},
                                             "temporal": {"same_spot_gap_s": 60.0, "same_spot_radius_m": 0.3}},

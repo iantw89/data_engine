@@ -70,11 +70,21 @@ def main() -> None:
     parser.add_argument("workspace")
     parser.add_argument("--inject", type=int, default=0)
     parser.add_argument("--out")
+    parser.add_argument("--appearance", action="store_true", help="add the appearance cue (fast-reid, GPU) for every moment")
     args = parser.parse_args()
     scene, row_identity, tracks, directory = load(args.workspace)
     recipe = RECIPE["swap_check"]
     identity = tracks["identity"].astype(np.int64)
-    result = swap_check.check(scene, row_identity, identity, tracks["t"], tracks["root"], tracks["xyz"], recipe)
+    embeddings = None
+    if args.appearance:
+        from data_engine import appearance
+        embed = appearance.embedder(scene.workspace, [camera.camera for camera in scene.cameras])
+        probe = swap_check.Index.build(scene, row_identity, identity, tracks["t"], tracks["root"], tracks["xyz"],
+                                       window=recipe["window_frames"])
+        found, _ = swap_check.moments(probe, scene.T, recipe)
+        embeddings = embed(swap_check.appearance_rows(probe, found))
+    result = swap_check.check(scene, row_identity, identity, tracks["t"], tracks["root"], tracks["xyz"], recipe,
+                              embeddings=embeddings)
     minutes = scene.T / 600
     entries = result["entries"]
     print(directory)
@@ -117,7 +127,7 @@ def main() -> None:
             if not hits:
                 outcome["no moment found (MISSED)"] += 1
                 continue
-            statuses = {swap_check.evaluate(index, m, recipe)["status"] for m in hits}
+            statuses = {swap_check.evaluate(index, m, recipe, embeddings)["status"] for m in hits}
             outcome["flagged" if "flagged" in statuses else "unverified (reviewed)" if "unverified" in statuses
                     else "verified (MISSED)"] += 1
         print(f"injected {'takeover' if takeover else 'swap'} while apart ({len(picks)} of {len(candidates)} instants):",
@@ -130,7 +140,8 @@ def main() -> None:
         for entry in picks:
             s, e = entry["t"]
             index = exchanged_index(scene, row_identity, tracks, entry["a"], entry["b"], (s + e + 1) // 2, takeover, full)
-            verdict = swap_check.evaluate(index, {"kind": "crossing", "a": entry["a"], "b": entry["b"], "t": (s, e)}, recipe)
+            verdict = swap_check.evaluate(index, {"kind": "crossing", "a": entry["a"], "b": entry["b"], "t": (s, e)}, recipe,
+                                          embeddings)
             outcome[verdict["status"] if verdict["status"] != "verified" else "verified (MISSED)"] += 1
             if verdict["status"] == "verified":
                 was[entry["status"]] += 1

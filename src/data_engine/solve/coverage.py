@@ -201,11 +201,16 @@ class Plan:
     counts: dict = field(default_factory=dict)
 
 
-def plan(scene: Scene, presence: Presence, recipe: dict, min_angle_deg: float) -> Plan:
+def plan(scene: Scene, presence: Presence, recipe: dict, min_angle_deg: float,
+         only: set[tuple[int, int]] | None = None) -> Plan:
+    """Cases and crops for the missing instants (``only``: restrict to these (identity, t) - used when a
+    later pass looks again around positions that were just recovered)."""
     cases, jobs = [], []
     counts = {"missing_instants": 0, "without_hint": 0, "seen_by_fewer_than_2_cameras": 0}
     centers = [camera.cam.center if camera.cam is not None else None for camera in scene.cameras]
     for who, t in missing_instants(presence, scene.T, int(recipe["end_frames"])):
+        if only is not None and (who, t) not in only:
+            continue
         counts["missing_instants"] += 1
         hint = make_hint(presence, who, t, int(recipe["reach_frames"]))
         if hint is None:
@@ -350,6 +355,21 @@ def bone_ranges(xyz: np.ndarray, low: float = 0.5, high: float = 99.5) -> np.nda
     return np.array([np.percentile(np.linalg.norm(sample[:, a] - sample[:, b], axis=1), [low, high]) for a, b in BONES])
 
 
+def failed_gates(features: dict, recipe: dict, name: str) -> list[str]:
+    """Which conditions of tier ``name`` a recovery does not meet (empty: it would be accepted)."""
+    gate = recipe["tiers"][name]
+    checks = [("cameras", features["cameras"] >= gate["min_cameras"]),
+              ("body joints", features["body_joints"] >= gate["min_body_joints"]),
+              ("residual", features["median_residual_px"] <= gate["max_median_residual_px"]),
+              ("bone lengths", features["bad_bones"] <= gate["max_bad_bones"]),
+              ("distance from the hint", features["hint_distance_in"] <= gate["max_hint_distance_in"]),
+              ("image confidence", features["weakest_view_peak"] >= gate["min_view_peak"]),
+              ("another identity is measured there", features["other_identity_in"] >= recipe["other_identity_clear_in"])]
+    if name == "B":
+        checks.append(("not bracketed by nearby poses", features["hint_kind"] == 0 and features["hint_frames"] <= gate["max_hint_frames"]))
+    return [label for label, passed in checks if not passed]
+
+
 def tier(features: dict, recipe: dict) -> str | None:
     """Name of the tier that accepts a recovery ("A": three or more cameras, "B": two cameras), else None."""
     for name in ("A", "B"):
@@ -374,16 +394,19 @@ class Recovered:
     tier: list = field(default_factory=list)
     jobs: list = field(default_factory=list)  # job index per camera (-1 = camera not used)
     reasons: dict = field(default_factory=dict)
+    # Every case that was not accepted: {"case", "reason", and for gate rejections "features", "failed", "root", "xyz"}
+    rejected: list = field(default_factory=list)
 
 
 def accept(scene: Scene, presence: Presence, tr_identity: np.ndarray, tr_t: np.ndarray, the_plan: Plan,
-           keypoints: np.ndarray, boxes: np.ndarray, geometry: dict, recipe: dict) -> Recovered:
+           keypoints: np.ndarray, boxes: np.ndarray, geometry: dict, recipe: dict,
+           ranges: np.ndarray | None = None) -> Recovered:
     """Triangulate and gate every case. ``keypoints`` (J, 17, 3) and ``boxes`` (J, 4) are what the pose model
-    read for each job (NaN where it did not run)."""
+    read for each job (NaN where it did not run). ``ranges``: plausible bone lengths (default: from ``presence``)."""
     measured_at: dict[int, list[int]] = {}
     for row in np.flatnonzero((tr_identity >= 0) & np.isfinite(presence.root).all(axis=1)):
         measured_at.setdefault(int(tr_t[row]), []).append(int(row))
-    ranges = bone_ranges(presence.xyz)
+    ranges = bone_ranges(presence.xyz) if ranges is None else ranges
     jobs_of: dict[int, list[int]] = {}
     for job, case in enumerate(the_plan.job_case):
         jobs_of.setdefault(int(case), []).append(job)
@@ -419,11 +442,14 @@ def accept(scene: Scene, presence: Presence, tr_identity: np.ndarray, tr_t: np.n
                 continue
             reads.append(Read(camera.index, pose, boxes[job].astype(np.float64), job))
         if len({read.camera for read in reads}) < 2:
-            reasons["crops follow another person" if dropped else "no pose read in two cameras"] += 1
+            reason = "crops follow another person" if dropped else "no pose read in two cameras"
+            reasons[reason] += 1
+            out.rejected.append({"case": case, "reason": reason})
             continue
         found = consistent_set(scene, reads, geometry, recipe, the_plan.root[case])
         if found is None:
             reasons["no consistent pose in two cameras"] += 1
+            out.rejected.append({"case": case, "reason": "no consistent pose in two cameras"})
             continue
         xyz, root = found["xyz"], found["root"]
         worst = np.nanmax(np.where(found["used"], found["residual"], np.nan), axis=0) if found["used"].any() else np.zeros(17)
@@ -439,6 +465,10 @@ def accept(scene: Scene, presence: Presence, tr_identity: np.ndarray, tr_t: np.n
         accepted = tier(features, recipe)
         if accepted is None:
             reasons["rejected by the acceptance gate"] += 1
+            name = "A" if features["cameras"] >= recipe["tiers"]["A"]["min_cameras"] else "B"
+            out.rejected.append({"case": case, "reason": "rejected by the acceptance gate", "features": features,
+                                 "failed": failed_gates(features, recipe, name), "tier_tried": name,
+                                 "root": root, "xyz": xyz})
             continue
         reasons["accepted"] += 1
         per_camera = np.full(len(scene.cameras), -1, np.int64)
@@ -453,3 +483,96 @@ def accept(scene: Scene, presence: Presence, tr_identity: np.ndarray, tr_t: np.n
         out.jobs.append(per_camera)
     out.reasons = reasons
     return out
+
+
+# --------------------------------------------------------------------------- recursion from the edges
+
+
+def recover_iteratively(scene: Scene, identity: np.ndarray, t: np.ndarray, root: np.ndarray, xyz: np.ndarray,
+                        read, geometry: dict, recipe: dict, log=print) -> dict:
+    """Recover positions pass after pass, each pass looking around what the previous one found.
+
+    A pass can only look where a known pose is at most ``reach_frames`` away. Every accepted recovery is
+    itself a measured pose, so the next pass uses it as the hint for its neighbours: gaps are closed from
+    both edges inwards, and tracks are followed beyond the instants where they first appear and last
+    disappear, for as long as poses keep triangulating and passing the acceptance gate. It stops when a
+    pass accepts nothing (or after ``max_passes``).
+
+    ``read(plan) -> (keypoints (J, 17, 3), boxes (J, 4))`` reads the crops of a plan.
+    Returns the recovered person-frames (arrays), the per-pass log and, for every instant that was looked
+    at and is still missing, why (``rejected``: {(identity, t): record}).
+    """
+    measured = (identity >= 0) & np.isfinite(root).all(axis=1)
+    known_identity, known_t = identity[measured].astype(np.int64), t[measured].astype(np.int64)
+    known_root, known_xyz = root[measured].astype(np.float64), xyz[measured].astype(np.float64)
+    ranges = bone_ranges(known_xyz)  # from measured poses only: recoveries must not widen their own gate
+    cameras = len(scene.cameras)
+    out = {name: [] for name in ("identity", "t", "xyz", "used", "residual", "root", "tier", "pass", "hint_kind",
+                                 "hint_frames", "pose_frame", "pose_keypoints", "pose_box")}
+    rejected: dict[tuple[int, int], dict] = {}
+    passes, only, first_counts, exhausted = [], None, None, False
+    reach = int(recipe["reach_frames"])
+    for number in range(int(recipe["max_passes"])):
+        presence = build_presence(known_identity, known_t, known_root, known_xyz)
+        the_plan = plan(scene, presence, recipe, geometry["min_ray_angle_deg"], only=only)
+        if first_counts is None:
+            first_counts = dict(the_plan.counts)
+        if not len(the_plan.t):
+            exhausted = True
+            break
+        keypoints, boxes = read(the_plan)
+        result = accept(scene, presence, known_identity, known_t, the_plan, keypoints, boxes, geometry, recipe, ranges)
+        for record in result.rejected:
+            case = record["case"]
+            key = (int(the_plan.identity[case]), int(the_plan.t[case]))
+            rejected[key] = {**{k: v for k, v in record.items() if k != "case"}, "pass": number,
+                             "hint_kind": int(the_plan.kind[case]), "hint_frames": int(the_plan.distance[case])}
+        cases = np.array(result.case, np.int64)
+        passes.append({"pass": number, "cases": int(len(the_plan.t)), "crops": int(len(the_plan.job_case)),
+                       "accepted": int(len(cases)), "outcome": dict(result.reasons)})
+        log(f"pass {number + 1}: {len(the_plan.t)} instants looked at, {len(cases)} positions recovered")
+        if not len(cases):
+            exhausted = True
+            break
+        used = np.array(result.used, bool).reshape(len(cases), cameras, 17)
+        residual = np.array(result.residual, np.float64).reshape(len(cases), cameras, 17)
+        jobs = np.array(result.jobs, np.int64).reshape(len(cases), cameras)
+        has = jobs >= 0
+        safe = np.clip(jobs, 0, None)
+        out["identity"].append(the_plan.identity[cases])
+        out["t"].append(the_plan.t[cases])
+        out["xyz"].append(np.array(result.xyz, np.float64).reshape(len(cases), 17, 3))
+        out["used"].append(used)
+        out["residual"].append(residual)
+        out["root"].append(np.array(result.root, np.float64).reshape(len(cases), 3))
+        out["tier"].append(np.array(result.tier, dtype="U1"))
+        out["pass"].append(np.full(len(cases), number, np.int16))
+        out["hint_kind"].append(the_plan.kind[cases])
+        out["hint_frames"].append(the_plan.distance[cases])
+        out["pose_frame"].append(np.where(has, the_plan.job_frame[safe], -1))
+        out["pose_keypoints"].append(np.where(has[:, :, None, None], keypoints[safe], np.nan))
+        out["pose_box"].append(np.where(has[:, :, None], boxes[safe], np.nan))
+        known_identity = np.concatenate([known_identity, the_plan.identity[cases]])
+        known_t = np.concatenate([known_t, the_plan.t[cases]])
+        known_root = np.concatenate([known_root, out["root"][-1]])
+        known_xyz = np.concatenate([known_xyz, out["xyz"][-1]])
+        only = set()
+        for who, when in zip(the_plan.identity[cases], the_plan.t[cases]):
+            rejected.pop((int(who), int(when)), None)
+            only.update((int(who), int(when) + delta) for delta in range(-reach, reach + 1) if delta)
+    empty = {"identity": np.zeros(0, np.int64), "t": np.zeros(0, np.int64), "xyz": np.zeros((0, 17, 3)),
+             "used": np.zeros((0, cameras, 17), bool), "residual": np.zeros((0, cameras, 17)), "root": np.zeros((0, 3)),
+             "tier": np.zeros(0, "U1"), "pass": np.zeros(0, np.int16), "hint_kind": np.zeros(0, np.int8),
+             "hint_frames": np.zeros(0, np.int32), "pose_frame": np.zeros((0, cameras), np.int64),
+             "pose_keypoints": np.zeros((0, cameras, 17, 3)), "pose_box": np.zeros((0, cameras, 4))}
+    arrays = {name: (np.concatenate(parts) if parts else empty[name]) for name, parts in out.items()}
+    final = build_presence(known_identity, known_t, known_root, known_xyz)
+    return {"arrays": arrays, "passes": passes, "rejected": rejected, "first_plan": first_counts or {},
+            "stopped_by_pass_limit": not exhausted,
+            "inside_missing_before": inside_missing(build_presence(identity[measured], t[measured], root[measured], xyz[measured])),
+            "inside_missing_after": inside_missing(final), "positions_before": int(measured.sum())}
+
+
+def inside_missing(presence: Presence) -> int:
+    """Instants without a position between each identity's first and last known position."""
+    return int(sum(int(times[-1]) - int(times[0]) + 1 - len(times) for times in presence.t.values()))

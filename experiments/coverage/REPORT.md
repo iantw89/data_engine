@@ -69,8 +69,13 @@ negatives (no held-out set); one 10-minute recording whose detector was fine-tun
 fewer than two cameras, 145 where the crops follow another person, 810 with no consistent
 pose in two cameras, 926 with a pose that the acceptance gate rejects.
 
-The negative controls also exposed real people the engine never tracked at all - a
-coverage problem that gap recovery does not touch.
+Correction (2026-11-19): the research report called two accepted negative controls "real
+people the engine never tracked". Checked against the tracks, that is wrong. One is identity
+9 inside a 1.2 s gap of its own track (measured 0.9 s before and 0.4 s after at that spot).
+The other is a person with no position within 5 s at that spot while two tracks are
+unmeasured there (one starts 6.6 s later, 6 m away; one has a 100 s gap). Both are people
+who are tracked at other times and unmeasured at that instant - which is what recovery is
+for. Everyone who is ever seen by two cameras has a track at some point.
 
 ## 5. Felix hour (no labels; `recovered_sanity.py`)
 
@@ -85,6 +90,46 @@ Continuity check: the distance from a recovered root to the same person's measur
 frame earlier or later is 0.07 m at the median and 0.46 m at p99 (maximum 0.72 m);
 between adjacent measured roots it is 0.03 m and 0.28 m. Rendered examples
 (`--sheets`) show the recovered pose on the same person as the neighbouring detections.
+
+## 6. Recursion from the edges (2026-11-19)
+
+The first version only looked where a measured pose was at most 3 s away. That limit is a
+property of one pass, not of the method: every accepted recovery is itself a measured pose,
+so the stage now runs in passes and each pass uses what the previous one found as the hint
+for its neighbours. Gaps close from both edges inwards, and tracks are followed beyond where
+they first appear and last disappear, until a pass accepts nothing.
+
+Golden: 749 positions in one pass -> 1,125 in 7 passes (931 from three or more cameras,
+194 from two). Of 422 camera views checkable against golden boxes, 407 are on the right
+person, 9 on another person (2.1%; it was 1.9% for a single pass), 6 low overlap. Missing
+inside tracks 4,561 -> 3,483.
+
+## 7. What is still missing, and what would change it (`rejected_impact.py`, golden)
+
+Of the 3,483 instants still missing inside tracks:
+
+* 2,210 were never within reach of a known pose: the recursion stopped earlier because the
+  frames at the frontier did not yield an accepted pose.
+* 1,273 were looked at: 622 gave no consistent pose in two cameras (the person is not
+  readable in two views there), 67 had crops that follow another person, 584 triangulated
+  but failed the acceptance gate.
+* Independently of the cause: at 1,051 of 3,401 missing instants (31%) the same golden
+  person IS measured at that instant under another engine identity. Linking those
+  identities (the open re-identification and association questions) removes them without
+  any recovery.
+
+Gate-rejected recoveries (714 instants in 329 runs, inside tracks and beyond ends):
+
+| Why the gate rejected it | Instants | Runs | What resolves it |
+|---|---|---|---|
+| Measurement fine, proof that it is this person missing (two cameras: residual over 3 px, low joint confidence, hint from one side only or far away) | 411 | 204 | A person saying "yes, both crops show this person" - the position is then an ordinary two-view triangulation. Or a third camera. |
+| Poor measurement (implausible bone lengths, too few joints) | 238 | 175 | Pose correction (CVAT), not a yes/no. Otherwise it stays unmeasured. |
+| Another identity is already measured at that place | 65 | 28 | An identity / association answer; 63 of them have the same golden person under another identity. |
+
+So a yes/no review would add at most about 58% of the gate-rejected instants, one question
+per run (a run is consecutive frames of one person). None of it is needed for a track to
+exist or to carry its identity: these are isolated frames inside tracks that already have
+positions around them.
 
 ## Reproduce
 

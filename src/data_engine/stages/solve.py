@@ -40,9 +40,16 @@ def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: C
                                      solved.identity_of_label[np.clip(label, 0, None)], -1).astype(np.int64))
     frames = solved.frames
     keep = multi[frames.label]
+    from .. import appearance
+
+    try:
+        embed = appearance.embedder(context.workspace, [camera.camera for camera in scene.cameras], context.log)
+    except Exception as exc:  # the cue is optional: never fail the solve over it
+        context.log(f"appearance cue unavailable ({exc})", level="warning")
+        embed = None
     result = swap_check.check(scene, row_identity, solved.identity_of_label[frames.label[keep]].astype(np.int64),
                               frames.t[keep], frames.root[keep], frames.xyz[keep], RECIPE["swap_check"],
-                              same_rows=constraints.same)
+                              same_rows=constraints.same, embed=embed)
     (context.workspace.round_dir(context.round) / "swap_check.json").write_text(
         json.dumps(result, indent=1), encoding="utf-8")
     unknowns = []

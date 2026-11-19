@@ -196,6 +196,32 @@ def cmd_publish(args) -> int:
         runlock.release(workspace)
 
 
+def cmd_store_calibration(args) -> int:
+    """Explicit operator action: store the workspace's decided calibration as the dataset's in data_management."""
+    from . import runlock
+    from .stages.calibration import StoreRefused, store_calibration
+    workspace = _existing(args.dataset_id)
+    if workspace is None:
+        return REFUSED
+    if not runlock.acquire(workspace, "data-engine " + args.command_line):
+        print("refused: a run is already in progress", file=sys.stderr)
+        return REFUSED
+    try:
+        message = store_calibration(workspace, replace=args.replace)
+    except StoreRefused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return REFUSED
+    except Exception:
+        traceback.print_exc()
+        return FAILED
+    finally:
+        runlock.release(workspace)
+    print(message)
+    print("the calibration stage does not rerun by itself; use `data-engine run "
+          f"{args.dataset_id} --force calibration` to start from the stored calibration")
+    return OK
+
+
 def cmd_serve(args) -> int:
     from .web.app import serve  # lazy: the web module is optional for every other command
     serve(args.host, args.port)
@@ -237,6 +263,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("publish", help="run the publish stage")
     p.add_argument("dataset_id")
     p.set_defaults(func=cmd_publish)
+
+    p = sub.add_parser("store-calibration",
+                       help="store the workspace's decided calibration as the dataset's calibration in data_management "
+                            "(explicit; refuses while any calibration unknown is open)")
+    p.add_argument("dataset_id")
+    p.add_argument("--replace", action="store_true", help="replace a calibration data_management already stores for the dataset")
+    p.set_defaults(func=cmd_store_calibration)
 
     p = sub.add_parser("serve", help="start the web UI")
     p.add_argument("--host", default="127.0.0.1")

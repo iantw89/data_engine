@@ -9,6 +9,11 @@ A mount-check correction is NEVER applied on its own. It is applied only when an
 ``use_standard`` records that the person accepted the standard calibration for that camera, and
 ``exclude_camera`` removes the camera from the calibration file. Every decision and the status of
 every camera is written to the file's top-level ``data_engine`` note.
+
+The base calibration is data_management's resolution for the dataset (``resolve_base``): the dataset's stored
+calibration if it has one, else the site's standard calibration. Storing a decided workspace calibration as the
+dataset's calibration is a separate, explicit operator action (``store_calibration`` below, ``data-engine
+store-calibration``); the stage never writes to data_management.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from .ingest import WORKERS, log_tail, run_worker
 SAMPLES = 9
 ATTENTION = ("shifted", "moved", "inconclusive")
 CHOICES = ("use_standard", "use_corrected", "exclude_camera")
+ALREADY_CARRIED = "stored (the dataset calibration already carries the correction)"
 
 
 def human_decisions(context: Context) -> dict[str, dict]:
@@ -82,18 +88,52 @@ def describe(camera: str, check: dict, frames: int) -> dict:
             "what_would_resolve": "A calibration_review decision: use_standard, use_corrected or exclude_camera."}
 
 
+def resolve_base(context: Context) -> dict:
+    """The calibration this dataset starts from: ``{"source": "dataset"|"default", "path", "cameras_overridden", ...}``.
+
+    Asks data_management (worker ``calibration_store_dm.py``): a dataset with a stored calibration starts from it,
+    any other dataset (or an old data_management without the store) from the site's standard calibration, exactly
+    as before. A store that refuses (the default changed since the dataset's calibration was derived) is an
+    ``error``; nothing is guessed.
+    """
+    workspace = context.workspace
+    out_dir = workspace.path("calibration")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / "base.json"
+    target.unlink(missing_ok=True)
+    command = [workspace.site.interpreter("data_management"), WORKERS / "calibration_store_dm.py", "--mode", "resolve",
+               "--dataset", workspace.source_dataset, "--out", out_dir]
+    code = run_worker(context, command)
+    try:
+        info = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        info = {}
+    if code != 0 or info.get("error"):
+        return {"error": info.get("error") or f"calibration store worker exited with code {code}: {log_tail(context)}"}
+    if info.get("source") == "dataset" and info.get("path") and Path(info["path"]).is_file():
+        return {"source": "dataset", "path": Path(info["path"]), "cameras_overridden": list(info.get("cameras_overridden", [])),
+                "sha256": info.get("sha256"), "provenance": info.get("provenance", {})}
+    return {"source": "default", "path": Path(workspace.site["calibration"]), "cameras_overridden": []}
+
+
 def run(context: Context) -> StageResult:
     workspace = context.workspace
     site = workspace.site
     dataset = workspace.dataset
-    source = Path(site["calibration"])
+    base = resolve_base(context)
+    if "error" in base:
+        return StageResult(status="failed", message=f"dataset calibration: {base['error']}")
+    source = base["path"]
     if not source.is_file():
         return StageResult(status="failed", message=f"standard calibration not found: {source}")
+    if base["source"] == "dataset":
+        context.log(f"starting from the dataset's stored calibration {source.name} "
+                    f"(cameras overridden: {', '.join(base['cameras_overridden']) or 'none'})")
     out_dir = workspace.path("calibration")
-    out_dir.mkdir(parents=True, exist_ok=True)
     check_path = out_dir / "mount_check.json"
     source_sha, dataset_sha = file_sha256(source), file_sha256(workspace.dataset_json)
     inputs = {"calibration_source": str(source), "calibration_source_sha256": source_sha,
+              "calibration_base": base["source"], "calibration_cameras_overridden": base["cameras_overridden"],
               "dataset_json_sha256": dataset_sha, "mount_check_samples": SAMPLES,
               "interpreter": str(site.interpreter("data_management"))}
 
@@ -134,6 +174,10 @@ def run(context: Context) -> StageResult:
                 applied = "corrected"
                 calibration["cameras"][str(cid)]["rvec"] = list(result["corrected_rvec"])
                 calibration["cameras"][str(cid)]["tvec"] = list(result["corrected_tvec"])
+            elif str(cid) in base["cameras_overridden"]:
+                # The dataset's stored calibration already carries this camera's correction: measured against
+                # it the camera is no longer shifted, so there is nothing left to apply.
+                applied = ALREADY_CARRIED
             else:
                 applied = "standard (use_corrected requested but the mount check offers no correction)"
         elif decision:
@@ -141,7 +185,8 @@ def run(context: Context) -> StageResult:
         elif status in ATTENTION:
             applied = "standard (undecided: open calibration unknown)"
         # A decision that cannot be honoured leaves the question open.
-        satisfied = decision is not None and not (decision["choice"] == "use_corrected" and applied != "corrected")
+        satisfied = decision is not None and not (decision["choice"] == "use_corrected"
+                                                  and applied not in ("corrected", ALREADY_CARRIED))
         if status in ATTENTION and not satisfied:
             item = describe(camera_id, result, camera.frame_count)
             unknowns.append({"subject": f"calibration:{camera_id}", "severity": float(camera.frame_count or 1), "detail": item})
@@ -160,6 +205,7 @@ def run(context: Context) -> StageResult:
                         + f"; applied: {applied}")
     calibration["data_engine"] = {
         "source": str(source), "source_sha256": source_sha, "dataset": workspace.dataset_id,
+        "base": {"source": base["source"], "cameras_overridden": base["cameras_overridden"]},
         "mount_check_sha256": inputs["mount_check_sha256"], "cameras": note_cameras, "excluded_cameras": excluded,
         "note": "Corrections are applied only on an explicit human use_corrected decision; see cameras[*].applied."}
     target = out_dir / "calibration.json"
@@ -182,3 +228,75 @@ def run(context: Context) -> StageResult:
         output_hash=stable_hash(geometry),
         message=message, unknowns={"calibration": unknowns}, inputs=inputs,
         outputs={"calibration": "calibration/calibration.json", "mount_check": "calibration/mount_check.json"})
+
+
+# ------------------------------------------------------------------ store as the dataset's calibration
+class StoreRefused(Exception):
+    """store_calibration refused; nothing was written to data_management."""
+
+
+def store_calibration(workspace, *, replace: bool = False, by: str = "data_engine store-calibration") -> str:
+    """Store the workspace's decided calibration as the dataset's calibration in data_management.
+
+    Explicit operator action only (``data-engine store-calibration``); no stage or round calls it. Refuses when
+    the calibration stage is not up to date, any ``calibration`` unknown is open, a camera was excluded, or the
+    workspace calibration was not derived from what the dataset resolves to now. The write itself is
+    data_management's ``register_calibration`` (worker ``calibration_store_dm.py``): atomic, never overwrites
+    without ``replace``. Returns a one-line description of what was stored.
+    """
+    from ..engine import STAGE, Engine
+
+    if "@" in workspace.dataset_id:
+        raise StoreRefused(f"{workspace.dataset_id} is a pilot slice; store the calibration from the full dataset's workspace")
+    path = workspace.path("calibration", "calibration.json")
+    if not path.is_file():
+        raise StoreRefused(f"no calibration in the workspace ({path}); run the calibration stage first")
+    db = workspace.db
+    run_row = db.latest_stage_run("calibration")
+    if run_row is None or run_row["status"] != "done":
+        raise StoreRefused(f"the calibration stage has not completed (state: {(run_row or {}).get('status', 'never run')})")
+    state = Engine(workspace).stage_state(STAGE["calibration"])
+    if state != "done":
+        raise StoreRefused(f"the calibration stage is {state}: new decisions or inputs are not applied yet; run a round first")
+    open_items = db.unknowns("open", "calibration")
+    if open_items:
+        raise StoreRefused("undecided cameras: " + ", ".join(sorted(u["subject"] for u in open_items))
+                           + " (open calibration unknowns; decide them in the calibration review first)")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    note = data.pop("data_engine", None)
+    if not note or "cameras" not in note:
+        raise StoreRefused("calibration.json has no data_engine note; it was not written by the calibration stage")
+    if note.get("excluded_cameras"):
+        raise StoreRefused(f"cameras {note['excluded_cameras']} are excluded in this workspace; "
+                           "exclusion is a per-run decision and is not stored as dataset geometry")
+    undecided = sorted(c for c, v in note["cameras"].items() if "undecided" in v.get("applied", ""))
+    if undecided:
+        raise StoreRefused(f"cameras {undecided} are undecided")
+    reasons = {}
+    for camera, entry in note["cameras"].items():
+        if entry.get("applied") == "corrected":
+            reasons[str(entry["calibration_id"])] = {
+                "camera": camera, "decision": entry["human_decision"], "constraint_id": entry["constraint_id"],
+                "status": entry["status"], "median_shift_px": entry["median_shift_px"],
+                "rotation_deg": entry["rotation_deg"], "residual_px": entry["residual_px"],
+                "applied": "rotation-corrected extrinsics from the mount check (human decision use_corrected)"}
+    out_dir = workspace.path("calibration")
+    clean = out_dir / "dataset_calibration.json"
+    clean.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    plan = {"produced_by": by, "reasons": reasons, "expected_base_sha256": note["source_sha256"],
+            "provenance": {"engine_workspace": str(workspace.root), "engine_dataset": workspace.dataset_id,
+                           "round": run_row["round"], "calibration_stage_run": run_row["id"],
+                           "workspace_calibration_sha256": file_sha256(path), "base_source": note.get("base", {}).get("source"),
+                           "base_path": note["source"], "base_sha256": note["source_sha256"],
+                           "mount_check_sha256": note.get("mount_check_sha256"), "data_engine_note": note}}
+    plan_path = out_dir / "store_plan.json"
+    plan_path.write_text(json.dumps(plan, indent=1), encoding="utf-8")
+    command = [workspace.site.interpreter("data_management"), WORKERS / "calibration_store_dm.py", "--mode", "store",
+               "--dataset", workspace.source_dataset, "--calibration", clean, "--plan", plan_path]
+    if replace:
+        command.append("--replace")
+    context = Context(workspace, db.current_round(), "store_calibration")
+    code = run_worker(context, command)
+    if code != 0:
+        raise StoreRefused(f"data_management refused or failed (exit {code}): {log_tail(context)}")
+    return log_tail(context, 1) or "stored"

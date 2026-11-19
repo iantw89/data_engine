@@ -153,7 +153,8 @@ def merge_colocated(scene: Scene, labels: Labels, frames: PersonFrames, *, radiu
 
 
 def merge_handoffs(scene: Scene, labels: Labels, frames: PersonFrames, *, max_overlap: int = 15,
-                   max_gap: int = 10, radius_in: float = 20.0, clear_radius_in: float = 40.0) -> list[dict]:
+                   max_gap: int = 10, radius_in: float = 20.0, clear_radius_in: float = 40.0,
+                   tracklet_support: int = 0, support_window: int = 30) -> list[dict]:
     """Merge a component that ends where and when another begins (a tracker hand-off).
 
     A person tracked in 3D does not vanish and get replaced by someone else at the same spot
@@ -163,6 +164,12 @@ def merge_handoffs(scene: Scene, labels: Labels, frames: PersonFrames, *, max_ov
     are one person - provided the pairing is unique in both directions within the wider
     ``clear_radius_in``, they never show the same camera at the same time, and no human
     said otherwise.
+
+    In a crowd the pairing is rarely unique by position alone. With ``tracklet_support`` > 0 a
+    non-unique hand-off is also merged when the single-camera tracker singles it out: in at
+    least that many cameras one 2D tracklet (the tracker's own, before any cut by the 3D
+    tracker) holds detections of X before its end and of Y after its start, and no other
+    candidate successor of X or predecessor of Y has such a tracklet in any camera.
     """
     from .identity import summarise
 
@@ -178,6 +185,32 @@ def merge_handoffs(scene: Scene, labels: Labels, frames: PersonFrames, *, max_ov
             if first is not None and second is not None and len(np.intersect1d(first, second, assume_unique=True)):
                 return True
         return any((min(x, y), max(x, y)) in labels.forbidden for x in members.get(a, ()) for y in members.get(b, ()))
+
+    by_label = {s.label: s for s in summaries}
+    # rows of every component per camera, for the tracklet-continuity test
+    sorted_rows = []
+    for camera in scene.cameras:
+        order = np.argsort(labels.label[camera.index], kind="stable")
+        sorted_rows.append((order, labels.label[camera.index][order]))
+    support_cache: dict[tuple[int, int], int] = {}
+
+    def continuing_tracklets(earlier: int, later: int) -> int:
+        """Cameras in which one 2D tracklet holds the earlier component before its end and the later one after its start."""
+        key = (earlier, later)
+        if key not in support_cache:
+            end, start = by_label[earlier].last_root_t, by_label[later].first_root_t
+            count = 0
+            for camera, (order, sorted_label) in zip(scene.cameras, sorted_rows):
+                source = getattr(camera, "source_tracklet", camera.tracklet)
+                found = []
+                for label, low, high in ((earlier, end - support_window, end), (later, start, start + support_window)):
+                    rows = order[np.searchsorted(sorted_label, label):np.searchsorted(sorted_label, label, side="right")]
+                    rows = rows[(camera.t[rows] >= low) & (camera.t[rows] <= high)]
+                    ids = source[rows]
+                    found.append(np.unique(ids[ids >= 0]))
+                count += bool(len(np.intersect1d(found[0], found[1], assume_unique=True)))
+            support_cache[key] = count
+        return support_cache[key]
 
     by_start = sorted(summaries, key=lambda s: s.first_root_t)
     starts = np.array([s.first_root_t for s in by_start])
@@ -202,12 +235,50 @@ def merge_handoffs(scene: Scene, labels: Labels, frames: PersonFrames, *, max_ov
             x = parent[x]
         return x
 
+    proposals: list[tuple[int, int, float, str]] = []
     for earlier_label, options in sorted(successors.items()):
-        if len(options) != 1:
-            continue
         later_label, distance = options[0]
-        if len(predecessors[later_label]) != 1 or distance > radius_in:
-            continue
+        if len(options) == 1 and len(predecessors[later_label]) == 1 and distance <= radius_in:
+            proposals.append((earlier_label, later_label, distance, "unique"))
+    if tracklet_support > 0:
+        # Hand-offs that position alone does not single out (a crowd), or that the 1 s endpoint medians
+        # miss (someone walking): compare the positions AT the hand-off (last / first three measured
+        # frames) and let the single-camera trackers single out the successor.
+        order = np.lexsort((frames.t, frames.label))
+        measured = order[np.isfinite(frames.root[order, 0])]
+        cut = np.flatnonzero(np.diff(frames.label[measured])) + 1
+        tight = {}
+        for chunk in np.split(measured, cut):
+            if len(chunk):
+                tight[int(frames.label[chunk[0]])] = (np.median(frames.root[chunk[:3]], axis=0),
+                                                      np.median(frames.root[chunk[-3:]], axis=0))
+        near_after: dict[int, list[tuple[int, float]]] = {}
+        near_before: dict[int, list[tuple[int, float]]] = {}
+        for earlier in summaries:
+            low = np.searchsorted(starts, earlier.last_root_t - max_overlap, side="left")
+            high = np.searchsorted(starts, earlier.last_root_t + max_gap, side="right")
+            for later in by_start[low:high]:
+                if later.label == earlier.label or later.first_root_t <= earlier.first_root_t \
+                        or later.last_root_t <= earlier.last_root_t:
+                    continue
+                distance = float(np.linalg.norm(tight[later.label][0] - tight[earlier.label][1]))
+                if distance <= clear_radius_in:
+                    near_after.setdefault(earlier.label, []).append((later.label, distance))
+                    near_before.setdefault(later.label, []).append((earlier.label, distance))
+        already = {(a, b) for a, b, _, _ in proposals}
+        for earlier_label, options in sorted(near_after.items()):
+            supported = [(label, d, continuing_tracklets(earlier_label, label)) for label, d in options]
+            chosen = [(label, d, n) for label, d, n in supported if n >= tracklet_support and d <= radius_in]
+            if len(chosen) != 1 or sum(1 for _, _, n in supported if n >= 1) != 1:
+                continue
+            later_label, distance, count = chosen[0]
+            if (earlier_label, later_label) in already:
+                continue
+            if any(continuing_tracklets(other, later_label) >= 1 for other, _ in near_before[later_label]
+                   if other != earlier_label):
+                continue
+            proposals.append((earlier_label, later_label, distance, f"{count} continuing 2D tracklets"))
+    for earlier_label, later_label, distance, evidence in proposals:
         a, b = find(earlier_label), find(later_label)
         if a == b or clash(a, b):
             continue
@@ -223,7 +294,8 @@ def merge_handoffs(scene: Scene, labels: Labels, frames: PersonFrames, *, max_ov
                 occupied[(a, camera.index)] = np.union1d(occupied.get((a, camera.index), np.empty(0, np.int32)),
                                                          occupied.pop(key_b))
         members.setdefault(a, set()).update(members.pop(b, set()))
-        merged.append({"from": int(earlier_label), "to": int(later_label), "distance_in": round(distance, 1)})
+        merged.append({"from": int(earlier_label), "to": int(later_label), "distance_in": round(distance, 1),
+                       "evidence": evidence})
     return merged
 
 

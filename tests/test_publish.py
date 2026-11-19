@@ -564,3 +564,70 @@ def test_drafts_validate_and_publish_into_a_temp_store(drafted, tmp_path):
     with pytest.raises(Exception):  # republishing an existing name needs replace
         pm.publish_into(store_root, drafts, replace=False, placeholder="TEST ONLY - placeholder commit")
     pm.publish_into(store_root, drafts, replace=True, placeholder="TEST ONLY - placeholder commit")
+
+
+# --------------------------------------------------------------------------- recovered positions and 2D poses
+
+
+def add_recovered(root: Path, native: np.ndarray, *, t: int = 5, stale: bool = False) -> None:
+    """One recovered position of identity 0 at sync index ``t`` (unmeasured in the fixture), read in c0 and c1.
+
+    The c0 pose is at a place of its own; the c1 pose sits on a raw detection that is already published.
+    """
+    directory = root / "rounds/r001"
+    frames = np.full((1, 3), -1, np.int32)
+    frames[0, 0], frames[0, 1] = native[t, 0], native[t, 1]
+    keypoints = np.full((1, 3, 17, 3), np.nan, np.float32)
+    boxes = np.full((1, 3, 4), np.nan, np.float32)
+    keypoints[0, 0] = np.stack([500 + np.arange(17), 300 + np.arange(17) * 2.0, np.full(17, 0.8)], axis=1)
+    boxes[0, 0] = [480, 280, 540, 360]
+    raw_row = 2 * int(native[t, 1])  # the first raw detection of c1 in that frame
+    with np.load(root / "detections/raw/c1/000000.npz") as data:
+        boxes[0, 1] = data["boxes"][raw_row, :4]
+        keypoints[0, 1] = data["keypoints"][raw_row]
+    xyz = (np.array([55.0, 20.0, 40.0], np.float32) + np.arange(17)[:, None] * 0.5)[None]
+    np.savez_compressed(
+        directory / "tracks3d_recovered.npz", component=np.array([-1], np.int32), identity=np.array([0], np.int32),
+        t=np.array([t], np.int32), rows=np.full((1, 3), -1, np.int32), xyz=xyz, used=np.full((1, 17), 0b011, np.uint8),
+        residual=np.zeros((1, 17), np.float32), root=np.array([[55.0, 20.0, 40.0]], np.float32), tier=np.array(["B"]),
+        pose_frame=frames, pose_keypoints=keypoints, pose_box=boxes, cameras=np.array(CAMERAS),
+        source_tracks_sha256=np.array("0" * 64 if stale else pm.sha256_file(directory / "tracks3d.npz")))
+
+
+def test_recovered_positions_and_their_2d_poses_are_published(tmp_path, monkeypatch):
+    root, _, native = make_workspace(tmp_path)
+    monkeypatch.setattr(pm, "code_identity", lambda: dict(GOOD_CODE))
+    add_recovered(root, native)
+    drafts = pm.build_drafts(root, DATASET, "rec", tmp_path / "rec", stride=1)
+    summary = drafts.summary
+    assert summary["detections"]["recovered_published"] == 1 and summary["detections"]["recovered_already_a_detection"] == 1
+    recover_name = next(name for name in summary["provenance"]["names"] if name.startswith("data_engine.recover."))
+    camera = json.loads((tmp_path / "rec/two_d_tracklets/cameras/c0.json").read_text(encoding="utf-8"))
+    frame = next(f for f in camera["frames"] if f["frame"] == int(native[5, 0]))
+    recovered = [d for d in frame["detections"] if d["source_id"].endswith("/R0")]
+    assert len(recovered) == 1
+    detection = recovered[0]
+    assert detection["position_provenance"] == detection["tracklet_provenance"] == recover_name
+    assert detection["bbox"] == [480.0, 280.0, 540.0, 360.0] and detection["score"] == 0.8
+    assert detection["tracklet_id"] not in {d["tracklet_id"] for f in camera["frames"] for d in f["detections"]
+                                            if not d["source_id"].endswith("/R0")}
+    # the pose that coincides with an existing detection is not published twice
+    other = json.loads((tmp_path / "rec/two_d_tracklets/cameras/c1.json").read_text(encoding="utf-8"))
+    assert not [d for f in other["frames"] for d in f["detections"] if "/R" in d["source_id"]]
+    tracks = json.loads((tmp_path / "rec/three_d_tracks/tracks.json").read_text(encoding="utf-8"))["tracks"]
+    track = next(t for t in tracks if t["track_id"] == 0)
+    assert {"camera": "c0", "tracklet_id": detection["tracklet_id"],
+            "frame_range": [int(native[5, 0]), int(native[5, 0])]} in track["members"]
+    assert any(p["xyz"] == [55.0, 20.0, 40.0] for p in track["positions"])
+    assert "guided ViTPose crops" in drafts.notes["three_d_tracks"]
+    if pytest.importorskip("data_management.label_sets"):
+        assert pm.check_drafts(drafts)["ok"]
+
+
+def test_recovered_positions_of_another_solution_are_ignored(tmp_path, monkeypatch):
+    root, _, native = make_workspace(tmp_path)
+    monkeypatch.setattr(pm, "code_identity", lambda: dict(GOOD_CODE))
+    add_recovered(root, native, stale=True)
+    drafts = pm.build_drafts(root, DATASET, "stale", tmp_path / "stale", stride=1)
+    assert drafts.summary["detections"]["recovered_published"] == 0
+    assert not any(name.startswith("data_engine.recover.") for name in drafts.summary["provenance"]["names"])

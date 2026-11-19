@@ -93,3 +93,29 @@ def test_bone_ranges_come_from_this_recordings_measured_poses():
     ranges = coverage.bone_ranges(xyz)
     assert ranges.shape == (12, 2) and (ranges[:, 0] < ranges[:, 1]).all()
     assert np.isinf(coverage.bone_ranges(xyz[:100])[:, 1]).all()  # too few poses: no bone gate rather than a guess
+
+
+def test_failed_gates_names_what_is_missing():
+    two = good_features(cameras=2, median_residual_px=5.0, weakest_view_peak=0.4, hint_kind=1)
+    assert coverage.failed_gates(two, RECIPE_COVERAGE, "B") == ["residual", "image confidence", "not bracketed by nearby poses"]
+    assert coverage.failed_gates(good_features(), RECIPE_COVERAGE, "A") == []
+    crowded = good_features(other_identity_in=5.0, bad_bones=4)
+    assert coverage.failed_gates(crowded, RECIPE_COVERAGE, "A") == ["bone lengths", "another identity is measured there"]
+
+
+def test_missing_inside_tracks_counts_only_between_first_and_last_position():
+    presence = coverage.build_presence(*track([10, 11, 14, 20]))
+    assert coverage.inside_missing(presence) == 7  # 12, 13 and 15..19
+    more = coverage.build_presence(*track([10, 11, 12, 13, 14, 20]))
+    assert coverage.inside_missing(more) == 5
+
+
+def test_a_recovered_pose_becomes_the_hint_for_its_neighbours():
+    """What the recursion relies on: adding a position moves the reach."""
+    identity, t, root, xyz = track([10])
+    presence = coverage.build_presence(identity, t, root, xyz)
+    assert coverage.make_hint(presence, 3, 45, reach=30) is None  # 35 frames away: out of reach
+    identity, t, root, xyz = track([10, 40])  # a pass recovered t=40
+    presence = coverage.build_presence(identity, t, root, xyz)
+    hint = coverage.make_hint(presence, 3, 45, reach=30)
+    assert hint is not None and hint.distance == 5 and coverage.HINT_KINDS[hint.kind] == "held_from_before"

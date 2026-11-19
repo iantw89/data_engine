@@ -30,7 +30,7 @@ remaining unknowns into tasks and closes the round with a summary.
 |---|---|---|---|
 | `ingest` | once | `dataset.json`: per camera the ordered files with verified overlap trims; file boundaries the catalog could not verify are compared pixel by pixel (`overlap.py`); frame index | `stream_layout` |
 | `detect` | once | detection shards per camera (boxes, 17 keypoints, raw heatmap peaks), every native frame | - |
-| `calibration` | once, again on a human decision | `calibration/calibration.json`, mount check | `calibration` |
+| `calibration` | once, again on a human decision (base: the dataset's stored calibration in data_management, else the site default) | `calibration/calibration.json`, mount check | `calibration` |
 | `align` | once, again when calibration geometry changes | `alignment.json` (label payload), `sync_table.npz`, report | `alignment` |
 | `tracklets` | once | post-filter + BoT-SORT + over-split, per camera | - |
 | `autofit` | once | `evidence/autofit/labels.npz`: Autofit raw track id per detection (CPU, about a third of real time) | - |
@@ -173,12 +173,12 @@ the next round usually resolves many remaining unknowns by itself.
 
 * Alignment offsets are solved on a 10 Hz grid (0.1 s steps); sub-frame refinement from
   linked 3D tracks is planned. One-frame shifts barely change residuals in this scene.
-* Coverage: gaps longer than 3 s have no neighbouring pose close enough to say where to
-  look (about 43% of missing person-frames on golden) and are not searched; poses that
-  triangulate but fail the acceptance gate (about 900 on golden) are dropped rather than
-  shown to a person; recovered 2D poses stay in the workspace and are not published as 2D
-  detections (their 3D positions are). The golden controls also showed real people the
-  engine never tracks at all - not addressed by gap recovery.
+* Coverage: recovery stops where the frames at the frontier of what is known do not yield
+  an accepted pose; poses that triangulate but fail the acceptance gate are recorded
+  (`recover_rejected.npz`) and not shown to a person; a recovered pose that coincides with
+  an unassigned raw detection does not give that detection the track's identity; recovered
+  positions do not feed back into the next solve (they could let it attach more
+  detections).
 * Swap check: its body and appearance thresholds were fitted on one recording, and its
   recall is known only for injected swaps. A swap of two people who pass within about
   0.3 m with similar builds rests on the 2D tracklet cue or a person; appearance embeddings
@@ -278,9 +278,49 @@ the next round usually resolves many remaining unknowns by itself.
   14 min per recorded hour: not adopted. In the engine: 749 positions on golden, 97% of
   318 checkable camera views on the right golden person (4 of the 6 others follow a track
   that is itself on the wrong person).
+* **2026-11-19 - recovery recurses from the edges; recovered 2D poses are published.** The
+  3 s reach of a single pass is not a limit of the method: each accepted recovery is a
+  measured pose and is the hint for its neighbours in the next pass (`max_passes`). Golden:
+  749 -> 1,125 positions over 7 passes, 96% of checkable views on the right person (2.1% on
+  another person, 1.9% before). The 2D poses the positions were triangulated from are now
+  published as 2D detections with their own provenance (`data_engine.recover.*`), their own
+  tracklets and membership in the 3D track; a pose that coincides with an already published
+  detection (IoU >= 0.5) is not published twice (that detection keeps its own assignment).
+  Every instant that was looked at and is still missing is written with its reason
+  (`recover_rejected.npz`); see `experiments/coverage/REPORT.md` for what a human answer
+  would and would not change.
+* **2026-11-19 - hand-offs singled out by the 2D trackers.** 38 track endings on the felix
+  hour had another track born at the same spot within a few frames - one person tracked
+  twice - that neither the hand-off merge nor identity linking joined: in a crowd the
+  pairing is not unique by position, and the rule compared 1 s endpoint medians, which are
+  about a metre apart for someone walking. The rule now also merges when the positions at
+  the hand-off (last / first three frames) are within 20 in and single-camera tracklets in
+  at least two cameras continue from the ending component into the starting one and into no
+  other candidate (`refine.handoff_tracklets`). Golden bench: identities 32 -> 31, questions
+  78 -> 77, wrongly assigned observations unchanged (84); the second golden case is blocked
+  by a same-camera clash and stays a question. (The earlier, rejected `external_rebirth`
+  option accepted one camera and no 3D proximity.)
 * **2026-11-18 - rejected on the bench:** limb-length veto (no gain), single-camera identity
   bridge (no effect), duplicate recognition (no fewer questions), keeping tracklets across
   Autofit track re-creation (one more mixed identity), "only candidate" identity
   elimination (unsafe: about 400 wrongly assigned observations), ReID decisions (0.5-1%
   wrong), Autofit global ids for identity (2-4 wrong links). All remain as off-by-default
   options with their measurements in `experiments/RESULTS.md`.
+* **2026-11-19 - calibration is stored with the dataset, in data_management.** A recording
+  can have its own calibration (`data_management/data/calibrations/<dataset>/`, per-camera
+  overrides over the default, derived-from sha256 recorded; see data_management's README).
+  The calibration stage now takes its base from data_management's resolver (worker
+  `calibration_store_dm.py --mode resolve`, since the engine core does not import
+  data_management): a dataset with a stored calibration starts from it and the mount check
+  measures against it; every other dataset starts from the site default as before. If the
+  default changed after the stored calibration was derived the resolver refuses and the
+  stage fails rather than mixing geometries. A decided workspace calibration becomes the
+  dataset's only through the explicit `data-engine store-calibration DATASET [--replace]`
+  (worker `--mode store`): it refuses while any `calibration` unknown is open, while the
+  stage is stale, for excluded cameras (a per-run decision, not geometry), for pilot slices,
+  and if the workspace calibration was derived from something other than what the dataset
+  resolves to now; provenance (workspace, round, per-camera status/decision/constraint,
+  mount-check numbers, base sha256) goes into the record. Nothing stores automatically, and
+  the stage does not rerun by itself afterwards (`run --force calibration`). A `use_corrected`
+  decision whose correction the stored calibration already carries is satisfied
+  (`applied: stored ...`), since measured against it the camera is no longer shifted.

@@ -33,6 +33,7 @@ SITE_DEFAULTS: dict[str, Any] = {
         "data_management": str(GIT_ROOT / "data_management"),
         "cvat_labeling": str(GIT_ROOT / "cvat_labeling"),
         "autofit": str(GIT_ROOT / "Autofit"),
+        "fast_reid": str(GIT_ROOT / "fast-reid"),  # optional: appearance cue of the swap check
     },
     # Stage workers may need another repository's environment (TensorRT engines, Autofit).
     "interpreters": {
@@ -46,6 +47,7 @@ SITE_DEFAULTS: dict[str, Any] = {
         "yolo_onnx": str(GIT_ROOT / "data_management" / "models" / "yolov8x-pose-p6-curated-v6-1280.onnx"),
         "vitpose_onnx": str(GIT_ROOT / "data_management" / "models" / "vitpose-curated-v6.onnx"),
         "yolo_pt": str(GIT_ROOT / "cvat_labeling" / "finetuning" / "runs" / "curated_v7_al" / "weights" / "best.pt"),
+        "reid_fastreid": str(GIT_ROOT / "fast-reid" / "pretrained_download" / "msmt_sbs_R50.pth"),
         "vitpose_hf": r"C:\cvat_labeling_data\20250505071549\pilot\vitpose_curated_v6_20261101\training\best",
     },
     "cvat": {
@@ -99,6 +101,10 @@ RECIPE: dict[str, Any] = {
         # A tracked person's measured pose is compared with single-camera pieces up to 1 s away
         # (a stationary person who drops to one view); tracker hand-offs at one spot are merged.
         "temporal_reach_frames": 10, "merge_handoffs": True,
+        # NEW 2026-11-19: a hand-off that position alone does not single out (a crowd, or someone
+        # walking) is merged when single-camera tracklets in at least this many cameras continue
+        # from the ending track into the starting one and into no other candidate.
+        "handoff_tracklets": 2,
     },
     "temporal": {
         # Golden review filter: endpoint distance <= 12 m/s * elapsed + 0.5 m.
@@ -138,6 +144,11 @@ RECIPE: dict[str, Any] = {
         # a track are tried too. A camera is asked when at least min_body_in_view body joints and
         # min_box_in_view of the box are inside its image.
         "reach_frames": 30, "end_frames": 10, "min_body_in_view": 6, "min_box_in_view": 0.6,
+        # Passes: each accepted recovery is the hint for its neighbours in the next pass (recursion
+        # from the edges of what is known); stops when a pass finds nothing. max_passes is only a
+        # safety bound (a track followed 10 frames per pass for 40 s needs 40 passes; felix was still
+        # finding positions at pass 40); when it is reached the summary says so.
+        "max_passes": 400,
         # Skeleton -> detector-style box, fractions of the keypoint-box height (measured on 297k detections).
         "box_margin": {"left": 0.10, "right": 0.10, "top": 0.13, "bottom": 0.14},
         # A crop is dropped when another measured person's box overlaps the hint box this much and

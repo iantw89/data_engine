@@ -91,6 +91,7 @@ def with_external_units(scene: Scene, external: list[np.ndarray], *, rebirth: bo
     stats = {"tracklet_cuts": 0, "rebirths_kept_together": 0}
     for camera in scene.cameras:
         updated = copy.copy(camera)
+        updated.source_tracklet = camera.tracklet  # the single-camera tracker's own tracklets, before the cuts
         unit = np.full(len(camera.tracklet), -1, dtype=np.int32)
         rows = np.flatnonzero(camera.tracklet >= 0)
         order = rows[np.lexsort((camera.detections.frame_of_row[rows], camera.tracklet[rows]))]
@@ -193,7 +194,8 @@ def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None,
             frames, duplicates = triangulate_labels(scene, labels.label, recipe)
         handoffs = []
         if recipe.get("refine", {}).get("merge_handoffs"):
-            handoffs = recover.merge_handoffs(scene, labels, frames)
+            handoffs = recover.merge_handoffs(scene, labels, frames,
+                                              tracklet_support=int(recipe["refine"].get("handoff_tracklets", 0)))
             if handoffs:
                 frames, duplicates = triangulate_labels(scene, labels.label, recipe)
         attached = recover.projection_attach(

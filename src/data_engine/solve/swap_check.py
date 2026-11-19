@@ -521,21 +521,50 @@ def moments(index: Index, total: int, recipe: dict) -> tuple[list[dict], dict]:
                              "handoff_overlaps_skipped": handoffs}
 
 
+def appearance_rows(index: Index, wanted: list[dict], *, per_window: int = 6, min_height: float = 48.0) -> dict[int, np.ndarray]:
+    """Detections whose appearance the moments need: for both identities, before and after, up to
+    ``per_window`` evenly spaced detections per camera with a box at least ``min_height`` px tall."""
+    rows_of: dict[int, list] = {}
+    for moment in wanted:
+        s, e = moment["t"]
+        for who in (moment["a"], moment["b"]):
+            for lo, hi in ((s - index.window, s - 1), (e + 1, e + index.window)):
+                cams, rows, _ = index.rows(who, lo, hi)
+                for camera in index.scene.cameras:
+                    mine = rows[cams == camera.index]
+                    boxes = camera.detections.boxes[mine]
+                    mine = mine[(boxes[:, 3] - boxes[:, 1]) >= min_height] if len(mine) else mine
+                    if len(mine) > per_window:
+                        mine = mine[np.unique(np.linspace(0, len(mine) - 1, per_window).round().astype(int))]
+                    rows_of.setdefault(camera.index, []).append(mine)
+    return {camera: np.unique(np.concatenate(parts)) for camera, parts in rows_of.items() if parts}
+
+
 def check(scene: Scene, row_identity: list[np.ndarray], tr_identity: np.ndarray, tr_t: np.ndarray,
           tr_root: np.ndarray, tr_xyz: np.ndarray, recipe: dict, *, embeddings=None,
-          same_rows: list[tuple[list, list]] | None = None) -> dict:
+          same_rows: list[tuple[list, list]] | None = None, embed=None, embed_all: bool = False) -> dict:
     """Find and test every moment at which two tracks could have exchanged people.
 
     ``scene`` must carry the single-camera tracker's own tracklets (not pieces cut by the 3D tracker).
+    ``embed(rows per camera index) -> embeddings`` (``appearance.embedder``) adds the appearance cue: it is
+    asked only for the detections around moments the other cues did not verify (all moments with
+    ``embed_all``).
     Returns {"entries": [...], "summary": {...}}; an entry has the two identities, the sync span, the cue
     values, the verdict and, unless verified, the detection keys a reviewer needs.
     """
     window = int(recipe["window_frames"])
     index = Index.build(scene, row_identity, tr_identity, tr_t, tr_root, tr_xyz, window=window)
     found, skipped = moments(index, scene.T, recipe)
+    if embed is not None and embeddings is None:
+        first = [evaluate(index, moment, recipe, None) for moment in found]
+        wanted = [moment for moment, entry in zip(found, first) if embed_all or entry["status"] != "verified"]
+        if wanted:
+            embeddings = embed(appearance_rows(index, wanted))
+            for moment in found:
+                moment["_with_appearance"] = moment in wanted
     entries = []
     for moment in found:
-        entry = evaluate(index, moment, recipe, embeddings)
+        entry = evaluate(index, moment, recipe, embeddings if moment.get("_with_appearance", True) else None)
         a, b = entry["a"], entry["b"]
         s, e = entry["t"]
         if entry["status"] != "verified" and entry["kind"] != "exchange" and same_rows and \

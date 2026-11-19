@@ -59,6 +59,17 @@ class FakeSubprocess:
         return [c for c in self.commands if Path(c[1]).name == script]
 
 
+def resolve_worker(**info):
+    """Fake calibration_store_dm.py --mode resolve: writes base.json (default: the dataset has no calibration)."""
+    def worker(args, stdout):
+        assert args["--mode"] == "resolve"
+        out = Path(args["--out"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "base.json").write_text(json.dumps(info or {"source": "default"}), encoding="utf-8")
+        return 3 if info.get("error") else 0
+    return worker
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     calibration_file = tmp_path / "standard.json"
@@ -71,6 +82,7 @@ def env(tmp_path, monkeypatch):
                  "models": {k: str(v) for k, v in models.items()}})
     workspace = Workspace(DATASET_ID, site)
     fake = FakeSubprocess()
+    fake.handlers["calibration_store_dm.py"] = resolve_worker()  # no dataset calibration: the site default
     monkeypatch.setattr(ingest, "subprocess", fake)  # stages share ingest.run_worker
     return types.SimpleNamespace(workspace=workspace, site=site, fake=fake, tmp=tmp_path, calibration_file=calibration_file,
                                  db=workspace.db)

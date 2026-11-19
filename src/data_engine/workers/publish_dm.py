@@ -182,6 +182,9 @@ def load_solved(root: Path) -> Solved:
                 tracks["recovered_positions"] = int(len(extra["t"]))
                 for name in ("component", "identity", "t", "rows", "xyz", "used", "residual", "root"):
                     tracks[name] = np.concatenate([tracks[name], extra[name].astype(tracks[name].dtype)])
+                # the 2D poses those positions were triangulated from (published as 2D detections)
+                tracks["recovered_2d"] = {name: extra[name] for name in ("identity", "t", "pose_frame", "pose_keypoints",
+                                                                         "pose_box")}
             else:
                 log("tracks3d_recovered.npz belongs to another solution; ignored (run the recover stage)")
     sync_path = root / "alignment" / "sync_table.npz"
@@ -446,19 +449,78 @@ def published_frame_mask(frame_count: int, native: np.ndarray, column: int, publ
     return mask
 
 
+def _iou_one_to_many(box: np.ndarray, others: np.ndarray) -> np.ndarray:
+    width = np.minimum(box[2], others[:, 2]) - np.maximum(box[0], others[:, 0])
+    height = np.minimum(box[3], others[:, 3]) - np.maximum(box[1], others[:, 1])
+    inter = np.clip(width, 0, None) * np.clip(height, 0, None)
+    union = (box[2] - box[0]) * (box[3] - box[1]) + (others[:, 2] - others[:, 0]) * (others[:, 3] - others[:, 1]) - inter
+    return inter / np.maximum(union, 1e-9)
+
+
+def recovered_camera_detections(column: int, recovered: dict | None, detections, kept: np.ndarray,
+                                frame_mask: np.ndarray | None, published: np.ndarray, *, overlap: float = 0.5) -> dict:
+    """The poses the recover stage read in one camera, as detections to publish.
+
+    A recovered pose whose box overlaps a kept detection of the raw store in the same frame (IoU >= ``overlap``)
+    is not published a second time: that detection is already in the file (under its own tracklet).
+    Returns frame, box, keypoints, score, identity (sorted by identity, frame) and counts.
+    """
+    empty = {"frame": np.zeros(0, np.int64), "box": np.zeros((0, 4)), "keypoints": np.zeros((0, 17, 3)),
+             "score": np.zeros(0), "identity": np.zeros(0, np.int64), "read": 0, "already_a_detection": 0}
+    if recovered is None or not len(recovered["t"]):
+        return empty
+    frame = recovered["pose_frame"][:, column].astype(np.int64)
+    use = np.flatnonzero((frame >= 0) & published[recovered["t"].astype(np.int64)])
+    if frame_mask is not None:
+        use = use[frame_mask[frame[use]]]
+    keep, duplicate = [], 0
+    for index in use:
+        box = recovered["pose_box"][index, column].astype(np.float64)
+        rows = detections.rows(int(frame[index]))
+        raw = np.arange(rows.start, rows.stop)
+        raw = raw[kept[raw]] if len(raw) else raw
+        if len(raw) and _iou_one_to_many(box, detections.boxes[raw, :4].astype(np.float64)).max() >= overlap:
+            duplicate += 1
+            continue
+        keep.append(index)
+    keep = np.array(keep, np.int64)
+    if not len(keep):
+        return {**empty, "read": int(len(use)), "already_a_detection": duplicate}
+    order = keep[np.lexsort((frame[keep], recovered["identity"][keep]))]
+    keypoints = recovered["pose_keypoints"][order, column].astype(np.float64)
+    return {"frame": frame[order], "box": recovered["pose_box"][order, column].astype(np.float64), "keypoints": keypoints,
+            # no detector looked at these: the score is the mean heatmap peak of the 12 body joints
+            "score": keypoints[:, 5:17, 2].mean(axis=1), "identity": recovered["identity"][order].astype(np.int64),
+            "read": int(len(use)), "already_a_detection": duplicate}
+
+
 def build_camera_tracklets(camera: str, dataset: str, detections, kept: np.ndarray, atom: np.ndarray, identity: np.ndarray,
                            frame_mask: np.ndarray | None, image_size: tuple[int, int] | None,
-                           position_provenance: str, tracklet_provenance: str) -> tuple[dict | None, np.ndarray, dict]:
-    """One camera's two_d_tracklets file, the dense tracklet id of every raw row (-1 = unpublished) and counts."""
+                           position_provenance: str, tracklet_provenance: str, recovered: dict | None = None,
+                           recovered_provenance: str | None = None) -> tuple[dict | None, np.ndarray, dict]:
+    """One camera's two_d_tracklets file, the dense tracklet id of every raw row (-1 = unpublished) and counts.
+
+    ``recovered`` (from :func:`recovered_camera_detections`) adds the poses read by the recover stage as
+    detections with their own provenance and tracklets (one per run of consecutive frames of an identity);
+    ``stats["recovered_members"]`` then lists (identity, tracklet id, first frame, last frame) for the 3D tracks.
+    """
     frame_of_row = detections.frame_of_row.astype(np.int64)
     raw_ids, id_stats = raw_tracklet_ids(frame_of_row, kept, atom, identity)
     rows = np.flatnonzero(raw_ids >= 0)
     if frame_mask is not None:
         rows = rows[frame_mask[frame_of_row[rows]]]
     dense = np.full(len(kept), -1, dtype=np.int64)
-    stats = {**id_stats, "published_detections": int(len(rows)), "nonfinite_values": 0}
-    if not len(rows):
+    stats = {**id_stats, "published_detections": int(len(rows)), "nonfinite_values": 0, "recovered_detections": 0,
+             "recovered_members": []}
+    extra = recovered if recovered is not None and len(recovered["frame"]) else None
+    if not len(rows) and extra is None:
         return None, dense, stats
+    if not len(rows):
+        frames = np.zeros(0, np.int64)
+        uniq = np.zeros(0, np.int64)
+        by_frame: dict[int, list] = {}
+        return _finish_camera(camera, dataset, by_frame, uniq, stats, dense, extra, recovered_provenance, image_size,
+                              position_provenance, tracklet_provenance)
     frames = frame_of_row[rows]
     # dense ids ordered by first published frame, then raw id
     ordered = rows[np.lexsort((rows, frames))]
@@ -483,18 +545,49 @@ def build_camera_tracklets(camera: str, dataset: str, detections, kept: np.ndarr
     keypoint_list = np.concatenate([xy, conf[:, :, None]], axis=2).tolist()
     start = detections.start
     order = np.lexsort((tids, frames))
-    out_frames = []
-    current, bucket = None, None
+    by_frame: dict[int, list] = {}
     for i in order:
         frame = int(frames[i])
-        if frame != current:
-            bucket = []
-            out_frames.append({"frame": frame, "detections": bucket})
-            current = frame
         row = int(rows[i])
-        bucket.append({"class": "person", "tracklet_id": int(tids[i]), "bbox": box_list[i],
-                       "keypoints": keypoint_list[i], "score": score_list[i],
-                       "source_id": f"{camera}/{frame}/{row - int(start[frame])}"})
+        by_frame.setdefault(frame, []).append({
+            "class": "person", "tracklet_id": int(tids[i]), "bbox": box_list[i], "keypoints": keypoint_list[i],
+            "score": score_list[i], "source_id": f"{camera}/{frame}/{row - int(start[frame])}"})
+    return _finish_camera(camera, dataset, by_frame, uniq, stats, dense, extra, recovered_provenance, image_size,
+                          position_provenance, tracklet_provenance)
+
+
+def _finish_camera(camera: str, dataset: str, by_frame: dict[int, list], uniq: np.ndarray, stats: dict, dense: np.ndarray,
+                   extra: dict | None, recovered_provenance: str | None, image_size, position_provenance: str,
+                   tracklet_provenance: str) -> tuple[dict | None, np.ndarray, dict]:
+    """Add the recovered detections (own tracklets after the raw ones, own provenance) and assemble the file."""
+    tracklets = int(len(uniq))
+    if extra is not None:
+        frame, who = extra["frame"], extra["identity"]
+        new_run = np.ones(len(frame), bool)
+        new_run[1:] = (who[1:] != who[:-1]) | (frame[1:] != frame[:-1] + 1)
+        run = np.cumsum(new_run) - 1
+        ids = tracklets + run
+        xy, conf = np.round(extra["keypoints"][:, :, :2], 1), np.round(extra["keypoints"][:, :, 2], 3)
+        keypoint_list = np.concatenate([xy, conf[:, :, None]], axis=2).tolist()
+        box_list, score_list = np.round(extra["box"], 1).tolist(), np.round(extra["score"], 4).tolist()
+        counter: dict[int, int] = {}
+        for i in range(len(frame)):
+            f = int(frame[i])
+            number = counter.get(f, 0)
+            counter[f] = number + 1
+            detection = {"class": "person", "tracklet_id": int(ids[i]), "bbox": box_list[i], "keypoints": keypoint_list[i],
+                         "score": score_list[i], "source_id": f"{camera}/{f}/R{number}"}
+            if recovered_provenance:
+                detection["position_provenance"] = recovered_provenance
+                detection["tracklet_provenance"] = recovered_provenance
+            by_frame.setdefault(f, []).append(detection)
+        for value in range(int(run[-1]) + 1):
+            mine = np.flatnonzero(run == value)
+            stats["recovered_members"].append((int(who[mine[0]]), int(tracklets + value), int(frame[mine[0]]), int(frame[mine[-1]])))
+        tracklets += int(run[-1]) + 1
+        stats["recovered_detections"] = int(len(frame))
+        stats["published_detections"] += int(len(frame))
+    out_frames = [{"frame": frame, "detections": by_frame[frame]} for frame in sorted(by_frame)]
     payload = {"schema_version": 1, "dataset": dataset, "camera": camera, "keypoint_format": "coco17",
                "frame_range": [out_frames[0]["frame"], out_frames[-1]["frame"]],
                "position_provenance": position_provenance, "tracklet_provenance": tracklet_provenance,
@@ -502,7 +595,7 @@ def build_camera_tracklets(camera: str, dataset: str, detections, kept: np.ndarr
     if image_size:
         payload["image_size"] = [int(image_size[0]), int(image_size[1])]
     stats["published_frames"] = len(out_frames)
-    stats["tracklets"] = int(len(uniq))
+    stats["tracklets"] = tracklets
     return payload, dense, stats
 
 
@@ -531,14 +624,20 @@ def _members(identity: np.ndarray, dense: np.ndarray, frame_of_row: np.ndarray) 
 
 
 def build_tracks(dataset: str, solved: Solved, dense: dict[str, np.ndarray], frame_of_row: dict[str, np.ndarray],
-                 aligned: np.ndarray, published: np.ndarray, provenance: str, calibration: dict | None
-                 ) -> tuple[dict, dict]:
-    """The three_d_tracks payload and its counts: one track per identity, positions at published sync indices."""
+                 aligned: np.ndarray, published: np.ndarray, provenance: str, calibration: dict | None,
+                 recovered_members: dict[str, list[tuple[int, int, int, int]]] | None = None) -> tuple[dict, dict]:
+    """The three_d_tracks payload and its counts: one track per identity, positions at published sync indices.
+
+    ``recovered_members``: per camera the (identity, tracklet id, first frame, last frame) of recovered tracklets.
+    """
     members: dict[int, list[dict]] = {}
     for camera in solved.cameras:
         for identity, pieces in _members(solved.identity[camera], dense[camera], frame_of_row[camera]).items():
             for tracklet, low, high in pieces:
                 members.setdefault(identity, []).append({"camera": camera, "tracklet_id": tracklet, "frame_range": [low, high]})
+        for identity, tracklet, low, high in (recovered_members or {}).get(camera, []):
+            members.setdefault(int(identity), []).append({"camera": camera, "tracklet_id": int(tracklet),
+                                                          "frame_range": [int(low), int(high)]})
     data = solved.tracks
     t, identity = data["t"].astype(np.int64), data["identity"].astype(np.int64)
     root, xyz = data["root"], data["xyz"]
@@ -598,6 +697,9 @@ def calibration_descriptor(solved: Solved, workspace_id: str) -> dict | None:
     return {
         "path": "calibration/calibration.json", "workspace": workspace_id, "sha256": sha256_file(path),
         "standard_calibration": name, "source_path": source or None, "source_sha256": note.get("source_sha256"),
+        # where the stage started from: the dataset's stored calibration (data_management calibration store,
+        # with the cameras it overrides) or the default
+        "base": note.get("base"),
         "world": {"units": "in", "up_axis": "z", "floor_z": 0.0,
                   "frame": f"the standard {name} world frame (inches, z up, floor at z = 0)"},
         "convention": data.get("convention"), "pixel_space": "native camera pixels",
@@ -722,6 +824,31 @@ def solve_provenance(root: Path, solved: Solved, workspace_id: str, db: dict, co
     return finish_provenance("data_engine.solve", body)
 
 
+def recover_provenance(root: Path, solved: Solved, code: dict) -> dict:
+    manifest = latest_manifest(root, "recover")
+    config = ((manifest or {}).get("config") or {}).get("coverage") or RECIPE["coverage"]
+    inputs = (manifest or {}).get("inputs", {})
+    body = {
+        "kind": "machine",
+        "description": ("2D poses and 3D positions of the Data Engine recover stage: where a track has no position, a "
+                        "known pose of that track nearby in time is projected into every camera that should see the "
+                        "person, ViTPose (curated v6) reads a pose inside each box, and the poses are kept only if they "
+                        "triangulate across at least two cameras with the solve's gates and pass a stricter acceptance "
+                        "gate. The known pose only places the boxes; nothing is interpolated. There is no detector "
+                        "score: 'score' is the mean heatmap peak of the 12 body joints. Membership in a 3D track "
+                        "follows from the track whose gap was searched and is as provisional as that track's identity."),
+        "reproduction": {
+            "steps": ["data-engine run <workspace>   (recover stage: plan in solve/coverage.py, crops read by "
+                      "python src/data_engine/workers/recover_trt.py, acceptance in solve/coverage.py)"],
+            "code": code,
+            "config": {"coverage": config, "geometry": RECIPE["geometry"], "vitpose_onnx_sha256": inputs.get("vitpose_onnx_sha256"),
+                       "solution": inputs.get("solution"), "recover_manifest": (manifest or {}).get("_file"),
+                       "code_at_recovery": (manifest or {}).get("code")},
+        },
+    }
+    return finish_provenance("data_engine.recover", body)
+
+
 def alignment_provenance_record(solved: Solved, code: dict) -> dict | None:
     """The engine's alignment provenance as the label store can register it.
 
@@ -763,8 +890,10 @@ def build_notes(*, stats: dict, solved: Solved, workspace_id: str, slice_note: s
         "3D keypoints are measured joints only: unmeasured joints are null and nothing is interpolated or extrapolated; "
         "positions whose root is unmeasured are omitted. "
         + (f"{int(solved.tracks['recovered_positions'])} 3D positions (before sampling) were measured from poses read at "
-           "the track's expected place (guided ViTPose crops, triangulated with the same gates); their 2D poses are kept "
-           "in the engine workspace and are not among the published detections. "
+           "the track's expected place (guided ViTPose crops, triangulated with the same gates); "
+           f"{stats.get('recovered_detections', 0)} of those 2D poses are published as detections with their own "
+           "provenance and tracklets (source_id '<camera>/<frame>/R<n>'), and "
+           f"{stats.get('recovered_already_a_detection', 0)} coincide with a detection that is already published. "
            if int(solved.tracks.get("recovered_positions", 0)) else "")
         + f"Sampling: {sample}; time as aligned indices of the published frame_alignment set.{unresolved}{mount} "
         "Open unknowns at publication (engine ledger): "
@@ -824,6 +953,11 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
     if align_prov is None:
         raise PublishError("alignment/provenance.json is missing; cannot reference the alignment provenance")
     provenances = {p["name"]: p for p in (align_prov, detect, solve)}
+    recovered_2d = solved.tracks.get("recovered_2d")
+    recover = None
+    if recovered_2d is not None and len(recovered_2d["t"]):
+        recover = recover_provenance(root, solved, code)
+        provenances[recover["name"]] = recover
 
     alignment_payload, agreement = build_alignment(
         solved.alignment, dataset, aligned, solved.native, published, cameras, alignment_mode, shift,
@@ -840,14 +974,22 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
     per_camera: dict[str, dict] = {}
     unaligned = [c for c, column in zip(cameras, range(len(cameras))) if not (solved.native[:, column] >= 0).any()]
     total_published = in_3d = human_rows = kept_total = off_timeline = 0
+    recovered_members: dict[str, list] = {}
+    recovered_published = recovered_duplicates = 0
     for column, camera in enumerate(cameras):
         detections = load_camera(root / "detections" / "raw", camera, ds.cameras[camera].frame_count)
         frame_of_row[camera] = detections.frame_of_row.astype(np.int64)
         mask = published_frame_mask(detections.frame_count, solved.native, column, published, stride)
         info = ds.cameras[camera]
+        extra = recovered_camera_detections(column, recovered_2d, detections, solved.kept[camera], mask, published)
         payload, dense[camera], stats = build_camera_tracklets(
             camera, dataset, detections, solved.kept[camera], solved.atom[camera], solved.identity[camera], mask,
-            (info.width, info.height), detect["name"], solve["name"])
+            (info.width, info.height), detect["name"], solve["name"], recovered=extra,
+            recovered_provenance=recover["name"] if recover else None)
+        recovered_members[camera] = stats.pop("recovered_members")
+        stats["recovered_already_a_detection"] = extra["already_a_detection"]
+        recovered_published += stats["recovered_detections"]
+        recovered_duplicates += extra["already_a_detection"]
         per_camera[camera] = stats
         kept_total += int(solved.kept[camera].sum())
         on_timeline = np.zeros(detections.frame_count, bool)
@@ -855,8 +997,8 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
         on_timeline[shown[(shown >= 0) & (shown < detections.frame_count)]] = True
         off_timeline += int((solved.kept[camera] & ~on_timeline[frame_of_row[camera]]).sum())
         published_rows = dense[camera] >= 0
-        total_published += int(published_rows.sum())
-        in_3d += int((published_rows & (solved.identity[camera] >= 0)).sum())
+        total_published += int(published_rows.sum()) + stats["recovered_detections"]
+        in_3d += int((published_rows & (solved.identity[camera] >= 0)).sum()) + stats["recovered_detections"]
         human_rows += int((published_rows & (solved.source[camera] == 5)).sum())
         if payload is not None:
             sizes[f"two_d_tracklets/cameras/{camera}.json"] = write_json(
@@ -864,10 +1006,12 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
         del payload
         log(f"{camera}: {stats['published_detections']} detections, {stats.get('tracklets', 0)} tracklets")
 
-    tracks_payload, track_stats = build_tracks(dataset, solved, dense, frame_of_row, aligned, published, solve["name"], calibration)
+    tracks_payload, track_stats = build_tracks(dataset, solved, dense, frame_of_row, aligned, published, solve["name"],
+                                               calibration, recovered_members)
     sizes["three_d_tracks/tracks.json"] = write_json(out / "three_d_tracks" / "tracks.json", tracks_payload)
     stats = {"published_detections": total_published, "detections_in_3d_tracks": in_3d,
-             "share_in_3d_tracks": in_3d / total_published if total_published else 0.0, "human_sourced_rows": human_rows}
+             "share_in_3d_tracks": in_3d / total_published if total_published else 0.0, "human_sourced_rows": human_rows,
+             "recovered_detections": recovered_published, "recovered_already_a_detection": recovered_duplicates}
     slice_name = split_workspace_id(workspace_id)[1]
     limit = db["meta"].get("limit_frames")
     slice_note = f"pilot slice '{slice_name}': first {limit} native frames of every camera" if limit else \
@@ -894,6 +1038,7 @@ def build_drafts(workspace: Path, dataset: str, tag: str, out: Path, *, stride: 
         "stride": stride, "shift": shift, "sets": names, "draft_dir": str(out),
         "sync_indices": int(len(aligned)), "published_sync_indices": int(published.sum()),
         "detections": {"kept_total": kept_total, "published": total_published, "in_3d_tracks": in_3d,
+                       "recovered_published": recovered_published, "recovered_already_a_detection": recovered_duplicates,
                        "share_in_3d_tracks": round(stats["share_in_3d_tracks"], 4),
                        "kept_off_common_timeline": off_timeline, "human_sourced": human_rows,
                        "per_camera": per_camera},

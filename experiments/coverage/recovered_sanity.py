@@ -39,6 +39,7 @@ def main() -> None:
     parser.add_argument("workspace")
     parser.add_argument("--sheets")
     parser.add_argument("--count", type=int, default=8)
+    parser.add_argument("--pick", help="identity:t,identity:t,... render these recovered positions instead of random ones")
     args = parser.parse_args()
     from data_engine.workspace import Workspace
 
@@ -88,7 +89,12 @@ def main() -> None:
     out = Path(args.sheets)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
-    for number, row in enumerate(rng.choice(len(extra["t"]), size=min(args.count, len(extra["t"])), replace=False)):
+    chosen = rng.choice(len(extra["t"]), size=min(args.count, len(extra["t"])), replace=False)
+    if args.pick:
+        wanted = [tuple(int(v) for v in item.split(":")) for item in args.pick.split(",")]
+        chosen = [int(np.flatnonzero((extra["identity"] == who) & (extra["t"] == when))[0]) for who, when in wanted
+                  if ((extra["identity"] == who) & (extra["t"] == when)).any()]
+    for number, row in enumerate(chosen):
         who, when = int(extra["identity"][row]), int(extra["t"][row])
         cells = []
         for camera in scene.cameras:
