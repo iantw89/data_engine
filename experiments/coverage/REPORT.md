@@ -168,6 +168,14 @@ labels exist the identity is right for 50 of 52. 24 belong to another identity a
 different pose: those detections are left as they are and counted; 6 would be adopted by two
 identities and are adopted by neither.
 
+Felix hour (drafts of round 12, after the laps): 113,610 recovered camera poses; 82,919 are
+written as new detections, 30,691 lie on a kept detection: 22,841 on one of the same
+identity, 5,037 adopted, 258 with a different pose, 97 adoption conflicts, and 2,399 (7.8%;
+golden 1.9%) on a detection the solve gave to another identity. The last group is not
+resolved by the engine: either the two identities are one person (felix has 197 open
+identity-link questions) or one of the two assignments is wrong. It is counted in the draft
+summary and is not yet used as evidence for linking or as a review question.
+
 ## 9. Recovered poses as detections for Autofit (the lap; `experiments/autofit/augmented.py`)
 
 A recovered pose that does not lie on a kept detection is a detection the detector missed.
