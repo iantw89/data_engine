@@ -62,6 +62,13 @@ KINDS: dict[str, UnknownKind] = {kind.name: kind for kind in [
         ("3D motion continuity", "single-view tracklet bridge", "appearance ReID", "elimination of occupied identities"),
         "reidentify", ()),
     UnknownKind(
+        "identity_swap", "Possible identity swap",
+        "Two tracked people came within reach of each other (or their tracks exchanged places) and nothing "
+        "independent of the 3D tracker confirms who is who afterwards.",
+        ("step-by-step 3D continuity", "heading through the crossing", "3D body proportions before/after",
+         "single-camera tracklets in views where the two stay apart", "appearance ReID"),
+        "swap_check", ()),
+    UnknownKind(
         "unassigned", "Unassigned observations",
         "A tracklet of confident detections belongs to no track (single-view person, or a false detection).",
         ("projection assignment to existing 3D tracks", "single-view bridge between fragments"),
@@ -173,6 +180,15 @@ TASK_TYPES: dict[str, TaskType] = {task.name: task for task in [
          "none_of_these": "bool (A is a person not among the candidates)", "notes": "str"},
         ("same", "different"),
         "Positive/negative fragment pairs are ReID training pairs for this camera set and calibrate the appearance margin."),
+    TaskType(
+        "swap_check", "Identity swap check",
+        "Two people came close. Which of the candidates (after) is reference A (before)?",
+        "reference_candidates",
+        {"reference_ok": "bool", "candidates": "{candidate id: 'same' | 'different' | 'unsure'}",
+         "none_of_these": "bool (A is neither candidate)", "notes": "str"},
+        ("same", "different", "split"),
+        "Confirmed swaps and confirmed non-swaps calibrate the swap cues (body, heading, appearance) and are "
+        "hard cases for the 3D tracker's association."),
     TaskType(
         "detection_triage", "Unassigned detection triage",
         "Is this a real person? If so, which tracked person is it?",

@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def _git(*arguments: str, cwd: Path = REPO_ROOT) -> str | None:
     try:
-        result = subprocess.run(["git", *arguments], cwd=cwd, capture_output=True, text=True, timeout=20)
+        result = subprocess.run(["git", *arguments], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout if result.returncode == 0 else None

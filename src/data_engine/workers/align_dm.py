@@ -19,6 +19,12 @@ consecutively on the PTS clock (each part honouring its trim and count). A recor
 exactly at a file boundary is therefore invisible, and a part without overlap evidence
 (``verified`` false) is joined with an unknown gap; both are reported as uncertainty.
 
+Repeated frames: a part's ``overlap`` leading frames repeat the previous part's last frames
+(pixel-verified by the ingest stage). They are in the camera's frame index but not on its
+timeline: the generator runs on the timeline (those frames and their detections removed),
+and the sync table and ``clocks.npz`` are written back in frame-index terms. The sync table
+never selects a repeated frame; in ``clocks.npz`` it carries the time of the frame it repeats.
+
 Outputs in ``--out``: alignment.json, provenance.json, clocks.npz, sync_table.npz, report.json.
 """
 
@@ -36,7 +42,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from data_engine.dataset import Camera, Dataset  # noqa: E402
+from data_engine.dataset import Camera, Dataset, Part  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 SYNC_RATE_HZ = 10.0
@@ -64,6 +70,30 @@ def offsets_at(times: np.ndarray, schedule: list[tuple[float, dict[str, float]]]
     table = np.array([[schedule[i][1].get(c, np.nan) for c in cameras] for i in order], dtype=float)
     index = np.clip(np.searchsorted(effective, times, side="right") - 1, 0, len(order) - 1)
     return table[index]
+
+
+def timeline_frames(parts) -> np.ndarray:
+    """Frame index (ascending) of every frame on the timeline: all frames except each part's ``overlap``."""
+    keep, cumulative = [], 0
+    for part in parts:
+        overlap = int(getattr(part, "overlap", 0))
+        keep.append(np.arange(cumulative + overlap, cumulative + part.count, dtype=np.int64))
+        cumulative += part.count
+    return np.concatenate(keep) if keep else np.zeros(0, np.int64)
+
+
+def stream_clock(times: np.ndarray, keep: np.ndarray, repeated: list[tuple[int, int]], frames: int) -> np.ndarray:
+    """Timeline clock times written per frame index; a repeated frame gets the time of the frame it repeats."""
+    out = np.full(frames, np.nan)
+    out[keep] = times
+    for frame, source in repeated:
+        out[frame] = out[source]
+    return out
+
+
+def to_frame_index(native: np.ndarray, keep: np.ndarray) -> np.ndarray:
+    """Timeline positions (-1 = none) -> frame indices."""
+    return np.where(native >= 0, keep[np.clip(native, 0, len(keep) - 1)], -1).astype(np.int32)
 
 
 def frame_period(times: np.ndarray) -> float:
@@ -202,6 +232,17 @@ class CameraDetections:
             return None
         a = int(self.starts[i])
         return self.boxes[a:a + int(self.counts[i])], self.keypoints[a:a + int(self.counts[i])]
+
+    def on_timeline(self, keep: np.ndarray) -> "CameraDetections":
+        """The same detections with frames renumbered as timeline positions; frames off the timeline dropped."""
+        position = np.searchsorted(keep, self.frames)
+        present = (position < len(keep)) & (keep[np.minimum(position, len(keep) - 1)] == self.frames)
+        rows = np.repeat(present, self.counts)
+        counts = self.counts[present]
+        return CameraDetections(self.camera_id, position[present].astype(np.int64),
+                                np.concatenate(([0], np.cumsum(counts)[:-1])) if len(counts) else np.zeros(0, np.int64),
+                                counts, self.boxes[rows], self.keypoints[rows], self.clipped_confidences,
+                                self.dropped_people)
 
     def runs(self) -> list[tuple[int, int]]:
         """Contiguous (first, last) frame runs."""
@@ -573,7 +614,14 @@ def main() -> int:
     cameras = sorted(detections)
 
     started = time.time()
-    selected = {c: dataset.cameras[c] for c in cameras}
+    # From here on a camera is its timeline: repeated frames (Part.overlap) are trimmed away.
+    keep = {c: timeline_frames(dataset.cameras[c].parts) for c in cameras}
+    selected = {c: Camera(**{**vars(dataset.cameras[c]), "parts": [
+        Part(p.path, p.trim + p.overlap, p.count - p.overlap, p.verified, 0) for p in dataset.cameras[c].parts]})
+        for c in cameras}
+    for c in cameras:
+        if len(keep[c]) != dataset.cameras[c].frame_count:
+            detections[c] = detections[c].on_timeline(keep[c])
     index_dir = index_dir_for(selected, out / "frame_index")
     clocks = {c: build_clock(selected[c], index_dir) for c in cameras}
     for c in cameras:
@@ -589,6 +637,9 @@ def main() -> int:
             if not part.verified:
                 notes[c].append(f"part {Path(part.path).name} joined without overlap evidence: unknown gap at the "
                                 "file boundary shifts later time offsets by that gap")
+        for part in dataset.cameras[c].parts:
+            if part.overlap:
+                notes[c].append(f"part {Path(part.path).name}: {part.overlap} repeated leading frames taken off the timeline")
         notes[c] += cam.notes and [f"dataset note: {n}" for n in cam.notes if "overlap evidence" not in n] or []
         if detections[c].clipped_confidences:
             notes[c].append(f"{detections[c].clipped_confidences} keypoint confidences clipped into [0,1]")
@@ -701,6 +752,12 @@ def main() -> int:
     table = build_sync_table(clock_times, schedule, anchor=anchor) if anchor else {
         "cameras": np.array(cameras), "aligned_time": np.zeros(0), "native": np.zeros((0, len(cameras)), np.int32),
         "offsets_seconds": np.zeros((0, len(cameras)))}
+    # Back to frame-index terms for everything the engine reads.
+    for column, c in enumerate(str(name) for name in table["cameras"]):
+        if len(table["native"]):
+            table["native"][:, column] = to_frame_index(table["native"][:, column], keep[c])
+    clock_times = {c: stream_clock(clock_times[c], keep[c], dataset.cameras[c].repeated_frames(),
+                                   dataset.cameras[c].frame_count) for c in cameras}
 
     (out / "alignment.json").write_text(json.dumps(data, indent=1), encoding="utf-8")
     (out / "provenance.json").write_text(json.dumps(provenance.to_dict(), indent=1, default=str), encoding="utf-8")

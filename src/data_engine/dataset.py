@@ -6,7 +6,8 @@ catalog) and then read everywhere else, so the engine core does not import data_
 Conventions (same as data_management label sets):
 - camera ids are current catalogue ids (``felix-3``);
 - frame indices are 0-based *native* indices in presentation order across chunks, after
-  content-verified overlap trims;
+  content-verified overlap trims (data_management's index). A part's ``overlap`` frames are
+  in this index but repeat earlier frames: the alignment keeps them off the timeline;
 - pixel coordinates are native pixels unless a name says ``norm`` (1280x960 calibration scale).
 """
 
@@ -23,6 +24,9 @@ class Part:
     trim: int  # leading frames of this file that duplicate the previous part
     count: int  # frames this part contributes to the stream
     verified: bool = True
+    # Leading frames (after ``trim``) that repeat the previous part's last frames, found by pixel
+    # comparison (``overlap.py``). They stay in the frame index but are not part of the timeline.
+    overlap: int = 0
 
 
 @dataclass
@@ -50,6 +54,14 @@ class Camera:
                 return part.path, part.trim + frame - cumulative
             cumulative += part.count
         raise IndexError(f"{self.camera_id}: frame {frame} outside 0..{cumulative - 1}")
+
+    def repeated_frames(self) -> list[tuple[int, int]]:
+        """``(frame, frame it repeats)`` for every frame that a part's ``overlap`` takes off the timeline."""
+        pairs, cumulative = [], 0
+        for part in self.parts:
+            pairs += [(cumulative + j, cumulative - part.overlap + j) for j in range(part.overlap)]
+            cumulative += part.count
+        return pairs
 
 
 @dataclass

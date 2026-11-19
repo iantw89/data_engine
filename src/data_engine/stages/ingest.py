@@ -65,6 +65,51 @@ def stream_layout_unknowns(dataset) -> list[dict]:
     return items
 
 
+def verify_boundaries(context: Context) -> None:
+    """Pixel-check every file boundary the catalog left unverified; record exact repeats as ``overlap``."""
+    from ..dataset import Dataset
+    from ..overlap import verify_boundary
+    from ..video import ExactReader, frame_times
+
+    workspace = context.workspace
+    dataset = Dataset.load(workspace.dataset_json)
+    index_dir = workspace.path("frame_index")
+    changed = False
+    for camera_id, camera in sorted(dataset.cameras.items()):
+        for number in range(1, len(camera.parts)):
+            previous, part = camera.parts[number - 1], camera.parts[number]
+            if part.verified or camera.issues:
+                continue
+            name = os.path.basename(part.path)
+            try:
+                a = ExactReader(previous.path, frame_times(previous.path, index_dir))
+                b = ExactReader(part.path, frame_times(part.path, index_dir))
+                try:
+                    found = verify_boundary(a.read, previous.trim + previous.count - 1, b.read, part.trim, part.count)
+                finally:
+                    a.close()
+                    b.close()
+            except (OSError, RuntimeError, ValueError, IndexError) as exc:
+                context.log(f"{camera_id}: boundary check of {name} failed ({exc}); left unverified", level="warning")
+                continue
+            evidence = (f"difference {found.get('residual')} grey levels, next best {found.get('next_best')}, "
+                        f"{found.get('frames_compared')} frames compared")
+            if found["overlap"]:
+                part.overlap, part.verified, changed = int(found["overlap"]), True, True
+                camera.notes = [note for note in camera.notes if name not in note]
+                camera.notes.append(f"{name}: first {part.overlap} frames repeat the previous file's last "
+                                    f"{part.overlap} frames (pixel-identical; {evidence}); kept in the frame index, "
+                                    "taken off the timeline")
+            else:
+                changed = True
+                camera.notes.append(f"{name}: boundary not verified by pixel comparison either "
+                                    f"({found['reason']}; {evidence})")
+    if changed:
+        dataset.save(workspace.dataset_json)
+        for cached in ("dataset", "detections", "frames"):
+            workspace.__dict__.pop(cached, None)
+
+
 def run(context: Context) -> StageResult:
     workspace = context.workspace
     site = workspace.site
@@ -82,6 +127,7 @@ def run(context: Context) -> StageResult:
     # Later stages (and this process) must see the new file, not a previously cached load.
     for cached in ("dataset", "detections", "frames"):
         workspace.__dict__.pop(cached, None)
+    verify_boundaries(context)
     limit = context.db.get_meta("limit_frames")
     if limit:
         # Pilot slice: keep only the first N native frames of every camera.
@@ -92,7 +138,8 @@ def run(context: Context) -> StageResult:
             for part in camera.parts:
                 if remaining <= 0:
                     break
-                parts.append(Part(part.path, part.trim, min(part.count, remaining), part.verified))
+                parts.append(Part(part.path, part.trim, min(part.count, remaining), part.verified,
+                                  min(part.overlap, min(part.count, remaining))))
                 remaining -= parts[-1].count
             camera.parts = parts
             camera.notes.append(f"pilot slice: first {limit} frames only")

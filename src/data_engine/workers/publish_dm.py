@@ -171,6 +171,19 @@ def load_solved(root: Path) -> Solved:
     with np.load(directory / "tracks3d.npz") as data:
         tracks = {name: data[name] for name in data.files}
     cameras = [str(c) for c in tracks["cameras"]]
+    # Positions recovered from guided crops (recover stage) belong to this solution only if they were
+    # computed from exactly this tracks3d.npz.
+    recovered_path = directory / "tracks3d_recovered.npz"
+    tracks["recovered_positions"] = 0
+    if recovered_path.is_file():
+        with np.load(recovered_path) as extra:
+            if str(extra["source_tracks_sha256"]) == sha256_file(directory / "tracks3d.npz") \
+                    and [str(c) for c in extra["cameras"]] == cameras:
+                tracks["recovered_positions"] = int(len(extra["t"]))
+                for name in ("component", "identity", "t", "rows", "xyz", "used", "residual", "root"):
+                    tracks[name] = np.concatenate([tracks[name], extra[name].astype(tracks[name].dtype)])
+            else:
+                log("tracks3d_recovered.npz belongs to another solution; ignored (run the recover stage)")
     sync_path = root / "alignment" / "sync_table.npz"
     if not sync_path.is_file():
         raise PublishError(f"{sync_path} missing; run the align stage")
@@ -749,7 +762,11 @@ def build_notes(*, stats: dict, solved: Solved, workspace_id: str, slice_note: s
         f"({stats['human_sourced_rows']} published detections carry a human-sourced label). "
         "3D keypoints are measured joints only: unmeasured joints are null and nothing is interpolated or extrapolated; "
         "positions whose root is unmeasured are omitted. "
-        f"Sampling: {sample}; time as aligned indices of the published frame_alignment set.{unresolved}{mount} "
+        + (f"{int(solved.tracks['recovered_positions'])} 3D positions (before sampling) were measured from poses read at "
+           "the track's expected place (guided ViTPose crops, triangulated with the same gates); their 2D poses are kept "
+           "in the engine workspace and are not among the published detections. "
+           if int(solved.tracks.get("recovered_positions", 0)) else "")
+        + f"Sampling: {sample}; time as aligned indices of the published frame_alignment set.{unresolved}{mount} "
         "Open unknowns at publication (engine ledger): "
         + (", ".join(f"{k} {v}" for k, v in sorted(open_unknowns.items())) + f" (total {sum(open_unknowns.values())})"
            if open_unknowns else "none") + ".")

@@ -50,6 +50,16 @@ tracklets were impure. A detection-level 3D tracker does not inherit that error.
 | Autofit global (merged) ids | Autofit's own cross-gap re-identification | 2-4 wrong links on the first half of the data at every threshold | **Rejected for identity** |
 | Autofit "different tracks" as negative evidence | Eliminate candidates Autofit separates | up to 2.8% of true pairs wrongly eliminated | Rejected as a hard rule |
 
+## Added after the lever study (2026-11-18)
+
+| Mechanism | What it does | Measured | Decision |
+|---|---|---|---|
+| File-boundary check (`overlap.py`) | Compares decoded frames where the catalog could not verify a join between two files | felix-5: 6 repeated frames found (difference 0.0 vs 0.43 next best); the geometric alignment check then went from 6 disagreeing blocks to 0, identities 408 -> 366, open unknowns 654 -> 585 | **Adopted** |
+| Swap check (`solve/swap_check.py`, `experiments/switches/REPORT.md`) | Finds every step where two tracks could have exchanged people; tests crossings with heading, body proportions and 2D tracklets | golden: 2 questions per 10 min, 100/100 injected swaps flagged; felix: 81 questions per hour, a real swap found among the first examples viewed | **Adopted** (review only; nothing is relabelled) |
+| Coverage recovery (`stages/recover.py`, `experiments/coverage/REPORT.md`) | Reads poses at each track's expected place and triangulates them | golden: 749 of 5,065 missing person-frames recovered; 0 false accepts in 6,500 controls for three-camera recoveries. felix: 17,078 positions (+4.5%), missing frames inside tracks 49,247 -> 33,493 | **Adopted** |
+| Existing low-score detections near the hint | Attach raw candidates the post-filter dropped | 41 frames beyond guided crops at the same gate | Not adopted (too little) |
+| Other detectors on a zoomed crop (YOLOv8x, YOLO11l) | Detector on a 3-5x ROI, ViTPose on its boxes | +46 frames (5%) for about 14 min per recorded hour; 5x zoom halves recall | Rejected |
+
 ## What the remaining questions are (golden)
 
 * **Unassigned (40)**: real people that only one camera can see - a receptionist at a desk

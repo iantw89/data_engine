@@ -19,6 +19,7 @@ from ..store import parse_det_key
 from ..taxonomy import KINDS, TASK_TYPES
 
 ROUND_BUDGET = {"cross_view_match": 40, "reidentify": 40, "detection_triage": 25, "pose_ownership": 15,
+                "swap_check": 30,
                 "calibration_review": 10, "alignment_review": 10, "operator_decision": 10, "continuity": 20}
 COLORS = ["magenta", "cyan", "yellow", "orange"]
 
@@ -154,6 +155,36 @@ def identity_task(context: Context, unknown: dict) -> tuple[str, dict]:
     return "reidentify", payload
 
 
+def swap_task(context: Context, unknown: dict) -> tuple[str, dict]:
+    detail = unknown["detail"]
+    seconds, clock = time_text(context, detail.get("t"))
+    a, b = detail["identity"], detail["other"]
+    title = {"exchange": f"Tracks {a} and {b} exchanged places at {clock}",
+             "ending": f"Track {b} ends next to person {a} at {clock}",
+             "crossing": f"People {a} and {b} came very close at {clock}"}[detail["moment"]]
+    payload = base_payload("swap_check", title, detail["why"],
+                           {"closest distance (m)": detail.get("min_distance_m"), **{
+                               key.replace("_", " "): value for key, value in detail["cues"].items() if value is not None}},
+                           seconds)
+    payload["question"] = f"Reference A is person {a} just before. Which candidate shows the same person just after?"
+    payload["reference"] = {"id": "A", "caption": f"person {a}, just before",
+                            "panels": [panel(context, key, label="A") for key in detail["reference_keys"]]}
+    payload["candidates"] = [{
+        "id": "B", "track": a, "caption": f"labelled person {a} just after (no swap)", "keys": detail["after_a_keys"],
+        "continuation": True,
+        "panels": [panel(context, key, label="B", color=COLORS[0]) for key in detail["after_a_keys"]]}]
+    if detail.get("after_b_keys"):
+        payload["candidates"].append({
+            "id": "C", "track": b, "caption": f"labelled person {b} just after (a swap if this is A)",
+            "keys": detail["after_b_keys"],
+            "panels": [panel(context, key, label="C", color=COLORS[1]) for key in detail["after_b_keys"]]})
+    if detail.get("before_b_keys"):
+        payload["context_panels"] = [panel(context, key, label=f"person {b} before", color=COLORS[2])
+                                     for key in detail["before_b_keys"]]
+    payload.update({"allow_none": True, "single_choice": True, "reference_keys": detail["reference_keys"]})
+    return "swap_check", payload
+
+
 def ownership_task(context: Context, unknown: dict) -> tuple[str, dict]:
     detail = unknown["detail"]
     seconds, clock = time_text(context, detail.get("t"))
@@ -223,7 +254,8 @@ def alignment_task(context: Context, unknown: dict) -> tuple[str, dict]:
 
 
 BUILDERS = {"association": association_task, "unassigned": unassigned_task, "identity_link": identity_task,
-            "pose_ownership": ownership_task, "calibration": calibration_task, "alignment": alignment_task}
+            "pose_ownership": ownership_task, "calibration": calibration_task, "alignment": alignment_task,
+            "identity_swap": swap_task}
 
 
 def evidence_signature(payload: dict) -> str:

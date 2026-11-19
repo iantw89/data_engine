@@ -24,6 +24,79 @@ from ..solve.scene import Scene, load_scene
 from ..store import parse_det_key
 
 WINDOW = 20  # sync frames per evidence window (2 s)
+def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: Constraints,
+                  resolved_keys: set[str]) -> dict:
+    """Run ``solve/swap_check`` on the solution; flagged and unverified moments become unknowns."""
+    from ..solve import swap_check
+
+    cams = recover.camera_counts(solved.scene, solved.labels)
+    multi = np.zeros(solved.labels.next_label() + 1, dtype=bool)
+    for label, cameras in cams.items():
+        multi[label] = len(cameras) >= 2
+    row_identity = []
+    for camera in scene.cameras:
+        label = solved.labels.label[camera.index]
+        row_identity.append(np.where((label >= 0) & multi[np.clip(label, 0, None)],
+                                     solved.identity_of_label[np.clip(label, 0, None)], -1).astype(np.int64))
+    frames = solved.frames
+    keep = multi[frames.label]
+    result = swap_check.check(scene, row_identity, solved.identity_of_label[frames.label[keep]].astype(np.int64),
+                              frames.t[keep], frames.root[keep], frames.xyz[keep], RECIPE["swap_check"],
+                              same_rows=constraints.same)
+    (context.workspace.round_dir(context.round) / "swap_check.json").write_text(
+        json.dumps(result, indent=1), encoding="utf-8")
+    unknowns = []
+    for entry in result["entries"]:
+        if entry["status"] == "verified" or not entry.get("reference_keys") or not entry.get("after_a_keys"):
+            continue
+        if resolved_keys & set(entry["reference_keys"]):
+            continue  # a person already said this moment cannot be judged
+        start, end = entry["t"]
+        cues = entry["cues"]
+        if entry["kind"] == "exchange":
+            why = (f"people {entry['a']} and {entry['b']} exchanged places between two frames "
+                   f"({-entry['continuity_margin_m']:.2f} m cheaper exchanged than kept)")
+        elif entry["kind"] == "ending":
+            why = (f"the track of person {entry['b']} ends {entry['min_distance_m']:.2f} m from person {entry['a']}, "
+                   "who continues: the surviving track may now be following the other person")
+        else:
+            why = (f"people {entry['a']} and {entry['b']} came within {entry['min_distance_m']:.2f} m; position "
+                   "continuity cannot tell who is who afterwards")
+        said = "; ".join(filter(None, [
+            "cues for a swap: " + ", ".join(entry["swap_cues"]) if entry["swap_cues"] else "",
+            "cues against: " + ", ".join(entry["stay_cues"]) if entry["stay_cues"] else "",
+            "" if entry["swap_cues"] or entry["stay_cues"] else "no independent cue could decide"]))
+        unknowns.append({
+            "subject": f"identity_swap:{entry['reference_keys'][0]}",
+            # exchanges and flagged crossings first, then the closest unverified ones
+            "severity": float({"flagged": 2000, "unverified": 1000}[entry["status"]]
+                              + 500 * max(0.0, 1.0 - (entry["min_distance_m"] or 0.0))),
+            "detail": {"moment": entry["kind"], "status": entry["status"], "identity": entry["a"], "other": entry["b"],
+                       "t": int(start), "span_t": [int(start), int(end)], "min_distance_m": entry["min_distance_m"],
+                       "cues": {k: v for k, v in cues.items() if k != "contradicting_tracklets"},
+                       "swap_cues": entry["swap_cues"], "stay_cues": entry["stay_cues"],
+                       "reference_keys": entry["reference_keys"], "after_a_keys": entry["after_a_keys"],
+                       "after_b_keys": entry["after_b_keys"], "before_b_keys": entry["before_b_keys"],
+                       "why": f"{why} ({said})",
+                       "resolve_by": "a person compares each one before and after the moment"}})
+    return {"unknowns": unknowns, "summary": result["summary"]}
+
+
+def _file_boundaries(scene, camera) -> list[tuple[int, str]]:
+    """(first sync index showing a later file of this camera, file name) for every file after the first."""
+    import os
+
+    out, cumulative = [], 0
+    shown = scene.native[:, camera.index]
+    for part in scene.workspace.dataset.cameras[camera.camera].parts[:-1]:
+        cumulative += part.count
+        at = np.flatnonzero(shown >= cumulative)
+        if len(at):
+            following = scene.workspace.dataset.cameras[camera.camera].parts[len(out) + 1]
+            out.append((int(at[0]), os.path.basename(following.path)))
+    return out
+
+
 MIN_TASK_DETECTIONS = 30  # a free piece shorter than 3 s is not worth an individual question
 MIN_IDENTITY_DETECTIONS = 150  # a 3D track this small (a few seconds) is asked about as a group
 
@@ -424,20 +497,34 @@ def run(context: Context) -> StageResult:
         for entry in entries:
             if entry["verdict"] == "disagrees" and camera.camera not in decided:
                 start, end = entry["t"]
+                shift = f"{entry['best_lag']} frame(s)" if entry.get("peak_inside_scan", True) else \
+                    f"{entry['best_lag']} frame(s) or more (the edge of the scan)"
+                boundaries = _file_boundaries(scene, camera)
+                near = [name for sync, name in boundaries if sync <= end]
+                hint = (f" The camera's file {near[-1]} starts at or before this block; a shift that begins at a file "
+                        "boundary is a gap or overlap between the two files.") if near else ""
                 unknowns["alignment"].append({
                     "subject": f"alignment:{camera.camera}:{start}-{end}", "severity": float(end - start),
                     "detail": {"camera": camera.camera, "block_sync_frames": entry["t"], "best_lag_frames": entry["best_lag"],
-                               "agreeing_pairs_by_lag": entry["counts"],
-                               "reasons": [f"cross-camera geometry agrees best when this camera is shifted by "
-                                           f"{entry['best_lag']} frame(s)"],
+                               "agreeing_pairs_by_lag": entry["counts"], "lags": entry.get("lags"),
+                               "shift_measured": bool(entry.get("peak_inside_scan", True)),
+                               "file_boundaries_sync": [[sync, name] for sync, name in boundaries],
+                               "reasons": [f"cross-camera geometry agrees best when this camera is shifted by {shift}"],
                                "explanation": f"Between {start / 10:.0f} s and {end / 10:.0f} s, {camera.camera}'s "
                                               f"detections line up with the other cameras better at a shift of "
-                                              f"{entry['best_lag']} frame(s) than at the estimated offset."}})
+                                              f"{shift} than at the estimated offset.{hint}"}})
     verdicts = [e["verdict"] for entries in checked.values() for e in entries]
     alignment_summary = {v: verdicts.count(v) for v in set(verdicts)}
     context.log(f"alignment check by geometry: {alignment_summary}")
+    # Identity swaps: every moment two tracks could have exchanged people, tested with cues that do
+    # not come from the 3D tracker. ``scene`` still has the 2D tracker's own tracklets (the solver
+    # works on a copy cut at Autofit id changes).
+    swaps = swap_unknowns(context, scene, solved, constraints, info["resolved_keys"])
+    unknowns["identity_swap"] = swaps["unknowns"]
+    context.log(f"swap check: {swaps['summary']}")
     coverage = coverage_metrics(solved)
     metrics = {"coverage": coverage, "constraints_used": info["used"], "alignment_check": alignment_summary,
+               "swap_check": swaps["summary"],
                "refinement": [{k: v for k, v in e.items() if not isinstance(v, list)} for e in solved.log],
                "timings_s": {k: round(v, 1) for k, v in solved.timings.items()},
                "open_unknowns": {kind: len(items) for kind, items in unknowns.items()}}

@@ -403,3 +403,50 @@ def test_apply_logs_each_task(workspace, context):
     apply_task_answer(workspace, task, 2)
     messages = [row["message"] for row in workspace.db.query("SELECT message FROM events")]
     assert any(f"task {task['id']}" in m and "left open" in m for m in messages)
+
+
+# --------------------------------------------------------------------------- swap_check
+
+
+def swap(context, moment="crossing"):
+    unknown = {"detail": {"moment": moment, "status": "flagged", "identity": 7, "other": 9, "t": 300,
+                          "span_t": [300, 312], "min_distance_m": 0.21, "why": "w", "swap_cues": ["body"], "stay_cues": [],
+                          "cues": {"heading_mps": None, "body": 1.2, "tracklets_contradicting": 1},
+                          "reference_keys": REF, "after_a_keys": CAND_B, "after_b_keys": CAND_C,
+                          "before_b_keys": ["4/9/0"]}}
+    return stage_tasks.swap_task(context, unknown)
+
+
+def test_swap_task_shows_before_and_both_candidates_after(context):
+    task_type, payload = swap(context)
+    assert task_type == "swap_check" and payload["ui"] == "reference_candidates"
+    assert payload["reference_keys"] == REF
+    assert [(c["id"], c["track"], c["keys"]) for c in payload["candidates"]] == [("B", 7, CAND_B), ("C", 9, CAND_C)]
+    assert payload["candidates"][0]["continuation"] is True and "continuation" not in payload["candidates"][1]
+
+
+def test_swap_denied_confirms_the_track(workspace, context):
+    task_type, payload = swap(context)
+    task = make_task(workspace, task_type, "identity_swap:0/10/0", payload,
+                     {"reference_ok": True, "candidates": {"B": "same", "C": "different"}})
+    assert apply_task_answer(workspace, task, 2) == {"constraints": 2, "decided": True}
+    assert [(r["kind"], r["a"], r["b"]) for r in constraints(workspace)] == [("same", REF, CAND_B), ("different", REF, CAND_C)]
+
+
+def test_swap_confirmed_cuts_the_track_and_links_the_other(workspace, context):
+    task_type, payload = swap(context)
+    task = make_task(workspace, task_type, "identity_swap:0/10/0", payload,
+                     {"reference_ok": True, "candidates": {"B": "different", "C": "same"}})
+    assert apply_task_answer(workspace, task, 2) == {"constraints": 3, "decided": True}
+    rows = [(r["kind"], r["a"], r["b"]) for r in constraints(workspace)]
+    # one cut per camera of the labelled continuation, and the other person's detections are linked
+    assert rows == [("split", REF, [CAND_B[0]]), ("split", REF, [CAND_B[1]]), ("same", REF, CAND_C)]
+
+
+def test_swap_neither_candidate_closes_the_question(workspace, context):
+    task_type, payload = swap(context, moment="ending")
+    task = make_task(workspace, task_type, "identity_swap:0/10/0", payload,
+                     {"reference_ok": True, "candidates": {}, "none_of_these": True})
+    assert apply_task_answer(workspace, task, 2) == {"constraints": 1, "decided": True}
+    row = constraints(workspace, "undeterminable")[0]
+    assert row["a"] == REF and row["detail"]["reason"] == "neither_candidate"

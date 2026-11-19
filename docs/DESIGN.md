@@ -28,13 +28,14 @@ remaining unknowns into tasks and closes the round with a summary.
 
 | Stage | Runs | Produces | Owns unknowns |
 |---|---|---|---|
-| `ingest` | once | `dataset.json`: per camera the ordered files with verified overlap trims; frame index | `stream_layout` |
+| `ingest` | once | `dataset.json`: per camera the ordered files with verified overlap trims; file boundaries the catalog could not verify are compared pixel by pixel (`overlap.py`); frame index | `stream_layout` |
 | `detect` | once | detection shards per camera (boxes, 17 keypoints, raw heatmap peaks), every native frame | - |
 | `calibration` | once, again on a human decision | `calibration/calibration.json`, mount check | `calibration` |
 | `align` | once, again when calibration geometry changes | `alignment.json` (label payload), `sync_table.npz`, report | `alignment` |
 | `tracklets` | once | post-filter + BoT-SORT + over-split, per camera | - |
 | `autofit` | once | `evidence/autofit/labels.npz`: Autofit raw track id per detection (CPU, about a third of real time) | - |
-| `solve` | every round | `solution.npz`, `tracks3d.npz`, `solve.json`, `alignment_check.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage`, `alignment` |
+| `solve` | every round | `solution.npz`, `tracks3d.npz`, `solve.json`, `alignment_check.json`, `swap_check.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage`, `alignment`, `identity_swap` |
+| `recover` | every round, after `solve` | `tracks3d_recovered.npz` (positions triangulated from poses read at each track's expected place), `recover.json`; crop poses cached in `recovered/` | - |
 | `tasks` | every round | human tasks | - |
 | `publish` | on request | label-set drafts / published sets | - |
 
@@ -59,9 +60,10 @@ recipe, input identities, outputs and code identity.
 | `tracklet_purity` | A tracklet may hold two people | gap/jump cuts, consensus switch detection | continuity |
 | `association` | Which simultaneous tracklets are the same person is ambiguous | pairwise geometry with margin, pooled N-view support, elimination, projection | cross-view match |
 | `identity_link` | A track starts inside the recording without a unique predecessor | unique motion continuity | re-identification |
+| `identity_swap` | Two tracks came within reach (or exchanged places) and nothing independent of the 3D tracker confirms who is who afterwards | step-by-step 3D continuity, heading, body proportions, 2D tracklets in separated views, (appearance) | swap check |
 | `unassigned` | A piece of confident detections belongs to no track | projection onto 3D tracks | detection triage / policy decision |
 | `pose_ownership` | Two poses in one camera claim one person | pose suppression, 3D co-location | pose ownership |
-| `coverage` | A tracked person projects into a view without a detection | (planned) high-recall re-detection | visibility check |
+| `coverage` | A tracked person projects into a view without a detection | guided re-detection (`recover` stage) fills what triangulates; the rest is counted, not yet asked | visibility check (no generator yet) |
 | `pose_quality` | Keypoints disagree with the multi-view pose | leave-one-out view rejection | pose correction (CVAT) |
 | `audit` | Random sample awaiting spot check | - | audit |
 
@@ -129,6 +131,26 @@ the next round usually resolves many remaining unknowns by itself.
 8. **Alignment check** (`solve/alignment_check.py`): per camera and 5-minute block, the
    estimated offset must be the best-agreeing frame shift; blocks that disagree are the only
    alignment unknowns.
+9. **Swap check** (`solve/swap_check.py`). Geometry cannot see two people exchanging
+   tracks where they meet. For every pair of identities and every step between instants at
+   which both are measured, keeping the labels is compared with exchanging them (summed
+   movement, on 5-frame medians). A step where exchanging is clearly cheaper is an
+   *exchange of places* (flagged); a step where neither is clearly cheaper - the two are
+   within reach, or one was unmeasured for a while - is a *crossing*, tested with evidence
+   that does not come from the 3D tracker: heading through the crossing, 3D body
+   proportions before and after, single-camera tracklets in views where the two stay apart,
+   and appearance when embeddings exist. Two cues for "stay" and none for "swap" verify a
+   crossing; otherwise a person compares before and after. A track that ends within reach
+   of an established one is checked the same way, one-sided (takeover). Pairs that share a
+   spot for their whole common life are one person tracked twice and are skipped.
+10. **Coverage recovery** (`stages/recover.py`, `solve/coverage.py`). For every instant
+   missing inside a track (and 1 s beyond its ends) with a measured pose at most 3 s away,
+   that pose says where to look: it is projected into each camera that should see the
+   person, the top-down pose model reads a pose from each box (twice), and a position is
+   accepted only as a gated triangulation of those poses - three or more cameras (tier A),
+   or two cameras with strong image evidence inside a bracketed gap (tier B). A crop is
+   dropped when another measured person overlaps the box and the pose follows them. The
+   hint never enters a position.
 7. **Unknowns** (`stages/solve.py`): free pieces with hypotheses → `association`; free
    pieces without → `unassigned` (short ones are grouped into one policy question per
    camera); unexplained starts → `identity_link`; co-located duplicates → `pose_ownership`.
@@ -151,6 +173,25 @@ the next round usually resolves many remaining unknowns by itself.
 
 * Alignment offsets are solved on a 10 Hz grid (0.1 s steps); sub-frame refinement from
   linked 3D tracks is planned. One-frame shifts barely change residuals in this scene.
+* Coverage: gaps longer than 3 s have no neighbouring pose close enough to say where to
+  look (about 43% of missing person-frames on golden) and are not searched; poses that
+  triangulate but fail the acceptance gate (about 900 on golden) are dropped rather than
+  shown to a person; recovered 2D poses stay in the workspace and are not published as 2D
+  detections (their 3D positions are). The golden controls also showed real people the
+  engine never tracks at all - not addressed by gap recovery.
+* Swap check: its body and appearance thresholds were fitted on one recording, and its
+  recall is known only for injected swaps. A swap of two people who pass within about
+  0.3 m with similar builds rests on the 2D tracklet cue or a person; appearance embeddings
+  are not computed by the engine yet. A confirmed swap cuts the track at the reviewed
+  detection (within about 10 s of the swap), not at the exact frame.
+* Tracks that hand off with a short overlap (one person tracked twice for a moment) are
+  recognised and skipped by the swap check but are not yet offered to identity linking as
+  the obvious candidate (38 such cases on the felix hour).
+* A file boundary with a *gap* (frames missing between two files) or a re-encoded overlap
+  is not measurable by pixel comparison. The geometric alignment check then reports the
+  camera's later blocks as `alignment` unknowns, but a human alignment checkpoint is
+  recorded only: applying it (or the lag the check measured) to the camera's clock is not
+  implemented.
 * `coverage`, `pose_quality`, `continuity` and `audit` tasks have UI and answer handling
   but no generator yet; the CVAT pose-correction hand-off is not implemented.
 * Appearance ReID was tested and is not reliable enough to decide (0.5-1% wrong in its best
@@ -203,6 +244,40 @@ the next round usually resolves many remaining unknowns by itself.
   194 -> 87. Autofit global ids and "different tracks" as negative evidence were rejected.
 * **2026-11-18 - adopted on the bench:** pose reach of 1 s, hand-off merge, same-spot link
   up to 60 s, geometric alignment check (questions 87 -> 74, wrong observations 94 -> 84).
+* **2026-11-18 - file boundaries are verified by pixels when packets do not match.** The
+  geometric alignment check flagged felix-5 for the whole second half-hour of the felix
+  recording; a lag scan gave a clear best shift of -6 frames in every 5-minute block after
+  the camera's second file starts and 0 before. The catalog had placed that file right
+  after the first ("continuation without overlap evidence"). Decoded frames show its first
+  6 frames are identical to the first file's last 6 (difference 0.0 grey levels, next best
+  alignment 0.43). Ingest now measures such repeats (`Part.overlap`; decided only for an
+  exact, unique repeat of at least 2 frames), the frames stay in the frame index (it must
+  equal data_management's, and the detection store is keyed by it) and the alignment
+  worker takes them off the timeline. Two independent measurements (geometry, pixels)
+  agree; neither is a guess.
+* **2026-11-18 - swap check added; the first rule was rejected after looking at felix.**
+  Research on golden (`experiments/switches`): the engine solution has no track-level swap
+  there (its 26 error episodes are 25 single-camera contaminations and one identity-link
+  takeover), so recall was measured by exchanging labels after real encounters. A rule
+  "two of motion / body / tracklet cues over 10 s chunks of every encounter under 1 m"
+  flagged 97% of injected swaps at 3 questions per 10 min on golden - and 210 per hour on
+  felix, where rendered examples showed people walking together (position-only motion cue)
+  and duplicate tracks of one person. Replaced by step-wise continuity: only steps where
+  exchanging the labels is not clearly costlier are candidates. Golden: 6 moments, 2
+  questions per 10 min; felix: 107 moments, 81 questions per hour (10 exchanges of places -
+  at least one a real swap between two people at adjacent rowers); injected swaps while
+  apart 100/100 flagged on both, none verified; at crossings none of 86 injected swaps
+  and 1 of 86 takeovers verified on felix.
+* **2026-11-18 - coverage recovery by guided top-down pose.** Research on golden
+  (`experiments/coverage`): of 5,065 missing person-frames, 2,190 are in gaps longer than
+  3 s; of the rest most have a detection in only one of the cameras that see the place.
+  ViTPose on the projected box recovered 816 at a gate with 0 false accepts in 6,500
+  negative controls for three-camera recoveries (one for two-camera, on a held hint - hence
+  tier B requires a bracketed gap), median error 0.5 in against withheld poses. Existing
+  low-score detections add about 5%, zoomed-ROI detectors (YOLOv8x, YOLO11l) another 5% at
+  14 min per recorded hour: not adopted. In the engine: 749 positions on golden, 97% of
+  318 checkable camera views on the right golden person (4 of the 6 others follow a track
+  that is itself on the wrong person).
 * **2026-11-18 - rejected on the bench:** limb-length veto (no gain), single-camera identity
   bridge (no effect), duplicate recognition (no fewer questions), keeping tracklets across
   Autofit track re-creation (one more mixed identity), "only candidate" identity

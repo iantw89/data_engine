@@ -44,6 +44,13 @@ def _reference_candidates(workspace: Workspace, task: dict, round_number: int) -
         elif verdict == "same":
             _add(workspace, "same", reference, keys, task, round_number)
             created, decided = created + 1, True
+        elif verdict == "different" and task["type"] == "swap_check" and candidates[candidate_id].get("continuation"):
+            # The track did not stay on this person: cut each camera's tracklet at the later detection
+            # (a 'split' also keeps the two sides apart) so the solver can re-link the pieces.
+            for key in keys:
+                _add(workspace, "split", reference, [key], task, round_number, reason="identity swap confirmed")
+                created += 1
+            decided = True
         elif verdict == "different":
             _add(workspace, "different", reference, keys, task, round_number)
             created += 1
@@ -54,6 +61,7 @@ def _reference_candidates(workspace: Workspace, task: dict, round_number: int) -
         # The reference is a real person who is none of the candidates: for a re-identification
         # that closes the question (someone not tracked before); for triage it is a single-view track.
         reason = {"reidentify": "no_predecessor", "detection_triage": "single_view_person",
+                  "swap_check": "neither_candidate",
                   "cross_view_match": "none_of_candidates"}.get(task["type"], "none_of_candidates")
         _add(workspace, "undeterminable", reference, None, task, round_number, reason=reason)
         created, decided = created + 1, True

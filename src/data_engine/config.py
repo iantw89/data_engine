@@ -111,6 +111,49 @@ RECIPE: dict[str, Any] = {
         # 1 m of the spot in between and no other track starts or ends there.
         "same_spot_gap_s": 60.0, "same_spot_radius_m": 0.4, "same_spot_clear_m": 1.0,
     },
+    "swap_check": {
+        # NEW 2026-11-18 (solve/swap_check.py, experiments/switches): did two tracks exchange people?
+        # Pairs ever within radius_m are examined step by step. A step is unambiguous when
+        # exchanging the labels would cost margin_m more movement than keeping them (more per
+        # second without a common measurement); it is an "exchange" when keeping them costs
+        # exchange_m more. Steps in between are crossings, merged over merge_frames.
+        "radius_m": 1.0, "median_frames": 5, "margin_m": 0.3, "margin_per_second_m": 0.5, "exchange_m": 0.3,
+        "step_gap_frames": 10, "max_gap_frames": 100, "merge_frames": 20, "window_frames": 100,
+        # Two identities whose common median distance is below duplicate_m are one person tracked
+        # twice; a track ending within ending_radius_m of a continuing one is checked one-sided.
+        # The survivor must have been measured established_frames in the window before the ending.
+        "duplicate_m": 0.3, "ending_radius_m": 0.5, "established_frames": 30,
+        # A cue says "swap" above flag, "stay" below stay. Units: heading m/s, body within-person
+        # sigma, appearance cosine. Body and appearance were fitted on the golden recording
+        # (flag = 98th percentile of untouched encounters, stay = 2nd percentile of injected
+        # swaps); heading is a round number. All provisional.
+        "flag": {"heading": 0.6, "body": 0.038, "appearance": -0.089},
+        "stay": {"heading": -0.6, "body": -0.505, "appearance": 0.043},
+        "tracklet_contradictions": 1, "tracklet_agreements": 2,
+    },
+    "coverage": {
+        # NEW 2026-11-18 (solve/coverage.py, experiments/coverage): recover positions inside and next
+        # to tracks by reading poses where the person must be. A neighbouring measured pose within
+        # reach_frames says where to look (never what the position is); end_frames beyond each end of
+        # a track are tried too. A camera is asked when at least min_body_in_view body joints and
+        # min_box_in_view of the box are inside its image.
+        "reach_frames": 30, "end_frames": 10, "min_body_in_view": 6, "min_box_in_view": 0.6,
+        # Skeleton -> detector-style box, fractions of the keypoint-box height (measured on 297k detections).
+        "box_margin": {"left": 0.10, "right": 0.10, "top": 0.13, "bottom": 0.14},
+        # A crop is dropped when another measured person's box overlaps the hint box this much and
+        # the pose read follows that person at least as well (removed 22 of 23 false accepts).
+        "competitor_iou": 0.4,
+        "min_pair_joints": 6, "search_radius_in": 100.0, "other_identity_clear_in": 24.0,
+        # Acceptance on top of the triangulation gates. A: three or more cameras (0 false accepts in
+        # 6,500 negative controls). B: two cameras, much stricter on image evidence, and only inside
+        # a gap bracketed by measured poses at most max_hint_frames away.
+        "tiers": {
+            "A": {"min_cameras": 3, "min_body_joints": 9, "max_median_residual_px": 12.0, "max_bad_bones": 1,
+                  "max_hint_distance_in": 15.0, "min_view_peak": 0.0, "max_hint_frames": 30},
+            "B": {"min_cameras": 2, "min_body_joints": 8, "max_median_residual_px": 3.0, "max_bad_bones": 2,
+                  "max_hint_distance_in": 12.0, "min_view_peak": 0.6, "max_hint_frames": 5},
+        },
+    },
 }
 
 

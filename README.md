@@ -10,8 +10,8 @@ and repeats until nothing is unknown.
 provide data ─► ingest ─► 2D detection ─► calibration check ─► time alignment ─► 2D tracklets ─► Autofit 3D tracking
                                                                                      │
         ┌────────────────────────────── every round ───────────────────────────────┐ │
-        │  3D association + identity ─► human tasks ─► answers ─► constraints ──┐   │◄┘
-        │            ▲                                                          │   │
+        │  3D association + identity + swap check ─► coverage recovery ─► human     │◄┘
+        │            ▲                              tasks ─► answers ─► constraints │
         │            └──────────────────────────────────────────────────────────┘   │
         └────────────────────────────────────────────────────────────────────────────┘
                                        │ no open unknowns
@@ -24,7 +24,7 @@ It builds on what the golden-set work in `cvat_labeling` and `data_management` e
 
 | Piece | Reused from |
 |---|---|
-| Dataset catalog, verified chunk layouts, exact frame access | `data_management` catalog / frame index |
+| Dataset catalog, verified chunk layouts, exact frame access | `data_management` catalog / frame index (file joins it cannot verify are checked by pixel comparison) |
 | Detector (fine-tuned YOLOv8x-pose-p6 + ViTPose, TensorRT) | `data_management` live path, `cvat_labeling` curated v6 weights |
 | Detection post-filter and 10 fps BoT-SORT settings | `cvat_labeling/prelabel_policy.json` (read at run time; must equal the engine recipe) |
 | Time alignment | `data_management.alignment_generator` driven over the whole recording, then verified by geometry |
@@ -81,9 +81,9 @@ src/data_engine/
   db.py            per-dataset SQLite: rounds, stage runs, unknowns, tasks, constraints, events
   taxonomy.py      unknown kinds and human task types
   config.py        site paths and the frozen machine recipe (hashed into every manifest)
-  stages/          ingest, detect, calibration, align, tracklets, solve, tasks, publish
+  stages/          ingest, detect, calibration, align, tracklets, autofit, solve, recover, tasks, publish
   workers/         steps that run in another repository's interpreter (TensorRT, catalog, label store)
-  solve/           evidence, clustering, 3D tracks, refinement, identity
+  solve/           evidence, clustering, 3D tracks, refinement, identity, swap check, coverage recovery
   tasks/apply.py   answers -> constraints
   web/             dashboard + task runner (FastAPI, static JS)
 tests/             pytest (no GPU or recordings needed, except the calibration file for geometry tests)
