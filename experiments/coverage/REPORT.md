@@ -223,6 +223,33 @@ direct evidence about that detection:
 
 Golden's sample is small (one link, seven labelled pieces, three conflicts), all consistent.
 
+## 11. Re-identification from moved track ends (`links_after_recovery.py`)
+
+The recovery moves where and when a track is first and last measured. Running the solve's own
+linking rule (`solve/identity.py`, unchanged thresholds) on the final identities with the
+recovered positions added:
+
+| | Golden 10 min | Felix hour |
+|---|---|---|
+| New links with measured positions only (check: must be 0) | 0 | 0 |
+| New links with recovered positions added | 0 | 8 (283 -> 275 identities) |
+| Open track ends | 30 -> 30 | 533 -> 518 |
+| Track ends moved later / starts moved earlier | 2 / 3, at most 2.4 s | 78 / 115, median 0.6 s, 12 by more than 5 s, at most 67 s |
+
+Felix links: four by unique continuation (gaps 0.8-4.7 s), four by "same spot, nobody else"
+(gaps 7-29 s). No labels on felix; the rule is the one the solve's existing machine links use.
+The yield is limited by how far the recovery moves an end (it stops where two cameras stop
+giving a consistent pose, usually where the tracker lost the person too) and by ambiguity: 113
+felix open ends have a candidate within the automatic gap and radius that is not unique.
+
+Swap check: of the 35 open felix swap moments (15 flagged, 20 unverified), 27 have recovered
+positions of the two identities within 2 s; in the unverified crossings they cover 364 of
+753 unmeasured person-instants. The swap check does not read recovered positions; whether
+they change verdicts is not tested.
+
+Not in the engine yet. The identity step takes 2 s on the felix hour, so running it after the
+recovery costs nothing compared with a lap.
+
 ## Reproduce
 
 Research: run the scripts with data_management's interpreter in the order given in each
