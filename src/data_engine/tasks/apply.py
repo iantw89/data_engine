@@ -90,6 +90,29 @@ def _decision(workspace: Workspace, task: dict, round_number: int) -> tuple[int,
         _add(workspace, "calibration", [payload["camera"]], None, task, round_number, choice=choice)
         return 1, True
     if task["type"] == "operator_decision":
+        policy = payload.get("policy") or {}
+        if policy.get("kind") == "short_identities":
+            if choice == "leave_unlinked":
+                _add(workspace, "undeterminable", ["policy:short_identities"], None, task, round_number,
+                     reason="short 3D tracks left as separate tracks by operator decision")
+                return 1, True
+            if choice == "review_individually":
+                _add(workspace, "undeterminable", ["policy:review_short_identities"], None, task, round_number,
+                     reason="operator asked for one question per short 3D track")
+                return 1, False
+            return 0, False
+        if policy.get("kind") == "outside_coverage":
+            camera = policy["camera"]
+            if choice == "review_individually":
+                _add(workspace, "undeterminable", [f"policy:review_individually:{camera}"], None, task, round_number,
+                     reason="operator asked for piece-by-piece review of people outside the 3D-covered area")
+                return 1, False
+            if choice in ("undeterminable", "single_view_tracks"):
+                _add(workspace, "undeterminable", [f"policy:outside_coverage:{camera}"], None, task, round_number,
+                     reason=("out of scope" if choice == "undeterminable" else "kept as single-camera tracks")
+                     + ": people seen only outside the 3D-covered area", choice=choice)
+                return 1, True
+            return 0, False
         if payload.get("policy") and choice == "undeterminable":
             _add(workspace, "undeterminable", [f"policy:short:{payload['policy']['camera']}"], None, task,
                  round_number, reason="short single-camera fragments left out by operator decision")

@@ -25,6 +25,16 @@ from ..store import parse_det_key
 
 WINDOW = 20  # sync frames per evidence window (2 s)
 MIN_TASK_DETECTIONS = 30  # a free piece shorter than 3 s is not worth an individual question
+MIN_IDENTITY_DETECTIONS = 150  # a 3D track this small (a few seconds) is asked about as a group
+
+
+def _iou(a, b) -> float:
+    width = min(a[2], b[2]) - max(a[0], b[0])
+    height = min(a[3], b[3]) - max(a[1], b[1])
+    if width <= 0 or height <= 0:
+        return 0.0
+    intersection = width * height
+    return float(intersection / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - intersection))
 
 
 def load_constraints(context: Context, scene: Scene) -> tuple[Constraints, dict]:
@@ -137,12 +147,40 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
                         "frames_compared": option["comparable"], "why_open": entry.get("reason", "competing matches")}
 
     short = {camera.camera: 0 for camera in scene.cameras}
+    # Where in each image do 3D-tracked people appear? A single-camera piece that stays in image
+    # cells no 3D-tracked person ever enters (a doorway into another room, a mirror, a desk
+    # behind glass) cannot be measured in 3D at all: these are grouped into one scope decision
+    # per camera instead of one question per piece.
+    grid_w, grid_h = 40, 30
+    visited = []
+    for camera in scene.cameras:
+        mask = np.zeros((grid_h, grid_w), dtype=bool)
+        lab = labels.label[camera.index]
+        in_track = np.flatnonzero((lab >= 0) & np.isin(lab, list(multi)))
+        if len(in_track):
+            boxes = camera.detections.boxes[in_track]
+            width = float(scene.workspace.dataset.cameras[camera.camera].width)
+            height = float(scene.workspace.dataset.cameras[camera.camera].height)
+            gx = np.clip(((boxes[:, 0] + boxes[:, 2]) / 2 / width * grid_w).astype(int), 0, grid_w - 1)
+            gy = np.clip(((boxes[:, 1] + boxes[:, 3]) / 2 / height * grid_h).astype(int), 0, grid_h - 1)
+            mask[gy, gx] = True
+            grown = mask.copy()  # one cell of tolerance around visited cells
+            grown[1:, :] |= mask[:-1, :]
+            grown[:-1, :] |= mask[1:, :]
+            grown[:, 1:] |= mask[:, :-1]
+            grown[:, :-1] |= mask[:, 1:]
+            mask = grown
+        visited.append(mask)
+    outside: dict[str, dict] = {}
+    loose: dict[int, list[dict]] = {}
     for atom, rows in enumerate(association.atom_rows):
         camera_index = int(association.atom_camera[atom])
         camera = scene.cameras[camera_index]
         rows = rows[(labels.atom[camera_index][rows] == atom) & (camera.t[rows] >= 0)]
         if not len(rows) or atom_label.get(atom, -1) in multi:
             continue
+        if (labels.duplicate_of[camera_index][rows] >= 0).mean() > 0.5:
+            continue  # a second detection of an already tracked person: nothing to ask
         keys = representative_keys(scene, camera_index, rows)
         if not keys or resolved_keys & set(keys):
             continue
@@ -162,15 +200,63 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
                                "reference_keys": keys, "candidates": candidates,
                                "resolve_by": "a human picks which candidate is the same person, or none"}})
                 continue
-        if len(rows) >= MIN_TASK_DETECTIONS:
+        if len(rows) >= MIN_TASK_DETECTIONS and f"policy:review_individually:{camera.camera}" not in resolved_keys:
+            boxes = camera.detections.boxes[rows]
+            size = scene.workspace.dataset.cameras[camera.camera]
+            gx = np.clip(((boxes[:, 0] + boxes[:, 2]) / 2 / size.width * grid_w).astype(int), 0, grid_w - 1)
+            gy = np.clip(((boxes[:, 1] + boxes[:, 3]) / 2 / size.height * grid_h).astype(int), 0, grid_h - 1)
+            if visited[camera_index][gy, gx].mean() <= 0.1:
+                group = outside.setdefault(camera.camera, {"pieces": 0, "detections": 0, "examples": []})
+                group["pieces"] += 1
+                group["detections"] += int(len(rows))
+                group["examples"].append((int(len(rows)), keys[len(keys) // 2]))
+                continue
+        loose.setdefault(camera_index, []).append({
+            "rows": rows, "keys": keys, "t0": int(camera.t[rows[0]]), "t1": int(camera.t[rows[-1]]),
+            "first_box": camera.detections.boxes[rows[0], :4], "last_box": camera.detections.boxes[rows[-1], :4]})
+    # Consecutive single-camera pieces of someone who stays in place (a tracker id change or a
+    # cut, the box reappearing where it was within 5 s) are one question, not one per piece.
+    for camera_index, pieces in loose.items():
+        camera = scene.cameras[camera_index]
+        pieces.sort(key=lambda piece: piece["t0"])
+        chains: list[list[dict]] = []
+        for piece in pieces:
+            for chain in chains:
+                tail = chain[-1]
+                if 0 <= piece["t0"] - tail["t1"] <= 50 and _iou(tail["last_box"], piece["first_box"]) >= 0.5:
+                    chain.append(piece)
+                    break
+            else:
+                chains.append([piece])
+        for chain in chains:
+            total = int(sum(len(piece["rows"]) for piece in chain))
+            if total < MIN_TASK_DETECTIONS:
+                short[camera.camera] += total
+                continue
+            largest = sorted(chain, key=lambda piece: -len(piece["rows"]))[:4]
             unknowns["unassigned"].append({
-                "subject": f"unassigned:{subject_key}", "severity": float(len(rows)),
-                "detail": {"camera": camera.camera, "detections": int(len(rows)), "t": middle,
-                           "span_t": [int(camera.t[rows[0]]), int(camera.t[rows[-1]])], "reference_keys": keys,
+                "subject": f"unassigned:{camera.detections.key(int(chain[0]['rows'][0]))}", "severity": float(total),
+                "detail": {"camera": camera.camera, "detections": total, "pieces": len(chain),
+                           "t": int((chain[0]["t0"] + chain[-1]["t1"]) // 2), "span_t": [chain[0]["t0"], chain[-1]["t1"]],
+                           "reference_keys": [piece["keys"][len(piece["keys"]) // 2] for piece in
+                                              sorted(largest, key=lambda piece: piece["t0"])],
+                           # one key per piece: an answer covers the whole chain
+                           "member_keys": [piece["keys"][len(piece["keys"]) // 2] for piece in chain],
                            "why": "seen by one camera only, with no geometric hypothesis linking it to a tracked person",
                            "resolve_by": "a human says whether it is a person (single-view track) or a false detection"}})
-        else:
-            short[camera.camera] += int(len(rows))
+    for camera_name, group in outside.items():
+        if f"policy:outside_coverage:{camera_name}" in resolved_keys:
+            continue
+        examples = [key for _, key in sorted(group["examples"], reverse=True)[:4]]
+        unknowns["unassigned"].append({
+            "subject": f"unassigned:outside_coverage:{camera_name}", "severity": float(group["detections"]),
+            "detail": {"camera": camera_name, "detections": group["detections"], "pieces": group["pieces"],
+                       "policy_question": True, "policy": "outside_coverage", "reference_keys": examples,
+                       "why": "people seen only by this camera, in a part of its image where nobody tracked in 3D "
+                              "ever appears (for example through a doorway into another room): no second view "
+                              "exists, so they cannot be measured in 3D",
+                       "resolve_by": "one operator decision for the whole group: out of scope, keep as "
+                                     "single-camera 2D tracks, or review piece by piece"}})
     for camera_name, count in short.items():
         if count and f"policy:short:{camera_name}" not in resolved_keys:
             unknowns["unassigned"].append({
@@ -182,12 +268,22 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
 
     # Identity: components that start inside the recording without a predecessor.
     summaries = {s.label: s for s in solved.summaries if s is not None}
+    identity_size: dict[int, int] = {}
+    for summary in summaries.values():
+        identity_size[int(identity[summary.label])] = identity_size.get(int(identity[summary.label]), 0) + summary.detections
+    brief = {"count": 0, "detections": 0, "examples": []}
     for end in solved.links.open_ends:
         if end["end"] != "start":
             continue
         label = end["component"]
         keys = component_keys_at(scene, labels, label, end["t"] + 5, count=3, tolerance=40)
         if not keys or resolved_keys & set(keys):
+            continue
+        size = identity_size.get(int(identity[label]), 0)
+        if size < MIN_IDENTITY_DETECTIONS and "policy:review_short_identities" not in resolved_keys:
+            brief["count"] += 1
+            brief["detections"] += size
+            brief["examples"].append((size, keys[0]))
             continue
         candidates = []
         for option in end["candidates"][:6]:
@@ -208,6 +304,16 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
                                  else "one earlier person could have reached this spot but not within the automatic gate"
                                  if end["candidates"] else "nobody tracked earlier could have reached this spot"),
                        "resolve_by": "a human picks the earlier person, or says it is someone not tracked before"}})
+
+    if brief["count"] and "policy:short_identities" not in resolved_keys:
+        unknowns["identity_link"].append({
+            "subject": "identity_link:short", "severity": float(brief["detections"]),
+            "detail": {"policy": "short_identities", "tracks": brief["count"], "detections": brief["detections"],
+                       "reference_keys": [key for _, key in sorted(brief["examples"], reverse=True)[:4]],
+                       "why": f"{brief['count']} short 3D tracks (under {MIN_IDENTITY_DETECTIONS} detections each) start "
+                              "inside the recording without a unique continuation; each is a correct but brief track "
+                              "whose person is not established",
+                       "resolve_by": "one operator decision: leave them as separate short tracks, or review each"}})
 
     # Two components measured at the same place that share a camera at the same time: duplicate poses.
     seen = set()
@@ -259,6 +365,9 @@ def save_solution(context: Context, solved: Solved) -> dict[str, str]:
         arrays[f"identity_{camera.camera}"] = identity
         arrays[f"source_{camera.camera}"] = solved.labels.source[camera.index]
         arrays[f"atom_{camera.camera}"] = solved.labels.atom[camera.index]  # tracklet piece per row, -1 if none
+        duplicate = solved.labels.duplicate_of[camera.index]
+        arrays[f"duplicate_of_{camera.camera}"] = np.where(  # identity this row is a second detection of
+            duplicate >= 0, solved.identity_of_label[np.clip(duplicate, 0, None)], -1).astype(np.int32)
     np.savez_compressed(directory / "solution.npz", **arrays)
     frames = solved.frames
     keep = multi[frames.label]
@@ -279,12 +388,56 @@ def run(context: Context) -> StageResult:
     workspace = context.workspace
     scene = load_scene(workspace, joint_peak=RECIPE["geometry"]["joint_peak"])
     constraints, info = load_constraints(context, scene)
-    long_recording = scene.T > 6000
+    evidence = workspace.path("evidence", "autofit", "labels.npz")
+    if evidence.is_file():
+        with np.load(evidence) as data:
+            constraints.external = [
+                data[f"raw_{camera.camera}"].astype(np.int64) if f"raw_{camera.camera}" in data.files
+                else np.full(len(camera.kept), -1, dtype=np.int64) for camera in scene.cameras]
+        info["used"]["autofit_tracks"] = int(sum(len(np.unique(e[e >= 0])) for e in constraints.external))
+        context.log(f"using Autofit raw tracks as independent evidence ({info['used']['autofit_tracks']} track ids)")
+    else:
+        context.log("no Autofit evidence: geometry-only solve (expect many more questions)", level="warning")
+    # Evidence at every sync frame up to about an hour (the golden bench was scored that way);
+    # only longer recordings subsample to 5 Hz to bound memory.
+    long_recording = scene.T > 40000
     solved = solve(scene, RECIPE, constraints=constraints, step=2 if long_recording else 1, log=context.log)
     outputs = save_solution(context, solved)
     unknowns = extract_unknowns(solved, info["resolved_keys"])
+    # Alignment: the generator's "stale" spans are replaced by a direct geometric check.
+    from ..solve import alignment_check
+    checked = alignment_check.verify(scene, RECIPE)
+    (workspace.round_dir(context.round) / "alignment_check.json").write_text(json.dumps(checked, indent=1), encoding="utf-8")
+    unknowns["alignment"] = []
+    decided = {c["a"][0] for c in context.db.constraints("alignment") if c["a"]}
+    for camera in scene.cameras:
+        entries = checked.get(camera.camera)
+        if entries is None:
+            if camera.camera not in decided:
+                unknowns["alignment"].append({
+                    "subject": f"alignment:{camera.camera}", "severity": float(camera.detections.frame_count),
+                    "detail": {"camera": camera.camera, "reasons": ["no resolved time offset: the camera has no "
+                                                                     "frames on the common timeline"],
+                               "explanation": f"{camera.camera} could not be tied to the other cameras in time, so "
+                                              "none of its detections take part in 3D."}})
+            continue
+        for entry in entries:
+            if entry["verdict"] == "disagrees" and camera.camera not in decided:
+                start, end = entry["t"]
+                unknowns["alignment"].append({
+                    "subject": f"alignment:{camera.camera}:{start}-{end}", "severity": float(end - start),
+                    "detail": {"camera": camera.camera, "block_sync_frames": entry["t"], "best_lag_frames": entry["best_lag"],
+                               "agreeing_pairs_by_lag": entry["counts"],
+                               "reasons": [f"cross-camera geometry agrees best when this camera is shifted by "
+                                           f"{entry['best_lag']} frame(s)"],
+                               "explanation": f"Between {start / 10:.0f} s and {end / 10:.0f} s, {camera.camera}'s "
+                                              f"detections line up with the other cameras better at a shift of "
+                                              f"{entry['best_lag']} frame(s) than at the estimated offset."}})
+    verdicts = [e["verdict"] for entries in checked.values() for e in entries]
+    alignment_summary = {v: verdicts.count(v) for v in set(verdicts)}
+    context.log(f"alignment check by geometry: {alignment_summary}")
     coverage = coverage_metrics(solved)
-    metrics = {"coverage": coverage, "constraints_used": info["used"],
+    metrics = {"coverage": coverage, "constraints_used": info["used"], "alignment_check": alignment_summary,
                "refinement": [{k: v for k, v in e.items() if not isinstance(v, list)} for e in solved.log],
                "timings_s": {k: round(v, 1) for k, v in solved.timings.items()},
                "open_unknowns": {kind: len(items) for kind, items in unknowns.items()}}

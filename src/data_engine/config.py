@@ -94,12 +94,22 @@ RECIPE: dict[str, Any] = {
         "min_shared_frames": 10, "accept_p80_px": 5.0, "accept_p80_rel": 0.025,
         "review_p80_px": 10.0, "review_p80_rel": 0.05, "margin": 0.05, "margin_f2": 0.25,
     },
+    "refine": {
+        # NEW, adopted 2026-11-18 on the golden bench (see docs/DESIGN.md decision log).
+        # A tracked person's measured pose is compared with single-camera pieces up to 1 s away
+        # (a stationary person who drops to one view); tracker hand-offs at one spot are merged.
+        "temporal_reach_frames": 10, "merge_handoffs": True,
+    },
     "temporal": {
         # Golden review filter: endpoint distance <= 12 m/s * elapsed + 0.5 m.
         "max_speed_mps": 12.0, "slack_m": 0.5,
         # NEW: automatic links need a unique continuation within a short gap and tight radius;
         # candidates offered for human review are searched up to candidate_gap_s.
         "auto_gap_s": 5.0, "auto_speed_mps": 2.0, "auto_radius_m": 0.75, "candidate_gap_s": 120.0,
+        # NEW, adopted 2026-11-18 on the golden bench: someone measured again at the same spot
+        # (within 0.4 m) up to 60 s later is the same person if nobody else was measured within
+        # 1 m of the spot in between and no other track starts or ends there.
+        "same_spot_gap_s": 60.0, "same_spot_radius_m": 0.4, "same_spot_clear_m": 1.0,
     },
 }
 

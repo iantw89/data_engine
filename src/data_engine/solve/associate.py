@@ -90,11 +90,13 @@ def associate(scene: Scene, recipe: dict, *, step: int = 1, window: int = 20, ma
         unit_b = atoms.atom_of(cells.b, cells.window.astype(np.int64))
         edges = cluster.regroup(cells, unit_a, unit_b)
         components = cluster.Components(atoms.count, atom_camera, [np.unique(t) for t in atom_t])
-        must_link, cannot_link, duplicates = constraints(atom_rows, atom_camera) if constraints else ([], [], [])
+        mapped = constraints(atom_rows, atom_camera) if constraints else ([], [], [], [])
+        must_link, cannot_link, duplicates = mapped[:3]
+        evidence_links = mapped[3] if len(mapped) > 3 else []
         components.duplicates = {(min(a, b), max(a, b)) for a, b in duplicates}
         solution = cluster.agglomerate(edges, components, min_samples=min_samples,
                                        margin=association["margin_f2"], must_link=must_link,
-                                       cannot_link=cannot_link)
+                                       cannot_link=cannot_link, evidence_links=evidence_links)
         _, dense = np.unique(solution.labels, return_inverse=True)
         added, new_events = cluster.refine_cuts(cells, atoms, dense)
         if not added or iteration == max_passes:

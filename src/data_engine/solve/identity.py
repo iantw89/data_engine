@@ -79,11 +79,25 @@ class Links:
 
 def link_components(summaries: list[ComponentSummary | None], recipe: dict, *, T: int, fps: float = 10.0,
                     edge_margin: int = 20, must_link: list[tuple[int, int]] = (),
-                    cannot_link: list[tuple[int, int]] = (), min_measured: int = 5) -> Links:
+                    cannot_link: list[tuple[int, int]] = (), min_measured: int = 5,
+                    frames: PersonFrames | None = None) -> Links:
     temporal = recipe["temporal"]
     reach_speed, slack = temporal["max_speed_mps"], temporal["slack_m"]
     auto_gap, auto_speed, auto_radius = temporal["auto_gap_s"], temporal["auto_speed_mps"], temporal["auto_radius_m"]
     candidate_gap = temporal["candidate_gap_s"]
+    # "Same spot" rule (off unless same_spot_gap_s > 0): someone measured at a spot, unmeasured
+    # for a while, and measured again at that spot is the same person if nobody else was
+    # measured near the spot in between and no other track starts or ends there.
+    spot_gap = float(temporal.get("same_spot_gap_s", 0.0))
+    spot_radius = float(temporal.get("same_spot_radius_m", 0.4))
+    spot_clear = float(temporal.get("same_spot_clear_m", 1.0))
+    measured_t = measured_label = measured_root = None
+    if spot_gap > 0 and frames is not None:
+        ok = np.isfinite(frames.root[:, 0])
+        order = np.argsort(frames.t[ok], kind="stable")
+        measured_t = frames.t[ok][order]
+        measured_label = frames.label[ok][order]
+        measured_root = frames.root[ok][order].astype(np.float64)
     n = len(summaries)
     parent = np.arange(n)
 
@@ -157,6 +171,19 @@ def link_components(summaries: list[ComponentSummary | None], recipe: dict, *, T
         """Candidates a person could plausibly be within a short gap (walking pace, small radius)."""
         return [o for o in options if o[1] <= auto_gap and o[2] <= auto_radius + auto_speed * o[1]]
 
+    by_label = {s.label: s for s in eligible}
+
+    def spot_clear_between(earlier: ComponentSummary, later: ComponentSummary) -> bool:
+        """Nobody outside the two chains was measured within ``spot_clear`` of the spot during the gap."""
+        low = np.searchsorted(measured_t, earlier.last_root_t, side="right")
+        high = np.searchsorted(measured_t, later.first_root_t, side="left")
+        if high <= low:
+            return True
+        own = {s.label for s in chain(earlier.label)} | {s.label for s in chain(later.label)}
+        spot = 0.5 * (earlier.last_root + later.first_root)
+        near = np.linalg.norm(measured_root[low:high] - spot, axis=1) * INCH <= spot_clear
+        return not (near & ~np.isin(measured_label[low:high], list(own))).any()
+
     while True:
         successors, predecessors = candidates()
         merged = 0
@@ -175,6 +202,43 @@ def link_components(summaries: list[ComponentSummary | None], recipe: dict, *, T
                 accepted.append({"from": int(earlier_label), "to": int(later_label), "gap_s": round(gap, 2),
                                  "distance_m": round(distance, 2), "source": "machine:unique_motion_continuity"})
                 merged += 1
+        if spot_gap > 0 and measured_t is not None and not merged:
+            for earlier_label, options in successors.items():
+                # Everything that starts within the clearance radius of where this track ended, in
+                # the allowed gap, competes; exactly one may exist and it must be at the spot.
+                around = [o for o in options if o[1] <= spot_gap and o[2] <= spot_clear]
+                if len(around) != 1 or around[0][2] > spot_radius:
+                    continue
+                later_label, gap, distance = around[0]
+                back = [o for o in predecessors.get(later_label, []) if o[1] <= spot_gap and o[2] <= spot_clear]
+                if len(back) != 1 or not compatible(earlier_label, later_label):
+                    continue
+                if not spot_clear_between(by_label[earlier_label], by_label[later_label]):
+                    continue
+                join(earlier_label, later_label)
+                accepted.append({"from": int(earlier_label), "to": int(later_label), "gap_s": round(gap, 2),
+                                 "distance_m": round(distance, 2), "source": "machine:same_spot_nobody_else"})
+                merged += 1
+                break  # candidate lists change after a join: recompute
+        only_gap = float(temporal.get("only_candidate_gap_s", 0.0))
+        only_speed = float(temporal.get("only_candidate_speed_mps", reach_speed))
+        if only_gap > 0 and not merged:
+            # Elimination: of everyone who could physically have reached this start, exactly one
+            # person is unaccounted for, and this start is the only place that person could be.
+            def reachable(options):
+                return [o for o in options if o[1] <= only_gap and o[2] <= only_speed * o[1] + slack]
+            for earlier_label, options in successors.items():
+                forward = reachable(options)
+                if len(forward) != 1:
+                    continue
+                later_label, gap, distance = forward[0]
+                if len(reachable(predecessors.get(later_label, []))) != 1 or not compatible(earlier_label, later_label):
+                    continue
+                join(earlier_label, later_label)
+                accepted.append({"from": int(earlier_label), "to": int(later_label), "gap_s": round(gap, 2),
+                                 "distance_m": round(distance, 2), "source": "machine:only_candidate"})
+                merged += 1
+                break
         if not merged:
             break
 

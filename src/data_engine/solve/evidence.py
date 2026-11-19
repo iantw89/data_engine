@@ -22,6 +22,23 @@ from .scene import Scene
 
 U_CLIP = 12.0  # residuals beyond this are all "certainly different" and carry no more information
 
+# Limb segments between body joints (indices into BODY: shoulders 0-1, elbows 2-3, wrists 4-5,
+# hips 6-7, knees 8-9, ankles 10-11) with generous adult length limits in inches. Pairing the
+# views of two different people triangulates joints at unrelated depths, so the "skeleton"
+# has impossible proportions; a real person's does not, whatever the pose.
+BONES = np.array([(0, 1), (6, 7), (0, 2), (1, 3), (2, 4), (3, 5), (6, 8), (7, 9), (8, 10), (9, 11), (0, 6), (1, 7)])
+BONE_LIMITS = np.array([(9, 21), (4, 15), (7, 16), (7, 16), (6, 14), (6, 14), (11, 23), (11, 23), (10, 22), (10, 22),
+                        (13, 28), (13, 28)], dtype=np.float64)
+
+
+def bone_statistics(midpoint: np.ndarray, usable: np.ndarray, tolerance: float = 1.25):
+    """Per sample: (measurable limb segments, segments outside the limits widened by ``tolerance``)."""
+    first, second = BONES[:, 0], BONES[:, 1]
+    measurable = usable[:, first] & usable[:, second]
+    length = np.linalg.norm(midpoint[:, first] - midpoint[:, second], axis=-1)
+    bad = measurable & ((length < BONE_LIMITS[:, 0] / tolerance) | (length > BONE_LIMITS[:, 1] * tolerance))
+    return measurable.sum(axis=1).astype(np.uint8), bad.sum(axis=1).astype(np.uint8)
+
 
 @dataclass
 class PairSamples:
@@ -33,6 +50,8 @@ class PairSamples:
     t: np.ndarray  # (P,) int32 sync index
     u: np.ndarray  # (P,) float32 normalised residual (clipped)
     plausible: np.ndarray  # (P,) bool: in front of both cameras, ray angle and floor checks passed
+    bones: np.ndarray = None  # (P,) uint8 limb segments measurable from the two-view triangulation
+    bones_bad: np.ndarray = None  # (P,) uint8 of those, how many have an impossible length
 
     def __len__(self) -> int:
         return len(self.t)
@@ -58,7 +77,7 @@ def _cross_pairs(scene: Scene, a: int, b: int, ts: np.ndarray):
 
 
 def pair_samples(scene: Scene, recipe: dict, *, step: int = 1, min_common: int = 5,
-                 chunk: int = 250_000) -> PairSamples:
+                 chunk: int = 250_000, only_camera: int | None = None) -> PairSamples:
     """Two-view evidence for every simultaneous cross-camera detection pair.
 
     ``step`` subsamples the timeline (2 = 5 Hz), which halves the cost when the pairing
@@ -68,7 +87,9 @@ def pair_samples(scene: Scene, recipe: dict, *, step: int = 1, min_common: int =
     accept_px, accept_rel = association["accept_p80_px"], association["accept_p80_rel"]
     min_angle, floor = geometry["min_ray_angle_deg"], geometry["floor_veto_in"]
     torso_in_body = np.isin(BODY, TORSO)
-    out: dict[str, list] = {key: [] for key in ("cam_a", "cam_b", "row_a", "row_b", "t", "u", "plausible")}
+    out: dict[str, list] = {key: [] for key in ("cam_a", "cam_b", "row_a", "row_b", "t", "u", "plausible", "bones",
+                                                 "bones_bad")}
+    bone_veto = geometry.get("bone_veto")  # None = measure only; else {"min_bones": n, "max_bad_share": x}
     ts_all = np.arange(0, scene.T, step)
     cameras = [c for c in scene.cameras if c.cam is not None and len(c.order)]
     centres = np.array([c.cam.center for c in scene.cameras if c.cam is not None])
@@ -77,6 +98,8 @@ def pair_samples(scene: Scene, recipe: dict, *, step: int = 1, min_common: int =
     room_high = centres[:, :2].max(axis=0) + geometry["room_margin_in"]
     for i, cam_a in enumerate(cameras):
         for cam_b in cameras[i + 1:]:
+            if only_camera is not None and only_camera not in (cam_a.index, cam_b.index):
+                continue
             rows_a, rows_b, ts = _cross_pairs(scene, cam_a.index, cam_b.index, ts_all)
             height = np.minimum(cam_a.height_cvat[rows_a], cam_b.height_cvat[rows_b])
             for start in range(0, len(ts), chunk):
@@ -114,6 +137,12 @@ def pair_samples(scene: Scene, recipe: dict, *, step: int = 1, min_common: int =
                 outside |= centre[:, 2] > ceiling
                 outside |= ((centre[:, :2] < room_low) | (centre[:, :2] > room_high)).any(axis=1)
                 plausible = angle_ok & front_ok & ~below & ~outside
+                bones, bones_bad = bone_statistics(midpoint, common & front)
+                if bone_veto:
+                    plausible &= ~((bones >= bone_veto["min_bones"])
+                                   & (bones_bad > bone_veto["max_bad_share"] * bones))
+                out["bones"].append(bones)
+                out["bones_bad"].append(bones_bad)
                 out["cam_a"].append(np.full(len(u), cam_a.index, np.int8))
                 out["cam_b"].append(np.full(len(u), cam_b.index, np.int8))
                 out["row_a"].append(ra[enough].astype(np.int32))
@@ -123,7 +152,7 @@ def pair_samples(scene: Scene, recipe: dict, *, step: int = 1, min_common: int =
                 out["plausible"].append(plausible)
     if not out["t"]:
         return PairSamples(*[np.empty(0, dtype) for dtype in (np.int8, np.int8, np.int32, np.int32, np.int32,
-                                                              np.float32, bool)])
+                                                              np.float32, bool, np.uint8, np.uint8)])
     return PairSamples(**{key: np.concatenate(values) for key, values in out.items()})
 
 

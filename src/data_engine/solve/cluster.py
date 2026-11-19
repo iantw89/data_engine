@@ -346,7 +346,8 @@ class Solution:
 
 def agglomerate(edges: Histograms, components: Components, *, min_samples: int, support: float = 0.8,
                 contradict: float = 0.5, margin: float = 0.25, strong: float = 0.8, corroborate: float = 0.6,
-                must_link: list[tuple[int, int]] = (), cannot_link: list[tuple[int, int]] = ()) -> Solution:
+                must_link: list[tuple[int, int]] = (), cannot_link: list[tuple[int, int]] = (),
+                evidence_links: list[tuple[int, int]] = ()) -> Solution:
     """Grow components from supported, unambiguous edges until nothing changes.
 
     ``edges`` are pooled atom-pair histograms. Human constraints come first: ``cannot_link``
@@ -372,6 +373,20 @@ def agglomerate(edges: Histograms, components: Components, *, min_samples: int, 
             accepted.append({"a": int(x), "b": int(y), "source": "human"})
     for index in np.flatnonzero(contradicted):
         components.forbid(int(edges.a[index]), int(edges.b[index]))
+    # Links proposed by an independent tracker (e.g. Autofit: detection-level 3D tracking with a
+    # human prior). They rank below human evidence and can be vetoed by this solver's own
+    # geometry: a pair whose residuals contradict it, or that would put two simultaneous
+    # detections of one camera together, is not linked and is left to the normal rules.
+    for x, y in evidence_links:
+        if components.find(x) == components.find(y):
+            continue
+        reason = components.conflict(x, y)
+        if reason:
+            blocked.append({"a": int(x), "b": int(y), "reason": f"independent tracker vs {reason}",
+                            "source": "evidence"})
+        else:
+            components.union(x, y)
+            accepted.append({"a": int(x), "b": int(y), "source": "evidence"})
 
     # Pooled histogram between components, kept incrementally: neighbours[root][other root].
     neighbours: dict[int, dict[int, np.ndarray]] = {}

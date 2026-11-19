@@ -33,7 +33,8 @@ remaining unknowns into tasks and closes the round with a summary.
 | `calibration` | once, again on a human decision | `calibration/calibration.json`, mount check | `calibration` |
 | `align` | once, again when calibration geometry changes | `alignment.json` (label payload), `sync_table.npz`, report | `alignment` |
 | `tracklets` | once | post-filter + BoT-SORT + over-split, per camera | - |
-| `solve` | every round | `solution.npz`, `tracks3d.npz`, `solve.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage` |
+| `autofit` | once | `evidence/autofit/labels.npz`: Autofit raw track id per detection (CPU, about a third of real time) | - |
+| `solve` | every round | `solution.npz`, `tracks3d.npz`, `solve.json`, `alignment_check.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage`, `alignment` |
 | `tasks` | every round | human tasks | - |
 | `publish` | on request | label-set drafts / published sets | - |
 
@@ -90,6 +91,13 @@ the next round usually resolves many remaining unknowns by itself.
 
 ## 4. Solve stage
 
+0. **Independent tracker** (`stages/autofit.py`, `solve/pipeline.with_external_units`).
+   Autofit tracks detections frame by frame in 3D with its learned human prior, so it does
+   not inherit single-camera tracker switches. Every 2D tracklet is cut where Autofit's raw
+   track id changes, and pieces that one Autofit track holds together for at least five
+   instants are linked - below human evidence, and only if the solver's own geometry does
+   not contradict the pair or put two simultaneous detections of one camera together.
+   Autofit's merged (global) ids are not used. Evidence: `experiments/RESULTS.md`.
 1. **Pair evidence** (`solve/evidence.py`). For every pair of simultaneous detections in
    two cameras, the two-view residual of the common reliable body joints, normalised to
    accept units (`u <= 1`: 5 px / .025 box height; `u <= 2`: review gate). Samples that are
@@ -109,11 +117,18 @@ the next round usually resolves many remaining unknowns by itself.
    rejection; nothing interpolated.
 5. **3D-first refinement** (`solve/recover.py`), repeated to a fixpoint: components measured
    at the same place at the same time merge (unless one camera shows both - then it is a
-   pose-ownership question); single-camera pieces and untracked detections attach to the
-   person whose *projected* 3D pose they match, by voting over the piece's lifetime.
+   pose-ownership question); a component that ends where and when another begins is merged
+   (tracker hand-off); single-camera pieces and untracked detections attach to the person
+   whose *projected* 3D pose they match, by voting over the piece's lifetime, including the
+   pose measured up to 1 s earlier or later for a person who stays put.
 6. **Identity** (`solve/identity.py`): components link across gaps when the continuation is
-   unique in both directions within walking reach; lifetimes that overlap are never linked.
-   Other starts inside the recording are reported with their candidates.
+   unique in both directions within walking reach, or when the person is measured again at
+   the same spot (0.4 m) within 60 s and nobody else was measured within 1 m in between;
+   lifetimes that overlap are never linked. Other starts inside the recording are reported
+   with their candidates.
+8. **Alignment check** (`solve/alignment_check.py`): per camera and 5-minute block, the
+   estimated offset must be the best-agreeing frame shift; blocks that disagree are the only
+   alignment unknowns.
 7. **Unknowns** (`stages/solve.py`): free pieces with hypotheses → `association`; free
    pieces without → `unassigned` (short ones are grouped into one policy question per
    camera); unexplained starts → `identity_link`; co-located duplicates → `pose_ownership`.
@@ -138,7 +153,12 @@ the next round usually resolves many remaining unknowns by itself.
   linked 3D tracks is planned. One-frame shifts barely change residuals in this scene.
 * `coverage`, `pose_quality`, `continuity` and `audit` tasks have UI and answer handling
   but no generator yet; the CVAT pose-correction hand-off is not implemented.
-* No appearance model is used yet: identity across long gaps always goes to a human.
+* Appearance ReID was tested and is not reliable enough to decide (0.5-1% wrong in its best
+  case, `experiments/reid/REPORT.md`): identity across long gaps goes to a human. Using it
+  to rank the candidates shown is implemented in `reid.py` but not wired into tasks yet.
+* People that only one camera can see (outside the 3D-covered floor) need a scope decision
+  per piece today; grouping them into one decision per camera region is implemented but only
+  triggers where no 3D-tracked person ever appears in that part of the image.
 * Thresholds marked NEW in `config.RECIPE` are provisional and unvalidated on other rooms.
 * A person seen by only two cameras that lie on the same epipolar plane as another person
   can be mis-associated by geometry alone; such two-view-only components should be
@@ -175,3 +195,17 @@ the next round usually resolves many remaining unknowns by itself.
   windows; a switch inside a window can leave up to about 2 s of 2D detections on the
   wrong track (their 3D joints are still gated per frame). Kept as a strict expected
   failure in `tests/test_solve_cluster.py`.
+* **2026-11-18 - Autofit raw tracks become the association backbone.** On the golden bench
+  the geometry-on-tracklets solver assigned 1,246 observations to the wrong person, 1,016 of
+  them inside 2D tracklets that contained two people (74 of 808 tracklets). Autofit alone
+  made 192. Cutting tracklets at Autofit id changes and linking on shared Autofit tracks
+  (geometry may veto) gives 94 wrong observations, coverage 89% -> 97% and questions
+  194 -> 87. Autofit global ids and "different tracks" as negative evidence were rejected.
+* **2026-11-18 - adopted on the bench:** pose reach of 1 s, hand-off merge, same-spot link
+  up to 60 s, geometric alignment check (questions 87 -> 74, wrong observations 94 -> 84).
+* **2026-11-18 - rejected on the bench:** limb-length veto (no gain), single-camera identity
+  bridge (no effect), duplicate recognition (no fewer questions), keeping tracklets across
+  Autofit track re-creation (one more mixed identity), "only candidate" identity
+  elimination (unsafe: about 400 wrongly assigned observations), ReID decisions (0.5-1%
+  wrong), Autofit global ids for identity (2-4 wrong links). All remain as off-by-default
+  options with their measurements in `experiments/RESULTS.md`.

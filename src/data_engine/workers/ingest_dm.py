@@ -23,7 +23,10 @@ from data_engine.dataset import Camera, Dataset, Part, parse_dataset_id  # noqa:
 def main_channel_stream(catalog, cam):
     """Return a CameraStream built from the camera's channel-0 files, or None if not mixed."""
     parts = sorted([(cam.parsed.start, cam.parsed.part, cam.path)] + cam.extra_parts)
-    channels = {catalog.parse_filename(os.path.basename(path)).channel for _, _, path in parts}
+    parsed = [catalog.parse_filename(os.path.basename(path)) for _, _, path in parts]
+    if any(name is None for name in parsed):
+        return None  # registered extra dataset (e.g. the golden recording): files are not NVR channel exports
+    channels = {name.channel for name in parsed}
     if channels == {0} or 0 not in channels:
         return None
     main = [part for part in parts if catalog.parse_filename(os.path.basename(part[2])).channel == 0]
@@ -56,12 +59,17 @@ def resolve(dataset_id: str, video_root: str) -> Dataset:
             notes.append("catalog stream mixed main and sub channel files; rebuilt from channel 0 only")
             cam = replacement
         issues = list(cam.layout_issues)
-        if not cam.resolved_parts or not cam.part_frame_counts:
-            issues.append("no resolved chunk layout")
-        parts = [
-            Part(part.path, int(part.trim), int(part.count), bool(part.verified or index == 0))
-            for index, part in enumerate(cam.resolved_parts) if part.count
-        ]
+        single_file = not cam.resolved_parts and len(cam.part_paths) == 1 and cam.meta and cam.meta.frame_count
+        if single_file:
+            # One file per camera (registered extra datasets): the file is the stream.
+            parts = [Part(cam.part_paths[0], 0, int(cam.meta.frame_count), True)]
+        else:
+            if not cam.resolved_parts or not cam.part_frame_counts:
+                issues.append("no resolved chunk layout")
+            parts = [
+                Part(part.path, int(part.trim), int(part.count), bool(part.verified or index == 0))
+                for index, part in enumerate(cam.resolved_parts) if part.count
+            ]
         for part in parts[1:]:
             if not part.verified:
                 notes.append(f"continuation without overlap evidence: {os.path.basename(part.path)}")

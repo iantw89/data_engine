@@ -7,7 +7,7 @@ could not decide, asks a person only those questions, feeds the answers back as 
 and repeats until nothing is unknown.
 
 ```
-provide data ─► ingest ─► 2D detection ─► calibration check ─► time alignment ─► 2D tracklets
+provide data ─► ingest ─► 2D detection ─► calibration check ─► time alignment ─► 2D tracklets ─► Autofit 3D tracking
                                                                                      │
         ┌────────────────────────────── every round ───────────────────────────────┐ │
         │  3D association + identity ─► human tasks ─► answers ─► constraints ──┐   │◄┘
@@ -27,7 +27,8 @@ It builds on what the golden-set work in `cvat_labeling` and `data_management` e
 | Dataset catalog, verified chunk layouts, exact frame access | `data_management` catalog / frame index |
 | Detector (fine-tuned YOLOv8x-pose-p6 + ViTPose, TensorRT) | `data_management` live path, `cvat_labeling` curated v6 weights |
 | Detection post-filter and 10 fps BoT-SORT settings | `cvat_labeling/prelabel_policy.json` (read at run time; must equal the engine recipe) |
-| Time alignment | `data_management.alignment_generator` driven over the whole recording |
+| Time alignment | `data_management.alignment_generator` driven over the whole recording, then verified by geometry |
+| Detection-level 3D tracking with a human prior | `Autofit` (`HumanBotSort`), run as an evidence stage on CPU |
 | Mount-shift check | `data_management.mount_check` |
 | Camera model, triangulation gates, physical veto | `cvat_labeling` `pseudo3d.geometry` / `identity_triangulation` contract (tested for equality) |
 | Label publication | `data_management` label store |
@@ -92,6 +93,16 @@ docs/DESIGN.md     design, taxonomy, algorithms, decision log
 Workspaces live under `C:\data_engine_data\<dataset>[@tag]\` (state database, immutable
 detection shards, per-round artifacts, one run manifest per stage run). Site paths and
 interpreters are in `config.py` and can be overridden with `engine.local.json`.
+
+## Evidence for the solver's rules
+
+Every rule that decides something without a human was scored against the golden identities
+(`experiments/bench/`); what was adopted and what was rejected, with numbers, is in
+[experiments/RESULTS.md](experiments/RESULTS.md). To re-run the bench after a change:
+
+```powershell
+.venv\Scripts\python.exe experiments\bench\bench.py adopted
+```
 
 ## Tests
 

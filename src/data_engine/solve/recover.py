@@ -35,6 +35,7 @@ class Labels:
     duplicates: set[tuple[int, int]] = field(default_factory=set)  # atom pairs allowed to coexist in one camera
     source: list[np.ndarray] = None  # per camera (M,) uint8: how the row got its label
     rejected: list[np.ndarray] = None  # per camera (M,) bool: a human said this is not a person
+    duplicate_of: list[np.ndarray] = None  # per camera (M,) int32: component this row is a second detection of
 
     SOURCE = {"none": 0, "pairwise": 1, "colocated": 2, "projection_atom": 3, "projection_row": 4, "human": 5}
 
@@ -43,6 +44,8 @@ class Labels:
             self.source = [np.where(lab >= 0, 1, 0).astype(np.uint8) for lab in self.label]
         if self.rejected is None:
             self.rejected = [np.zeros(len(lab), dtype=bool) for lab in self.label]
+        if self.duplicate_of is None:
+            self.duplicate_of = [np.full(len(lab), -1, dtype=np.int32) for lab in self.label]
 
     def next_label(self) -> int:
         return max((int(lab.max()) for lab in self.label if len(lab)), default=-1) + 1
@@ -149,14 +152,118 @@ def merge_colocated(scene: Scene, labels: Labels, frames: PersonFrames, *, radiu
     return merged
 
 
+def merge_handoffs(scene: Scene, labels: Labels, frames: PersonFrames, *, max_overlap: int = 15,
+                   max_gap: int = 10, radius_in: float = 20.0, clear_radius_in: float = 40.0) -> list[dict]:
+    """Merge a component that ends where and when another begins (a tracker hand-off).
+
+    A person tracked in 3D does not vanish and get replaced by someone else at the same spot
+    within a second. When component X's last measured position and component Y's first one
+    are within ``radius_in`` and Y starts no more than ``max_gap`` sync frames after X ends
+    (or the two overlap by at most ``max_overlap`` frames, seen by different cameras), they
+    are one person - provided the pairing is unique in both directions within the wider
+    ``clear_radius_in``, they never show the same camera at the same time, and no human
+    said otherwise.
+    """
+    from .identity import summarise
+
+    summaries = [s for s in summarise(frames, labels.next_label()) if s is not None and s.n_measured >= 3]
+    if len(summaries) < 2:
+        return []
+    occupied = occupancy(scene, labels)
+    members = labels.members()
+
+    def clash(a: int, b: int) -> bool:
+        for camera in scene.cameras:
+            first, second = occupied.get((a, camera.index)), occupied.get((b, camera.index))
+            if first is not None and second is not None and len(np.intersect1d(first, second, assume_unique=True)):
+                return True
+        return any((min(x, y), max(x, y)) in labels.forbidden for x in members.get(a, ()) for y in members.get(b, ()))
+
+    by_start = sorted(summaries, key=lambda s: s.first_root_t)
+    starts = np.array([s.first_root_t for s in by_start])
+    successors: dict[int, list[tuple[int, float]]] = {}
+    predecessors: dict[int, list[tuple[int, float]]] = {}
+    for earlier in summaries:
+        low = np.searchsorted(starts, earlier.last_root_t - max_overlap, side="left")
+        high = np.searchsorted(starts, earlier.last_root_t + max_gap, side="right")
+        for later in by_start[low:high]:
+            if later.label == earlier.label or later.first_root_t <= earlier.first_root_t \
+                    or later.last_root_t <= earlier.last_root_t:
+                continue
+            distance = float(np.linalg.norm(later.first_root - earlier.last_root))
+            if distance <= clear_radius_in:
+                successors.setdefault(earlier.label, []).append((later.label, distance))
+                predecessors.setdefault(later.label, []).append((earlier.label, distance))
+    merged = []
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        while parent.get(x, x) != x:
+            x = parent[x]
+        return x
+
+    for earlier_label, options in sorted(successors.items()):
+        if len(options) != 1:
+            continue
+        later_label, distance = options[0]
+        if len(predecessors[later_label]) != 1 or distance > radius_in:
+            continue
+        a, b = find(earlier_label), find(later_label)
+        if a == b or clash(a, b):
+            continue
+        parent[b] = a
+        for camera in scene.cameras:
+            moved = labels.label[camera.index] == b
+            if moved.any():
+                labels.label[camera.index][moved] = a
+                labels.source[camera.index][moved] = np.maximum(labels.source[camera.index][moved],
+                                                               Labels.SOURCE["colocated"])
+            key_b = (b, camera.index)
+            if key_b in occupied:
+                occupied[(a, camera.index)] = np.union1d(occupied.get((a, camera.index), np.empty(0, np.int32)),
+                                                         occupied.pop(key_b))
+        members.setdefault(a, set()).update(members.pop(b, set()))
+        merged.append({"from": int(earlier_label), "to": int(later_label), "distance_in": round(distance, 1)})
+    return merged
+
+
 def projection_attach(scene: Scene, labels: Labels, frames: PersonFrames, *, min_joints: int = 6,
                       pixel_floor: float = 20.0, diagonal_fraction: float = 0.06, min_common: int = 5,
                       agree_share: float = 0.7, min_votes: int = 5, vote_share: float = 0.7,
-                      runner_up_share: float = 0.3, attach_rows: bool = True) -> dict:
-    """Attach free atoms / untracked rows to the component whose projected 3D pose they match."""
+                      runner_up_share: float = 0.3, attach_rows: bool = True, temporal_reach: int = 0) -> dict:
+    """Attach free atoms / untracked rows to the component whose projected 3D pose they match.
+
+    With ``temporal_reach`` > 0 a person's measured 3D pose is also compared with detections
+    up to that many sync frames before or after it, at instants where the person has no
+    measured pose of their own. A person who stays put (on a machine, at a rack) and drops
+    to a single camera view is still exactly where they were measured a moment ago; the
+    piece that continues them matches the pose joint by joint, and a piece of someone
+    moving does not. Only tracked pieces are attached this way, never single detections,
+    and the same uniqueness rules apply. The attached frames get no 3D position of their
+    own (one view cannot measure it); they keep the person's 2D track and identity alive.
+    """
     multi = {l for l, cams in camera_counts(scene, labels).items() if len(cams) >= 2}
     body_measured = np.isfinite(frames.xyz[:, BODY, 0]).sum(axis=1)
     usable = np.flatnonzero((body_measured >= min_joints) & np.isin(frames.label, list(multi)))
+    cand_index, cand_t = usable, frames.t[usable].astype(np.int64)
+    cand_exact = np.ones(len(usable), dtype=bool)
+    if temporal_reach > 0 and len(usable):
+        stride = scene.T + 1
+        filled = np.zeros((int(frames.label.max()) + 1) * stride, dtype=bool)
+        filled[frames.label[usable].astype(np.int64) * stride + frames.t[usable]] = True
+        extra_index, extra_t = [], []
+        for shift in sorted((d for d in range(-temporal_reach, temporal_reach + 1) if d), key=abs):
+            target = frames.t[usable].astype(np.int64) + shift
+            ok = (target >= 0) & (target < scene.T)
+            key = frames.label[usable][ok].astype(np.int64) * stride + target[ok]
+            fresh = np.flatnonzero(~filled[key])
+            key_fresh, first = np.unique(key[fresh], return_index=True)  # nearest pose wins a slot
+            filled[key_fresh] = True
+            extra_index.append(usable[ok][fresh][first])
+            extra_t.append(target[ok][fresh][first])
+        cand_index = np.concatenate([cand_index, *extra_index])
+        cand_t = np.concatenate([cand_t, *extra_t])
+        cand_exact = np.concatenate([cand_exact, np.zeros(len(cand_index) - len(cand_exact), dtype=bool)])
     occupied = occupancy(scene, labels)
     members = labels.members()
     votes: dict[tuple[int, int, int], list[int]] = {}  # (camera, atom, label) -> [matches, comparable]
@@ -165,7 +272,11 @@ def projection_attach(scene: Scene, labels: Labels, frames: PersonFrames, *, min
         if camera.cam is None or not len(usable):
             continue
         c = camera.index
-        candidates = usable[frames.rows[usable, c] < 0]
+        # At the same instant the person must not already have a detection in this camera. A pose
+        # borrowed from a nearby instant may come from a moment when this camera did see them
+        # (the piece being tested is then the continuation); overlaps are refused at attach time.
+        select = (frames.rows[cand_index, c] < 0) | ~cand_exact
+        candidates, times_c, exact_c = cand_index[select], cand_t[select], cand_exact[select]
         if not len(candidates):
             continue
         lab = labels.label[c]
@@ -178,11 +289,12 @@ def projection_attach(scene: Scene, labels: Labels, frames: PersonFrames, *, min
         t_free = camera.t[rows_free]
         by_t = np.argsort(t_free, kind="stable")
         rows_free, t_free = rows_free[by_t], t_free[by_t]
-        first = np.searchsorted(t_free, frames.t[candidates], side="left")
-        last = np.searchsorted(t_free, frames.t[candidates], side="right")
+        first = np.searchsorted(t_free, times_c, side="left")
+        last = np.searchsorted(t_free, times_c, side="right")
         counts = last - first
         keep = counts > 0
         candidates, first, counts = candidates[keep], first[keep], counts[keep]
+        times_c, exact_c = times_c[keep], exact_c[keep]
         if not len(candidates):
             continue
         projected = camera.cam.project(frames.xyz[candidates][:, BODY].astype(np.float64))  # (N,12,2) native
@@ -215,16 +327,20 @@ def projection_attach(scene: Scene, labels: Labels, frames: PersonFrames, *, min
                 entry = votes.setdefault((c, int(a), int(l)), [0, 0])
                 entry[0] += int(n_match)
                 entry[1] += int(n_seen)
-        loose = ~tracked & matched
+        loose = ~tracked & matched & exact_c[pair_frame][comparable]  # single detections: same instant only
         if loose.any():
-            times = frames.t[candidates][pair_frame][comparable][loose]
+            times = times_c[pair_frame][comparable][loose]
             row_matches.extend((c, int(r), int(l), int(tt)) for r, l, tt in
                                zip(pair_row[comparable][loose], pair_label[loose], times))
     # Decide per atom: one clear winner, enough votes, no conflict.
     by_atom: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
     for (c, a, l), (matches, comparable) in votes.items():
         by_atom.setdefault((c, a), []).append((matches, comparable, l))
-    attached, ambiguous = [], []
+    attached, ambiguous, bridges = [], [], []
+    span_low = np.full(labels.next_label() + 1, np.iinfo(np.int64).max)
+    span_high = np.full(labels.next_label() + 1, -1)
+    np.minimum.at(span_low, frames.label, frames.t)
+    np.maximum.at(span_high, frames.label, frames.t)
     for (c, a), options in sorted(by_atom.items(), key=lambda kv: -max(o[0] for o in kv[1])):
         options.sort(reverse=True)
         matches, comparable, best = options[0]
@@ -232,6 +348,16 @@ def projection_attach(scene: Scene, labels: Labels, frames: PersonFrames, *, min
             continue
         runner = options[1] if len(options) > 1 else None
         if runner and runner[0] > runner_up_share * matches:
+            # One continuous single-camera piece that matches two people whose measured lifetimes
+            # do not overlap is not a conflict: it is the same person, seen by one camera in between.
+            second_ok = runner[0] >= min_votes and runner[0] >= vote_share * runner[1]
+            third_weak = len(options) < 3 or options[2][0] <= runner_up_share * runner[0]
+            disjoint = span_high[best] < span_low[runner[2]] or span_high[runner[2]] < span_low[best]
+            if second_ok and third_weak and disjoint:
+                bridges.append({"camera": c, "atom": a, "labels": [int(best), int(runner[2])],
+                                "matches": [int(matches), int(runner[0])],
+                                "comparable": [int(comparable), int(runner[1])]})
+                continue
             ambiguous.append({"camera": c, "atom": a, "options": [{"label": o[2], "matches": o[0], "comparable": o[1]}
                                                                     for o in options[:3]]})
             continue
@@ -272,4 +398,150 @@ def projection_attach(scene: Scene, labels: Labels, frames: PersonFrames, *, min
             labels.source[c][r] = Labels.SOURCE["projection_row"]
             occupied[(l, c)] = np.union1d(taken, [tt]) if taken is not None else np.array([tt])
             rows_attached += 1
-    return {"atoms_attached": attached, "atoms_ambiguous": ambiguous, "rows_attached": rows_attached}
+    return {"atoms_attached": attached, "atoms_ambiguous": ambiguous, "rows_attached": rows_attached,
+            "bridges": bridges}
+
+
+def mark_duplicates(scene: Scene, labels: Labels, frames: PersonFrames, *, min_joints: int = 6,
+                    pixel_floor: float = 20.0, diagonal_fraction: float = 0.06, min_common: int = 5,
+                    agree_share: float = 0.7, min_votes: int = 5, vote_share: float = 0.7,
+                    runner_up_share: float = 0.3) -> list[dict]:
+    """Recognise single-camera pieces that are a second detection of an already tracked person.
+
+    The detector sometimes reports a person twice in one image (typically a partial-body box
+    beside the full one, with a different enough pose to survive near-identical-pose
+    suppression). Such a piece coincides, in the same camera and at the same instants, with a
+    detection that already belongs to a tracked person, and its joints match that person's
+    projected 3D pose. It is not a new person and not a missing association: it is marked
+    ``duplicate_of`` that person and takes no further part (it stays in the raw store).
+    A piece whose joints match nobody's projection is left alone - that is another person.
+    """
+    multi = {l for l, cams in camera_counts(scene, labels).items() if len(cams) >= 2}
+    body_measured = np.isfinite(frames.xyz[:, BODY, 0]).sum(axis=1)
+    usable = np.flatnonzero((body_measured >= min_joints) & np.isin(frames.label, list(multi)))
+    marked = []
+    for camera in scene.cameras:
+        if camera.cam is None or not len(usable):
+            continue
+        c = camera.index
+        candidates = usable[frames.rows[usable, c] >= 0]  # the person already has a detection here
+        lab = labels.label[c]
+        free = np.array([l not in multi for l in range(labels.next_label() + 1)])
+        rows_free = camera.order[((lab[camera.order] < 0) | free[np.clip(lab[camera.order], 0, None)])
+                                 & ~labels.rejected[c][camera.order] & (labels.atom[c][camera.order] >= 0)
+                                 & (labels.duplicate_of[c][camera.order] < 0)]
+        if not len(candidates) or not len(rows_free):
+            continue
+        t_free = camera.t[rows_free]
+        by_t = np.argsort(t_free, kind="stable")
+        rows_free, t_free = rows_free[by_t], t_free[by_t]
+        first = np.searchsorted(t_free, frames.t[candidates], side="left")
+        counts = np.searchsorted(t_free, frames.t[candidates], side="right") - first
+        keep = counts > 0
+        candidates, first, counts = candidates[keep], first[keep], counts[keep]
+        if not len(candidates):
+            continue
+        projected = camera.cam.project(frames.xyz[candidates][:, BODY].astype(np.float64))
+        inside = (np.isfinite(projected).all(axis=-1) & (projected[..., 0] >= 0)
+                  & (projected[..., 0] < camera.cam.native_width) & (projected[..., 1] >= 0))
+        pair_frame = np.repeat(np.arange(len(candidates)), counts)
+        offsets = np.arange(counts.sum()) - np.repeat(np.concatenate(([0], np.cumsum(counts)[:-1])), counts)
+        pair_row = rows_free[np.repeat(first, counts) + offsets]
+        points = camera.detections.keypoints[pair_row][:, BODY]
+        common = inside[pair_frame] & camera.joint_ok[pair_row][:, BODY]
+        distance = np.linalg.norm(np.nan_to_num(projected[pair_frame]) - points[:, :, :2], axis=-1) * camera.cam.to_cvat
+        boxes = camera.detections.boxes[pair_row]
+        gate = np.maximum(pixel_floor, diagonal_fraction * np.hypot(boxes[:, 2] - boxes[:, 0],
+                                                                   boxes[:, 3] - boxes[:, 1]) * camera.cam.to_cvat)
+        n_common = common.sum(axis=1)
+        comparable = n_common >= min_common
+        match = comparable & ((common & (distance <= gate[:, None])).sum(axis=1)
+                              >= np.maximum(min_common, agree_share * n_common))
+        keys = np.stack([labels.atom[c][pair_row][comparable], frames.label[candidates][pair_frame][comparable]], axis=1)
+        if not len(keys):
+            continue
+        unique, inverse = np.unique(keys, axis=0, return_inverse=True)
+        inverse = inverse.reshape(-1)
+        seen = np.bincount(inverse, minlength=len(unique))
+        hits = np.bincount(inverse, weights=match[comparable].astype(np.float64), minlength=len(unique))
+        by_atom: dict[int, list[tuple[int, int, int]]] = {}
+        for (atom, label), n_match, n_seen in zip(unique, hits, seen):
+            by_atom.setdefault(int(atom), []).append((int(n_match), int(n_seen), int(label)))
+        for atom, options in by_atom.items():
+            options.sort(reverse=True)
+            matches, compared, best = options[0]
+            if matches < min_votes or matches < vote_share * compared:
+                continue
+            if len(options) > 1 and options[1][0] > runner_up_share * matches:
+                continue
+            rows = np.flatnonzero(labels.atom[c] == atom)
+            on_timeline = rows[camera.t[rows] >= 0]
+            # Most of the piece must coincide with the person's own detection in this camera.
+            if compared < 0.5 * len(on_timeline):
+                continue
+            labels.duplicate_of[c][rows] = best
+            marked.append({"camera": c, "atom": atom, "label": best, "matches": matches, "compared": compared,
+                           "rows": int(len(rows))})
+    return marked
+
+
+def competitor_share(scene: Scene, camera_index: int, rows: np.ndarray, *, iou: float = 0.2) -> float:
+    """Share of a piece's detections whose box is overlapped by another kept detection in the same frame."""
+    camera = scene.cameras[camera_index]
+    boxes = camera.detections.boxes
+    crowded = 0
+    for row in rows:
+        frame_rows = camera.detections.rows(int(camera.detections.frame_of_row[row]))
+        others = np.flatnonzero(camera.kept[frame_rows]) + frame_rows.start
+        others = others[others != row]
+        if not len(others):
+            continue
+        a, b = boxes[row, :4], boxes[others, :4]
+        width = np.clip(np.minimum(a[2], b[:, 2]) - np.maximum(a[0], b[:, 0]), 0, None)
+        height = np.clip(np.minimum(a[3], b[:, 3]) - np.maximum(a[1], b[:, 1]), 0, None)
+        union = (a[2] - a[0]) * (a[3] - a[1]) + (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1]) - width * height
+        crowded += bool((width * height / np.maximum(union, 1e-9) >= iou).any())
+    return crowded / max(1, len(rows))
+
+
+def apply_bridges(scene: Scene, labels: Labels, bridges: list[dict], *, max_competitor_share: float = 0.0) -> list[dict]:
+    """Join two people linked by one clean single-camera piece (see ``projection_attach``).
+
+    The piece must be clean - no other detection ever overlaps its box - because inside a
+    single view nothing but the 2D tracker vouches that it is one person throughout.
+    """
+    applied = []
+    for bridge in bridges:
+        c, atom = bridge["camera"], bridge["atom"]
+        first, second = bridge["labels"]
+        rows = np.flatnonzero(labels.atom[c] == atom)
+        if (labels.label[c][rows] >= 0).any() and not np.isin(labels.label[c][rows], [first, second, -1]).all():
+            continue
+        current = {int(l) for cam_labels in labels.label for l in np.unique(cam_labels[np.isin(cam_labels, [first, second])])}
+        if current != {first, second}:
+            continue  # one of the two was merged away earlier in this round
+        share = competitor_share(scene, c, rows[scene.cameras[c].t[rows] >= 0])
+        occupied = occupancy(scene, labels)
+        clash = any(
+            (first, camera.index) in occupied and (second, camera.index) in occupied
+            and len(np.intersect1d(occupied[(first, camera.index)], occupied[(second, camera.index)], assume_unique=True))
+            for camera in scene.cameras)
+        members = labels.members()
+        vetoed = any((min(x, y), max(x, y)) in labels.forbidden
+                     for x in members.get(first, set()) | {atom} for y in members.get(second, set()) | {atom})
+        record = {**bridge, "competitor_share": round(share, 3), "applied": False}
+        if share > max_competitor_share:
+            record["reason"] = "piece is not clean (another detection overlaps it)"
+        elif clash or vetoed:
+            record["reason"] = "same_camera_overlap" if clash else "human_different"
+        else:
+            for camera in scene.cameras:
+                moved = labels.label[camera.index] == second
+                labels.label[camera.index][moved] = first
+                labels.source[camera.index][moved] = np.maximum(labels.source[camera.index][moved],
+                                                               Labels.SOURCE["colocated"])
+            labels.label[c][rows] = first
+            labels.source[c][rows] = Labels.SOURCE["projection_atom"]
+            record["applied"] = True
+        applied.append(record)
+    return applied

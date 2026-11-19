@@ -71,6 +71,24 @@ def association_task(context: Context, unknown: dict) -> tuple[str, dict]:
 
 def unassigned_task(context: Context, unknown: dict) -> tuple[str, dict]:
     detail = unknown["detail"]
+    if detail.get("policy") == "outside_coverage":
+        payload = base_payload(
+            "operator_decision", f"People outside the 3D-covered area in {detail['camera']}", detail["why"],
+            {"pieces": detail["pieces"], "detections": detail["detections"]}, None)
+        payload["question"] = ("These people are visible to this camera only, in a region no other camera covers. "
+                               "How should the engine treat everyone seen only there?")
+        payload["panels"] = [panel(context, key, label=str(index + 1)) for index, key in
+                             enumerate(detail["reference_keys"])]
+        payload["options"] = [
+            {"value": "undeterminable", "label": "Out of scope", "hotkey": "1",
+             "hint": "Not part of the labels (kept in the raw store); cannot be measured in 3D"},
+            {"value": "single_view_tracks", "label": "Keep as single-camera tracks", "hotkey": "2",
+             "hint": "Real people with 2D tracklets only; no 3D positions"},
+            {"value": "review_individually", "label": "Ask me about each piece", "hotkey": "3",
+             "hint": "Creates one triage question per piece"}]
+        payload["policy"] = {"camera": detail["camera"], "kind": "outside_coverage"}
+        payload["reference_keys"] = detail["reference_keys"]
+        return "operator_decision", payload
     if detail.get("policy_question"):
         payload = base_payload(
             "operator_decision", f"Short single-camera fragments in {detail['camera']}", detail["why"],
@@ -92,13 +110,30 @@ def unassigned_task(context: Context, unknown: dict) -> tuple[str, dict]:
     payload["reference"] = {"id": "A", "caption": f"{detail['camera']} - seen by this camera only",
                             "panels": [panel(context, key, label="A") for key in detail["reference_keys"]]}
     payload.update({"candidates": [], "allow_none": True, "single_choice": True,
-                    "reference_keys": detail["reference_keys"],
+                    # the answer applies to every piece of the chain, not only the crops shown
+                    "reference_keys": detail.get("member_keys") or detail["reference_keys"],
                     "none_label": "A real person (keep as a single-camera track)"})
+    if detail.get("pieces", 1) > 1:
+        payload["evidence"]["consecutive pieces at the same place"] = detail["pieces"]
     return "detection_triage", payload
 
 
 def identity_task(context: Context, unknown: dict) -> tuple[str, dict]:
     detail = unknown["detail"]
+    if detail.get("policy") == "short_identities":
+        payload = base_payload("operator_decision", "Short 3D tracks without an established person", detail["why"],
+                               {"tracks": detail["tracks"], "detections": detail["detections"]}, None)
+        payload["question"] = ("These brief 3D tracks could not be tied to an earlier person. "
+                               "How should the engine treat them?")
+        payload["panels"] = [panel(context, key, label=str(index + 1)) for index, key in
+                             enumerate(detail["reference_keys"])]
+        payload["options"] = [
+            {"value": "leave_unlinked", "label": "Leave as separate short tracks", "hotkey": "1",
+             "hint": "Each stays a correct, brief track; no identity is assumed"},
+            {"value": "review_individually", "label": "Ask me about each", "hotkey": "2",
+             "hint": "One re-identification question per short track"}]
+        payload["policy"] = {"kind": "short_identities"}
+        return "operator_decision", payload
     seconds, clock = time_text(context, detail.get("t"))
     payload = base_payload(
         "reidentify", f"Person {detail['identity']} appears at {clock} - who are they?", detail["why"],
@@ -209,9 +244,6 @@ def run(context: Context) -> StageResult:
             unsure.add((task["subject"], evidence_signature(task["payload"])))
     created: dict[str, int] = {}
     skipped_unsure = skipped_budget = failed = 0
-    budget = dict(ROUND_BUDGET)
-    for task in db.tasks(status="open"):
-        budget[task["type"]] = budget.get(task["type"], 0) - 1
     open_unknowns = db.unknowns(status="open")
     live_subjects = {unknown["subject"] for unknown in open_unknowns}
     # An open task whose unknown was resolved by the machine in the meantime is withdrawn.
@@ -220,6 +252,9 @@ def run(context: Context) -> StageResult:
         if task["subject"] not in live_subjects:
             db.set_task_status(task["id"], "superseded")
             superseded += 1
+    budget = dict(ROUND_BUDGET)
+    for task in db.tasks(status="open"):
+        budget[task["type"]] = budget.get(task["type"], 0) - 1
     asked = {task["subject"] for status in ("open", "answered") for task in db.tasks(status=status)}
     for unknown in open_unknowns:  # ordered by severity
         builder = BUILDERS.get(unknown["kind"])

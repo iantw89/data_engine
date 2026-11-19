@@ -23,6 +23,10 @@ class Constraints:
     duplicate: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = field(default_factory=list)
     not_person: list[tuple[int, int]] = field(default_factory=list)  # rows a human rejected
     cuts: dict[int, list[int]] = field(default_factory=dict)  # tracklet -> window cuts (human splits)
+    # Track ids from an independent tracker, per camera per raw row (-1 = none). Used to cut 2D
+    # tracklets where that tracker changes person and to propose links (see ``with_external_units``).
+    external: list[np.ndarray] | None = None
+    external_min_common: int = 5
 
 
 @dataclass
@@ -49,10 +53,104 @@ def _atom_pairs(endpoint_pairs, row_atom) -> list[tuple[int, int]]:
     return sorted(pairs)
 
 
+def with_external_units(scene: Scene, external: list[np.ndarray], *, rebirth: bool = False) -> tuple[Scene, dict]:
+    """Cut 2D tracklets where the independent tracker says the person changed.
+
+    A single-camera tracker can slide from one person to a neighbour without any gap; a
+    detection-level 3D tracker rarely makes the same mistake at the same moment. The result
+    is a copy of the scene whose ``tracklet`` ids are the pieces ("units") both trackers
+    accept: a 2D tracklet is split at the first detection that carries a different external
+    id than the previous labelled detection - if those two external tracks coexist in time.
+    Two tracks alive at the same moment are two different people. A track that ended before
+    the other was born is the 3D tracker losing and re-creating its track for whoever the
+    2D tracklet is following; with ``rebirth`` such changes are not cut. (Off by default: on the
+    golden bench it removed 1 identity fragment of 32 and added one mixed identity.)
+    Detections without an external id stay with the piece they are in.
+    """
+    import copy
+
+    # Lifetime of every external track over all cameras, in sync time.
+    first: dict[int, int] = {}
+    last: dict[int, int] = {}
+    for camera in scene.cameras:
+        ids, t = external[camera.index], camera.t
+        ok = (ids >= 0) & (t >= 0)
+        if ok.any():
+            order = np.argsort(ids[ok], kind="stable")
+            sorted_ids, sorted_t = ids[ok][order], t[ok][order]
+            starts = np.flatnonzero(np.concatenate(([True], sorted_ids[1:] != sorted_ids[:-1])))
+            low = np.minimum.reduceat(sorted_t, starts)
+            high = np.maximum.reduceat(sorted_t, starts)
+            for track, lo, hi in zip(sorted_ids[starts], low, high):
+                first[int(track)] = min(first.get(int(track), int(lo)), int(lo))
+                last[int(track)] = max(last.get(int(track), int(hi)), int(hi))
+
+    result = copy.copy(scene)
+    result.cameras = []
+    next_unit = 0
+    stats = {"tracklet_cuts": 0, "rebirths_kept_together": 0}
+    for camera in scene.cameras:
+        updated = copy.copy(camera)
+        unit = np.full(len(camera.tracklet), -1, dtype=np.int32)
+        rows = np.flatnonzero(camera.tracklet >= 0)
+        order = rows[np.lexsort((camera.detections.frame_of_row[rows], camera.tracklet[rows]))]
+        ids = external[camera.index][order]
+        tracklets = camera.tracklet[order]
+        boundary = np.ones(len(order), dtype=bool)
+        if len(order):
+            boundary[1:] = tracklets[1:] != tracklets[:-1]
+            previous = -1
+            for i in range(len(order)):
+                if boundary[i]:
+                    previous = -1
+                current = int(ids[i])
+                if current >= 0:
+                    if previous >= 0 and current != previous and not boundary[i]:
+                        coexist = first.get(current, 0) <= last.get(previous, -1) \
+                            and first.get(previous, 0) <= last.get(current, -1)
+                        if coexist or not rebirth:
+                            boundary[i] = True
+                            stats["tracklet_cuts"] += 1
+                        else:
+                            stats["rebirths_kept_together"] += 1
+                    previous = current
+            unit[order] = next_unit + np.cumsum(boundary) - 1
+            next_unit += int(boundary.sum())
+        updated.tracklet = unit
+        result.cameras.append(updated)
+    return result, stats
+
+
+def external_links(external: list[np.ndarray], atom_rows, atom_camera, atom_t, min_common: int) -> list[tuple[int, int]]:
+    """Pairs of pieces from different cameras that one external track holds together for >= min_common instants.
+
+    A piece may carry several external ids in sequence (re-created tracks); each id links the
+    piece with the pieces of other cameras that carry the same id at the same instants.
+    """
+    by_track: dict[int, list[tuple[int, np.ndarray]]] = {}
+    for atom, rows in enumerate(atom_rows):
+        ids = external[atom_camera[atom]][rows]
+        times = atom_t[atom]
+        for track in np.unique(ids[ids >= 0]):
+            by_track.setdefault(int(track), []).append((atom, np.unique(times[ids == track])))
+    links = set()
+    for holders in by_track.values():
+        for i, (a, times_a) in enumerate(holders):
+            for b, times_b in holders[i + 1:]:
+                if atom_camera[a] != atom_camera[b] and \
+                        len(np.intersect1d(times_a, times_b, assume_unique=True)) >= min_common:
+                    links.add((min(a, b), max(a, b)))
+    return sorted(links)
+
+
 def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None, step: int = 1,
-          samples: PairSamples | None = None, max_rounds: int = 4, log=print) -> Solved:
+          samples: PairSamples | None = None, max_rounds: int = 6, log=print) -> Solved:
     constraints = constraints or Constraints()
     timings, events = {}, []
+    if constraints.external is not None:
+        scene, unit_stats = with_external_units(
+            scene, constraints.external, rebirth=bool(recipe.get("refine", {}).get("external_rebirth", False)))
+        events.append({"step": "external_units", **unit_stats})
     started = time.time()
     samples = samples if samples is not None else pair_samples(scene, recipe, step=step)
     timings["pair_samples"] = time.time() - started
@@ -62,8 +160,14 @@ def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None,
         for atom, rows in enumerate(atom_rows):
             row_atom[atom_camera[atom]][rows] = atom
         must = _atom_pairs(constraints.same, row_atom)
+        evidence = []
+        if constraints.external is not None:
+            atom_t = [scene.cameras[atom_camera[atom]].t[rows] for atom, rows in enumerate(atom_rows)]
+            evidence = external_links(constraints.external, atom_rows, atom_camera, atom_t,
+                                      constraints.external_min_common)
         # A human "same" between two atoms of one camera at the same time is a duplicate, handled below.
-        return (must, _atom_pairs(constraints.different, row_atom), _atom_pairs(constraints.duplicate, row_atom))
+        return (must, _atom_pairs(constraints.different, row_atom), _atom_pairs(constraints.duplicate, row_atom),
+                evidence)
 
     started = time.time()
     association = associate(scene, recipe, step=step, samples=samples, cuts=constraints.cuts, constraints=mapper)
@@ -87,9 +191,23 @@ def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None,
         n_merged = sum(m["merged"] for m in merged)
         if n_merged:
             frames, duplicates = triangulate_labels(scene, labels.label, recipe)
-        attached = recover.projection_attach(scene, labels, frames)
-        changed = n_merged + len(attached["atoms_attached"]) + attached["rows_attached"]
+        handoffs = []
+        if recipe.get("refine", {}).get("merge_handoffs"):
+            handoffs = recover.merge_handoffs(scene, labels, frames)
+            if handoffs:
+                frames, duplicates = triangulate_labels(scene, labels.label, recipe)
+        attached = recover.projection_attach(
+            scene, labels, frames, temporal_reach=int(recipe.get("refine", {}).get("temporal_reach_frames", 0)))
+        bridged = []
+        if recipe.get("refine", {}).get("bridge_identities"):
+            bridged = recover.apply_bridges(
+                scene, labels, attached["bridges"],
+                max_competitor_share=float(recipe["refine"].get("bridge_max_competitor_share", 0.0)))
+        n_bridged = sum(b["applied"] for b in bridged)
+        changed = n_merged + len(attached["atoms_attached"]) + attached["rows_attached"] + n_bridged + len(handoffs)
         events.append({"step": "refine", "round": round_number, "components_merged": n_merged,
+                       "handoffs_merged": len(handoffs),
+                       "identities_bridged": n_bridged, "bridges": bridged[:200],
                        "merge_refused": [m for m in merged if not m["merged"]][:50],
                        "atoms_attached": len(attached["atoms_attached"]), "rows_attached": attached["rows_attached"],
                        "atoms_ambiguous": attached["atoms_ambiguous"][:200]})
@@ -98,6 +216,10 @@ def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None,
         if not changed:
             break
         frames, duplicates = triangulate_labels(scene, labels.label, recipe)
+    if recipe.get("refine", {}).get("mark_duplicates"):
+        marked = recover.mark_duplicates(scene, labels, frames)
+        events.append({"step": "duplicates", "pieces": len(marked), "detections": sum(m["rows"] for m in marked),
+                       "marked": marked[:300]})
     timings["refine"] = time.time() - started
 
     started = time.time()
@@ -115,7 +237,7 @@ def solve(scene: Scene, recipe: dict, *, constraints: Constraints | None = None,
         return sorted(pairs)
 
     links = link_components(summaries, recipe, T=scene.T, must_link=label_pairs(constraints.same),
-                            cannot_link=label_pairs(constraints.different))
+                            cannot_link=label_pairs(constraints.different), frames=frames)
     timings["identity"] = time.time() - started
     events.append({"step": "identity", "links": len(links.accepted), "open_ends": len(links.open_ends)})
     return Solved(scene, association, labels, frames, summaries, links, links.identity, duplicates, events, timings)
