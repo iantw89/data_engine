@@ -1,0 +1,21 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
+ultralytics==8.3.228
+transformers==4.57.1
+onnxruntime-gpu==1.22.0
+numpy
+scipy
+opencv-python
+av>=14
+lap
+networkx
+fastapi
+uvicorn
+jinja2
+pytest
+httpx
+jsonschema>=4.18
+tqdm
+pandas
+pillow

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "data_engine"
+version = "0.1.0"
+description = "Recursive, human-in-the-loop label engine: time alignment, 2D detections/tracklets and 3D tracks for multi-camera recordings."
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "opencv-python", "networkx", "fastapi", "uvicorn", "jinja2", "av>=14"]
+
+[project.optional-dependencies]
+models = ["torch", "torchvision", "ultralytics", "transformers", "lap"]
+dev = ["pytest", "httpx"]
+
+[project.scripts]
+data-engine = "data_engine.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+data_engine = ["web/static/*", "web/templates/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
