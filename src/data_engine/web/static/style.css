@@ -111,6 +111,25 @@ textarea { resize: vertical; }
 .progress-text { position: absolute; inset: 0; padding: 0 5px; font-size: 10px; line-height: 15px; color: #fff; text-shadow: 0 0 3px #000; white-space: nowrap; overflow: hidden; }
 @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
 
+/* ------- this round, step by step */
+.terms { max-width: 110ch; margin: 4px 0 6px; }
+.now-line { margin: 4px 0 10px; font-size: 14px; } .now-line.is-running { color: var(--amber); }
+.laps { display: flex; flex-direction: column; gap: 8px; }
+.lap-row { display: grid; grid-template-columns: 96px 1fr; gap: 10px; align-items: start; background: var(--bg2); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; }
+.lap-label { font-weight: 600; font-size: 13px; padding-top: 4px; }
+.lap-steps { display: flex; flex-wrap: wrap; gap: 6px; align-items: stretch; }
+.step { width: 190px; flex: none; background: var(--bg); border: 1px solid var(--line2); border-left: 4px solid var(--line2); border-radius: 6px; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; }
+.step.sp-done { border-left-color: var(--green); } .step.sp-running { border-left-color: var(--amber); box-shadow: 0 0 0 1px #6b5518; }
+.step.sp-expected { border-style: dashed; opacity: .8; } .step.sp-failed, .step.sp-blocked { border-left-color: var(--red); }
+.step-head { display: flex; gap: 6px; align-items: baseline; } .step-title { font-weight: 600; font-size: 13px; }
+.step-mark { font-size: 12px; width: 12px; flex: none; } .sp-done .step-mark { color: var(--green); } .sp-running .step-mark { color: var(--amber); } .sp-failed .step-mark, .sp-blocked .step-mark { color: var(--red); } .sp-expected .step-mark { color: var(--dim); }
+.step-time { font-size: 11px; color: var(--muted); }
+.step-msg { font-size: 11px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.round-history { margin-top: 10px; } .round-history summary { cursor: pointer; color: var(--muted); }
+.seq.sp-failed, .seq.sp-blocked { color: var(--red); } .seq.sp-running { color: var(--amber); } .lap-sep { color: var(--blue); }
+.stage-note { font-size: 10px; color: var(--blue); text-transform: uppercase; letter-spacing: .4px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
 .chart-scroll { overflow-x: auto; background: var(--bg2); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px; }
 .chart { display: block; max-width: none; } .chart .gridline { stroke: var(--line); stroke-width: 1; }
 .chart .axis { fill: var(--muted); font-size: 11px; } .chart .axis.dim { fill: var(--dim); font-size: 10px; } .chart .total { fill: var(--text); font-size: 12px; font-weight: 600; }

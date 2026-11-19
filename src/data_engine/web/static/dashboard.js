@@ -41,7 +41,7 @@ export async function renderDataset(root, id) {
   const q = encodeURIComponent(id);
   const sections = {};
   const layout = h('div', { class: 'page dashboard' });
-  const order = ['banner', 'pipeline', 'chart', 'unknowns', 'tasks', 'coverage', 'cameras', 'events'];
+  const order = ['banner', 'timeline', 'history', 'pipeline', 'chart', 'unknowns', 'tasks', 'coverage', 'cameras', 'events'];
   for (const name of order) layout.append((sections[name] = h('section', { class: 'dash-section', dataset: { section: name } })));
   root.replaceChildren(layout);
 
@@ -82,8 +82,12 @@ export async function renderDataset(root, id) {
       try { state.run = await api(`/api/datasets/${q}/run`); } catch (_) { /* log is optional */ }
     }
     const second = running ? Math.floor(Date.now() / 1000) : 0;
-    patch('banner', [s.phase, s.phase_detail, s.next_actions, s.run.running, s.run.reason, state.logOpen, state.run && state.run.tail, s.round],
+    patch('banner', [s.phase, s.phase_detail, s.next_actions, s.run.running, s.run.reason, state.logOpen, state.run && state.run.tail, s.round,
+      running ? s.events.slice(0, 14) : null],
       () => banner(s, id, startRun, state));
+    patch('timeline', [s.timeline, s.run.running, second], () => timeline(s));
+    // its own section: it changes only when a round ends, so an opened list stays open while a run ticks
+    patch('history', [(s.timeline || {}).history, (s.timeline || {}).round], () => roundHistory(s));
     patch('pipeline', [s.stages, s.tasks.open_total, s.tasks.answered_pending, second], () => pipeline(s));
     patch('chart', [s.rounds, s.phase === 'running'], () => roundsChart(s));
     patch('unknowns', s.unknowns, () => unknownsTable(s, id));
@@ -117,9 +121,10 @@ function banner(s, id, startRun, state) {
   }, running ? 'Running...' : 'Run next round');
   const reviewButton = s.tasks.open_total
     ? h('a', { class: 'btn', href: `/d/${encodeURIComponent(id)}/tasks` }, `Review ${s.tasks.open_total} open tasks`) : null;
+  const recent = () => s.events.slice(0, 14).reverse().map((e) => `${fmtTime(e.time)}  ${e.stage ? '[' + e.stage + '] ' : ''}${e.message}`).join(String.fromCharCode(10));
   const logBox = (state.logOpen || running) && state.run ? h('details', { class: 'runlog', open: true },
-    h('summary', {}, `Run log ${state.run.log ? '(' + state.run.log + ')' : ''}`),
-    h('pre', {}, state.run.tail || '(no output yet)')) : (state.run && state.run.log ? h('details', { class: 'runlog' },
+    h('summary', {}, state.run.tail ? `Run log ${state.run.log ? '(' + state.run.log + ')' : ''}` : 'Latest engine messages (this run was not started from this page)'),
+    h('pre', {}, state.run.tail || recent() || '(no output yet)')) : (state.run && state.run.log ? h('details', { class: 'runlog' },
     h('summary', {}, `Last run log (${state.run.log})`), h('pre', {}, state.run.tail || '')) : null);
   return h('div', { class: `banner phase-${s.phase}` },
     h('div', { class: 'banner-main' },
@@ -132,6 +137,82 @@ function banner(s, id, startRun, state) {
     logBox);
 }
 
+// ------------------------------------------------------------------ this round, step by step
+const STEP_MARK = { done: '\u2713', running: '\u25cf', expected: '\u25cb', failed: '\u2715', blocked: '\u2715', skipped: '\u2013' };
+const lapName = (lap) => (lap ? `Lap ${lap}` : 'First pass');
+
+function stepChip(step) {
+  const status = step.status || 'expected';
+  const elapsed = status === 'running' && step.started ? Date.now() / 1000 - step.started : null;
+  const time = status === 'running' ? `${fmtDuration(elapsed)} so far`
+    : status === 'expected' ? `queued: ${step.reason}`
+      : step.duration_s !== null && step.duration_s !== undefined ? fmtDuration(step.duration_s) : '';
+  return h('div', { class: `step sp-${status}`, title: step.message || step.reason || '' },
+    h('div', { class: 'step-head' }, h('span', { class: 'step-mark', 'aria-hidden': 'true' }, STEP_MARK[status] || '?'),
+      h('span', { class: 'step-title' }, step.title), h('span', { class: 'sr-only' }, ` (${status})`)),
+    h('div', { class: 'step-time' }, time, step.started && status !== 'expected' ? ` - ${fmtTime(step.started)}` : ''),
+    status === 'running' && step.progress ? progressBar({ title: step.title, progress: step.progress }, elapsed) : null,
+    step.message && status !== 'running' ? h('div', { class: 'step-msg' }, step.message) : null);
+}
+
+function timeline(s) {
+  const header = (text, extra) => h('h2', {}, text, extra ? h('span', { class: 'count' }, extra) : null);
+  if (!s.timeline) {
+    return h('div', {}, header('This round'), h('p', { class: 'warn-text' },
+      'This web server runs an older version of the engine and cannot report the order of the round. Restart it (data-engine serve) to see what is running when.'));
+  }
+  const t = s.timeline;
+  const terms = h('p', { class: 'muted small terms' },
+    h('strong', {}, 'Round'), ': one run of the engine - it applies new answers, runs every stage whose inputs changed, in order, and builds the human tasks. ',
+    h('strong', {}, 'Lap'), ': a repeat inside a round - when the coverage recovery finds enough detections Autofit has not seen, Autofit, the solve and the recovery run once more before the tasks are built.');
+  if (t.round === null || t.round === undefined) return h('div', {}, header('This round'), terms, h('p', { class: 'muted' }, 'No round has run yet.'));
+  const active = t.finished === null || t.finished === undefined;
+  const runningStep = t.steps.find((x) => x.status === 'running');
+  const processAlive = s.run.running || !!runningStep;
+  const all = [...t.steps, ...(active ? t.expected.map((x) => ({ ...x, status: 'expected' })) : [])];
+  const laps = [...new Set(all.map((x) => x.lap))].sort((a, b) => a - b);
+  const state = !active ? `finished ${fmtTime(t.finished)}, took ${fmtDuration(t.finished - t.started)}`
+    : processAlive ? `running for ${fmtDuration(Date.now() / 1000 - t.started)}`
+      : 'not finished and nothing is running (interrupted) - run the round again to continue';
+  const now = runningStep ? `Now: ${runningStep.title}${runningStep.lap ? ` (lap ${runningStep.lap})` : ''}.`
+    : active ? '' : 'Nothing is running now.';
+  const next = active && t.expected.length ? ` Then: ${t.expected.map((x) => x.title).join(', ')}.` : '';
+  const mayLap = active && all.some((x) => x.stage === 'recover' && x.status !== 'done')
+    ? ' The coverage recovery decides at its end whether another lap is worth it, so the list can grow.' : '';
+  const rows = laps.map((lap) => h('div', { class: 'lap-row' },
+    h('div', { class: 'lap-label' }, lapName(lap), lap ? h('div', { class: 'muted small' }, 'repeat within the round') : null),
+    h('div', { class: 'lap-steps' }, all.filter((x) => x.lap === lap).flatMap((x, i) => [i ? h('span', { class: 'arrow', 'aria-hidden': 'true' }) : null, stepChip(x)]))));
+  return h('div', {},
+    header(`${active ? 'This round' : 'Last round'}: round ${t.round}`, `${t.trigger} - started ${fmtTime(t.started)} - ${state}`),
+    terms,
+    h('p', { class: `now-line ${runningStep ? 'is-running' : ''}` }, now, next, mayLap),
+    all.length ? h('div', { class: 'laps' }, rows) : h('p', { class: 'muted' }, 'No stage needed to run in this round.'));
+}
+
+function roundHistory(s) {
+  const t = s.timeline || { round: null, history: [] };
+  const history = (t.history || []).filter((r) => r.round !== t.round).reverse();
+  const sequence = (r) => {
+    const parts = [];
+    let lap = 0;
+    r.steps.forEach((x, i) => {
+      if (x.lap !== lap) { lap = x.lap; parts.push(h('span', { class: 'lap-sep' }, ` | lap ${lap}: `)); } else if (i) parts.push(' \u2192 ');
+      parts.push(h('span', { class: `seq sp-${x.status}` }, `${x.title}${x.duration_s !== null && x.duration_s !== undefined ? ` ${fmtDuration(x.duration_s)}` : ''}`));
+    });
+    return parts.length ? parts : h('span', { class: 'muted' }, 'nothing needed to run');
+  };
+  return h('div', {},
+    history.length ? h('details', { class: 'round-history' }, h('summary', {}, `Earlier rounds (${history.length})`),
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, ['Round', 'Started', 'Took', 'What ran, in order', 'Open unknowns after'].map((x) => h('th', { scope: 'col' }, x)))),
+        h('tbody', {}, history.map((r) => h('tr', {},
+          h('td', {}, h('strong', {}, r.round), h('div', { class: 'muted small' }, r.trigger)),
+          h('td', {}, fmtTime(r.started)),
+          h('td', {}, r.duration_s !== null && r.duration_s !== undefined ? fmtDuration(r.duration_s) : 'not finished'),
+          h('td', { class: 'small' }, sequence(r), r.stopped ? h('div', { class: 'warn-text' }, `stopped: ${r.stopped}`) : null),
+          h('td', { class: 'num' }, r.open_total ?? '-'))))))) : null);
+}
+
 // ------------------------------------------------------------------ pipeline
 function stageCard(stage) {
   const metrics = Object.entries(stage.metrics || {}).filter(([, v]) => ['number', 'string', 'boolean'].includes(typeof v)).slice(0, 4);
@@ -139,8 +220,10 @@ function stageCard(stage) {
   return h('div', { class: `stage st-${stage.status}`, title: stage.description, dataset: { stage: stage.name } },
     h('div', { class: 'stage-head' }, h('span', { class: 'stage-title' }, stage.title), h('span', { class: `badge st-${stage.status}` }, stage.status)),
     h('div', { class: 'stage-sub muted' },
-      stage.round !== null && stage.round !== undefined ? `round ${stage.round}` : 'not run',
-      ' - ', stage.status === 'running' ? `${fmtDuration(elapsed)} so far` : stage.duration_s !== null && stage.duration_s !== undefined ? fmtDuration(stage.duration_s) : '-'),
+      stage.round !== null && stage.round !== undefined ? `last run: round ${stage.round}` : 'not run',
+      ' - ', stage.status === 'running' ? `${fmtDuration(elapsed)} so far` : stage.duration_s !== null && stage.duration_s !== undefined ? fmtDuration(stage.duration_s) : '-',
+      stage.runs_this_round > 1 ? ` - ran ${stage.runs_this_round}x this round` : ''),
+    stage.note ? h('div', { class: 'stage-note' }, stage.note) : null,
     stage.progress ? progressBar(stage, elapsed) : null,
     metrics.length ? h('dl', { class: 'metrics' }, metrics.map(([k, v]) => h('div', {}, h('dt', {}, prettyKey(k)), h('dd', {}, fmtNumber(v, k))))) : null,
     stage.message ? h('p', { class: 'stage-msg', title: stage.message }, stage.message) : null);
@@ -164,9 +247,13 @@ function progressBar(stage, elapsed) {
 }
 
 function pipeline(s) {
-  const pre = s.stages.filter((x) => !x.every_round && x.name !== 'publish');
-  const loop = s.stages.filter((x) => x.every_round);
-  const post = s.stages.filter((x) => x.name === 'publish');
+  const counts = {};
+  for (const step of (s.timeline && s.timeline.steps) || []) counts[step.stage] = (counts[step.stage] || 0) + 1;
+  const stages = s.stages.map((x) => ({ ...x, runs_this_round: counts[x.name] || 0,
+    note: x.name === 'autofit' ? 'again only in a lap' : null }));
+  const pre = stages.filter((x) => !x.every_round && x.name !== 'publish' && x.name !== 'autofit');
+  const loop = stages.filter((x) => x.every_round || x.name === 'autofit');
+  const post = stages.filter((x) => x.name === 'publish');
   const arrow = () => h('span', { class: 'arrow', 'aria-hidden': 'true' });
   const humanNode = h('div', { class: `stage human-node ${s.tasks.open_total ? 'st-waiting' : 'st-done'}` },
     h('div', { class: 'stage-head' }, h('span', { class: 'stage-title' }, 'Human answers'), h('span', { class: 'badge st-waiting' }, s.tasks.open_total ? 'waiting' : 'none open')),
@@ -174,12 +261,12 @@ function pipeline(s) {
       h('div', {}, h('dt', {}, 'open tasks'), h('dd', {}, fmtNumber(s.tasks.open_total))),
       h('div', {}, h('dt', {}, 'answered, not applied'), h('dd', {}, fmtNumber(s.tasks.answered_pending)))));
   return h('div', {},
-    h('h2', {}, 'Pipeline'),
+    h('h2', {}, 'Pipeline ', h('span', { class: 'count' }, 'the latest run of every stage; the order of this round is above')),
     h('div', { class: 'pipeline' },
-      h('div', { class: 'once' }, h('div', { class: 'lane-label' }, 'Once (re-run only when inputs change)'),
+      h('div', { class: 'once' }, h('div', { class: 'lane-label' }, 'Prepared once (re-run only when inputs change)'),
         h('div', { class: 'lane' }, pre.flatMap((x, i) => [i ? arrow() : null, stageCard(x)]))),
       arrow(),
-      h('div', { class: 'loop' }, h('div', { class: 'lane-label' }, 'Every round'),
+      h('div', { class: 'loop' }, h('div', { class: 'lane-label' }, 'Every round: solve, recover, tasks - lap: Autofit, solve and recover again when the recovery adds detections'),
         h('div', { class: 'lane' }, [...loop.flatMap((x, i) => [i ? arrow() : null, stageCard(x)]), arrow(), humanNode]),
         h('div', { class: 'loop-return' }, h('span', {}, 'answers become constraints; the next round re-solves'))),
       arrow(),

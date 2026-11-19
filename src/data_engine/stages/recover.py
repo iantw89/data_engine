@@ -77,7 +77,23 @@ class CropReader:
                     self.keys, self.keypoints, self.box = data["keys"], data["keypoints"], data["box"]
         self.slot = {tuple(int(v) for v in key): index for index, key in enumerate(self.keys)}
         self.read_now = self.worker_seconds = 0
+        self.passes = self.recovered = 0
         self.dirty = False
+
+    def progress(self, message: str) -> None:
+        """What the stage is doing now, for the dashboard (the number of passes is not known in advance)."""
+        path = self.context.workspace.path("logs", "recover_progress.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"message": f"{message}; {self.recovered} positions recovered so far",
+                                    "updated": time.time()}), encoding="utf-8")
+
+    def note(self, message: str) -> None:
+        """Log callback of the recovery: counts passes and recovered positions for the progress line."""
+        self.context.log(message)
+        if message.startswith("pass "):
+            self.passes += 1
+            self.recovered += int(message.rsplit(",", 1)[1].split()[0])
+            self.progress(f"pass {self.passes} done")
 
     def __call__(self, plan: coverage.Plan) -> tuple[np.ndarray, np.ndarray]:
         keys = job_keys(plan)
@@ -97,6 +113,7 @@ class CropReader:
                        workspace.dataset_json, "--requests", requests, "--vitpose", self.vitpose, "--out", results,
                        "--margins", ",".join(str(self.margin[side]) for side in ("left", "right", "top", "bottom"))]
             self.context.log(f"reading {len(pending)} crops ({int(known.sum())} already cached)")
+            self.progress(f"pass {self.passes + 1}: reading {len(pending)} crops")
             started = time.time()
             code = run_worker(self.context, command)
             self.worker_seconds += time.time() - started
@@ -233,7 +250,7 @@ def run(context: Context) -> StageResult:
     started = time.time()
     try:
         result = coverage.recover_iteratively(scene, tracks["identity"].astype(np.int64), tracks["t"].astype(np.int64),
-                                              tracks["root"], tracks["xyz"], reader, geometry, recipe, log=context.log)
+                                              tracks["root"], tracks["xyz"], reader, geometry, recipe, log=reader.note)
     except WorkerFailed as exc:
         reader.save()
         return StageResult(status="failed", inputs=inputs, message=str(exc))

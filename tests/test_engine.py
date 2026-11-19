@@ -356,3 +356,50 @@ def test_lap_request_survives_a_round_that_stops_early(env):
     env.engine.advance(until="solve")
     assert env.harness.calls == ["ingest", "detect", "calibration", "solve"]
     assert env.db.get_meta(engine_module.RERUN_KEY, []) == ["detect"]
+
+
+# --------------------------------------------------------------------------- timeline (what ran when)
+
+
+def test_timeline_lists_the_round_in_order_with_laps(env):
+    asked = []
+
+    def solve(context):
+        asked.append(1)
+        return StageResult(rerun=("detect",) if len(asked) == 1 else (), message="solved")
+    env.harness.behavior["solve"] = solve
+    env.engine.advance()
+    timeline = env.engine.status()["timeline"]
+    assert [(step["stage"], step["lap"]) for step in timeline["steps"]] == [
+        ("ingest", 0), ("detect", 0), ("calibration", 0), ("solve", 0), ("detect", 1), ("solve", 1), ("tasks", 1)]
+    assert timeline["laps"] == 1 and timeline["finished"] is not None and timeline["expected"] == []
+    assert all(step["status"] == "done" and step["duration_s"] is not None for step in timeline["steps"])
+    assert timeline["history"][-1]["laps"] == 1 and len(timeline["history"][-1]["steps"]) == 7
+
+
+def test_timeline_shows_what_is_expected_after_the_running_stage(env):
+    seen = {}
+
+    def detect(context):
+        seen["during"] = env.engine.timeline()
+        return StageResult()
+    env.harness.behavior["detect"] = detect
+    env.engine.advance()
+    during = seen["during"]
+    assert during["steps"][-1]["stage"] == "detect" and during["steps"][-1]["status"] == "running"
+    assert [(item["stage"], item["lap"]) for item in during["expected"]] == [("calibration", 0), ("solve", 0), ("tasks", 0)]
+    assert during["expected"][1]["reason"] == "its input is being recomputed"
+
+
+def test_timeline_expects_the_lap_a_stage_asked_for(env):
+    """Between the stage that asked and the first stage of the lap (or after an interrupted round)."""
+    env.harness.behavior["solve"] = lambda context: StageResult(rerun=("detect",))
+    env.engine.advance(until="solve")
+    env.db.execute("UPDATE rounds SET finished = NULL WHERE round = ?", (env.db.current_round(),))
+    timeline = env.engine.timeline()
+    assert timeline["lap_requested"] == ["detect"]
+    assert [(item["stage"], item["lap"]) for item in timeline["expected"]][:2] == [("detect", 1), ("solve", 1)]
+
+
+def test_timeline_of_a_workspace_without_rounds(env):
+    assert env.engine.timeline() == {"round": None, "steps": [], "expected": [], "history": []}

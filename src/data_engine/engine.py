@@ -294,6 +294,85 @@ class Engine:
             progress.setdefault("message", f"{progress['rate_fps']} frames/s")
         return progress
 
+    # ------------------------------------------------------------------ what ran when
+    @staticmethod
+    def _sequence(runs: list[dict]) -> list[dict]:
+        """Stage runs of one round in the order they ran, each with the lap it belongs to (0 = first pass).
+
+        A round walks the stages in order; when it goes back to an earlier stage, a lap begins."""
+        position = {stage.name: index for index, stage in enumerate(STAGES)}
+        steps, lap, previous = [], 0, -1
+        for run in runs:
+            here = position.get(run["stage"], 0)
+            if here <= previous:
+                lap += 1
+            previous = here
+            stage = STAGE.get(run["stage"])
+            steps.append({
+                "stage": run["stage"], "title": stage.title if stage else run["stage"], "status": run["status"],
+                "lap": lap, "started": run["started"], "finished": run["finished"],
+                "duration_s": round(run["finished"] - run["started"], 1) if run["finished"] else None,
+                "message": run["message"] or ""})
+        return steps
+
+    def timeline(self) -> dict:
+        """The current (or last) round step by step - done, running, expected next - and recent rounds.
+
+        ``expected`` is a prediction: the stages after the running one that are out of date or consume what a
+        running or expected stage produces. A stage whose output turns out unchanged leaves its dependants as
+        they are, and the recover stage can add a lap, so the list can shrink or grow.
+        """
+        rounds = self.db.rounds()
+        if not rounds:
+            return {"round": None, "steps": [], "expected": [], "history": []}
+        by_round: dict[int, list[dict]] = {}
+        for run in self.db.stage_runs():
+            by_round.setdefault(run["round"], []).append(run)
+        current = rounds[-1]
+        steps = self._sequence(by_round.get(current["round"], []))
+        running = next((step for step in steps if step["status"] == "running"), None)
+        if running is not None:
+            running["progress"] = self.progress(STAGE[running["stage"]]) if running["stage"] in STAGE else None
+        expected = []
+        if current["finished"] is None and steps and steps[-1]["status"] in ("running", "done"):
+            names = [stage.name for stage in STAGES if stage.name != "publish"]
+            last = steps[-1]
+            requested = set(self.db.get_meta(RERUN_KEY, []))
+            changing = {last["stage"]} if last["status"] == "running" else set()
+            # a lap that was just requested starts again at the requested stage
+            start = min((names.index(name) for name in requested if name in names), default=names.index(last["stage"]) + 1) \
+                if last["status"] == "done" else names.index(last["stage"]) + 1
+            lap = last["lap"] + (1 if start <= names.index(last["stage"]) else 0)
+            for name in names[start:]:
+                stage = STAGE[name]
+                state = self.stage_state(stage)
+                if name in requested:
+                    reason = "asked for by " + last["title"] if last["status"] == "done" else "requested"
+                elif changing & set(stage.requires):
+                    reason = "its input is being recomputed"
+                elif state != "done":
+                    reason = {"stale": "out of date", "pending": "not run yet"}.get(state, state)
+                else:
+                    continue
+                changing.add(name)
+                expected.append({"stage": name, "title": stage.title, "lap": lap, "reason": reason})
+        history = []
+        for entry in rounds[-8:]:
+            sequence = self._sequence(by_round.get(entry["round"], []))
+            summary = entry["summary"] or {}
+            history.append({
+                "round": entry["round"], "trigger": entry["trigger"], "started": entry["started"],
+                "finished": entry["finished"],
+                "duration_s": round(entry["finished"] - entry["started"], 1) if entry["finished"] else None,
+                "laps": max((step["lap"] for step in sequence), default=0),
+                "steps": [{key: step[key] for key in ("stage", "title", "status", "lap", "duration_s")} for step in sequence],
+                "answers_applied": summary.get("answers_applied"), "open_total": summary.get("open_total"),
+                "stopped": summary.get("stopped")})
+        return {"round": current["round"], "trigger": current["trigger"], "started": current["started"],
+                "finished": current["finished"], "laps": max((step["lap"] for step in steps), default=0),
+                "steps": steps, "expected": expected, "history": history,
+                "lap_requested": sorted(self.db.get_meta(RERUN_KEY, []))}
+
     def status(self) -> dict:
         dataset = self.workspace.dataset if self.workspace.dataset_json.is_file() else None
         stages = []
@@ -326,8 +405,14 @@ class Engine:
         open_tasks = sum(t["open"] for t in by_type)
         pending_answers = sum(t["answered"] for t in by_type)
         states = {s["name"]: s["status"] for s in stages}
+        timeline = self.timeline()
         if any(v == "running" for v in states.values()):
-            phase, detail = "running", next(s["title"] for s in stages if s["status"] == "running") + " is running"
+            title = next(s["title"] for s in stages if s["status"] == "running")
+            step = next((step for step in timeline["steps"] if step["status"] == "running"), None)
+            lap = f", lap {step['lap']}" if step and step["lap"] else ""
+            after = [item["title"] for item in timeline["expected"]]
+            phase = "running"
+            detail = f"Round {timeline['round']}{lap}: {title} is running" + (f"; then {', '.join(after)}" if after else "")
         elif any(v in ("failed", "blocked") for v in states.values()):
             bad = next(s for s in stages if s["status"] in ("failed", "blocked"))
             phase, detail = "blocked", f"{bad['title']}: {bad['message']}"
@@ -372,5 +457,5 @@ class Engine:
             "unknowns": {"by_kind": by_kind, "open_total": open_unknowns},
             "tasks": {"by_type": by_type, "open_total": open_tasks, "answered_pending": pending_answers},
             "coverage": (solve or {}).get("metrics", {}).get("coverage", {}),
-            "next_actions": actions, "events": events,
+            "next_actions": actions, "events": events, "timeline": timeline,
         }

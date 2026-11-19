@@ -43,6 +43,13 @@ once, after the last lap.
 | `tasks` | every round | human tasks | - |
 | `publish` | on request | label-set drafts / published sets | - |
 
+The dashboard shows the round as it happens ("This round"): every stage run in the order
+it ran, grouped into the first pass and the laps, with the running stage, its progress and
+the stages expected next (`Engine.timeline()`; the expectation is a prediction - a stage
+whose output did not change leaves its dependants alone, and the recovery can add a lap).
+Earlier rounds are listed with what ran and how long each stage took. The stage cards
+below it show only the latest run of each stage.
+
 Dataset phases (dashboard banner): `new` → `machine_pending` → `running` →
 `waiting_for_human` → `answers_pending` → … → `ready_to_publish` → `published`, or
 `blocked` when a stage failed.
