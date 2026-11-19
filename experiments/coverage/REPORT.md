@@ -247,8 +247,43 @@ positions of the two identities within 2 s; in the unverified crossings they cov
 753 unmeasured person-instants. The swap check does not read recovered positions; whether
 they change verdicts is not tested.
 
-Not in the engine yet. The identity step takes 2 s on the felix hour, so running it after the
-recovery costs nothing compared with a lap.
+In the engine since 2026-11-19 as the identity lap (`docs/DESIGN.md` section 4, item 12): the
+solve keeps its association and decides identity again with the recovered positions; on felix
+that lap takes about 2 minutes (solve 56 s, recovery 53 s) against about an hour for the
+stages it reuses.
+
+**The eight felix links were then viewed** (`link_sheets.py`: last crops of the earlier
+track above first crops of the later one, per camera; one of them also in context):
+
+| Link (earlier -> later) | Gap, distance | Rule | Seen |
+|---|---|---|---|
+| 1111 -> 141 | 0.1 s, 0.12 m | unique continuation | **two people**: a man in a white T-shirt stops being tracked and stays; a man in dark clothes walks past and his track starts there |
+| 1320 -> 1328 | 4.7 s, 6.7 m | unique continuation | **two people**: a woman lying under a barbell, and someone standing elsewhere |
+| 192 -> 2495 | 4.5 s, 0.06 m | unique continuation | same person (rower, white shirt) |
+| 510 -> 543 | 0.1 s, 0.0 m | unique continuation | same person in the one camera that shows both ends alike; other views inconclusive |
+| 1431 -> 6646 | 2.6 s, 0.23 m | unique continuation | same person |
+| 346 -> 390, 359 -> 369, 367 -> 391 | 20-28 s, 0.17-0.31 m | same spot, nobody else | same person at the same rack or bench |
+
+Two of eight wrong is not acceptable for an automatic link, so these links are proposals
+(`RECIPE["relink"]["apply"] = False`): the earlier track becomes the first candidate of the
+later track's re-identification question. Both failures have one cause, and it is not the
+recovery: the rule takes "the only track that begins within reach" for the same person,
+which is false when the earlier person is still there, untracked.
+
+**The same check on the links the solve had already made on measured positions** (felix: 115
+links, 27 farther than 0.75 m, 18 farther than 2 m; `link_sheets.py --measured 6,6`):
+
+| Viewed | Result |
+|---|---|
+| The six farthest (4.7-9.2 m, gaps 2.5-4.9 s) | five join two different people (different clothing, or a person lying under a bar linked to someone walking), one plausible |
+| 548 -> 566 (3.55 m) | two people |
+| Three at 0.15-0.41 m | same person |
+
+Golden's ten links are all right (labels) and the farthest spans 1.39 m: the part of the
+rule that lets the radius grow to 10 m over 5 s was never exercised there. Automatic links
+are now capped at 1.5 m (`temporal.auto_max_distance_m`); a farther unique continuation stays
+a candidate of the question. Not viewed: felix links between 0.41 and 3.5 m, and all but
+three of the short ones.
 
 ## Reproduce
 

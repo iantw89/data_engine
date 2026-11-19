@@ -138,7 +138,8 @@ the next round usually resolves many remaining unknowns by itself.
    whose *projected* 3D pose they match, by voting over the piece's lifetime, including the
    pose measured up to 1 s earlier or later for a person who stays put.
 6. **Identity** (`solve/identity.py`): components link across gaps when the continuation is
-   unique in both directions within walking reach, or when the person is measured again at
+   unique in both directions within walking reach and at most 1.5 m away
+   (`temporal.auto_max_distance_m`), or when the person is measured again at
    the same spot (0.4 m) within 60 s and nobody else was measured within 1 m in between;
    lifetimes that overlap are never linked. Other starts inside the recording are reported
    with their candidates. Where a track was "last measured" includes the positions of the
@@ -185,13 +186,18 @@ the next round usually resolves many remaining unknowns by itself.
    warrant an Autofit lap, the recover stage runs the linking rule on the identities with
    and without the recovered positions; if the recovered positions add a link, it asks for
    an identity lap. The solve then reuses its association (`solve_state/`, valid for the
-   hash of the stage's inputs), adds the recovered positions to the person-frames the
-   identity step summarises, keeps every link it accepted on the measured positions and
-   accepts the new ones under the same rule (`after_recovery` in `solve.json`). The
-   recovery that follows starts from its previous result - positions are tied to
-   components, not identity numbers - and looks again only around the joined people, where
-   the gap between the two tracks is now inside one track and has a known pose on both
-   sides. Laps repeat while they join tracks (`RECIPE["relink"]`).
+   hash of what the association reads), adds the recovered positions to the person-frames
+   the identity step summarises and keeps every link it accepted on the measured positions.
+   What it does with the additional links is `RECIPE["relink"]["apply"]`:
+   * `False` (current): they are **proposals**. The earlier track is shown as the first
+     candidate of the later track's re-identification question, with the gap and distance
+     measured from the recovered positions; identities are unchanged.
+   * `True`: they are accepted (`after_recovery` in `solve.json`); the recovery that
+     follows starts from its previous result - positions are tied to components, not
+     identity numbers - and looks again only around the joined people, where the gap
+     between the two tracks is now inside one track. Laps repeat while they join tracks.
+   Proposals only, because on the felix hour two of the eight links join two different
+   people (decision log, 2026-11-19).
 7. **Unknowns** (`stages/solve.py`): free pieces with hypotheses → `association`; free
    pieces without → `unassigned` (short ones are grouped into one policy question per
    camera); unexplained starts → `identity_link`; co-located duplicates → `pose_ownership`.
@@ -230,6 +236,13 @@ the next round usually resolves many remaining unknowns by itself.
   come from the recover stage). Making them first-class detections of the store would
   touch every row-indexed artifact; not done. Autofit's own assignment of each recovered
   pose (`extra_raw`) is written but not yet used to cross-check the recovery's identity.
+* Identity links are decided by physics alone: "the only track that begins within reach of
+  where this one ended" is taken for the same person. It fails when the earlier person is
+  still there but no longer tracked and somebody else's track begins nearby. The 1.5 m cap
+  removes the cases seen on felix beyond 3.5 m; one wrong link was seen at 0.12 m (two
+  people side by side, through recovered positions), so short links can be wrong too and
+  nothing independent (appearance, body proportions) checks a link today. Of the felix
+  links at most 0.41 m apart, the three viewed are right.
 * Swap check: its body and appearance thresholds were fitted on one recording, and its
   recall is known only for injected swaps. A swap of two people who pass within about
   0.3 m with similar builds and similar clothes rests on the 2D tracklet cue or a person.
@@ -380,6 +393,26 @@ the next round usually resolves many remaining unknowns by itself.
   0.5%: it keeps golden's lap (0.7%) and felix lap 1 and drops felix lap 2. Positions
   barely move in any lap (felix 408,991 -> 408,748 in total); the lap buys consolidation.
   Table in `experiments/coverage/REPORT.md` section 9.
+* **2026-11-19 - identity after the recovery (identity lap); links through recovered
+  positions are proposals.** The recovery moves track ends (felix: 78 ends and 115 starts,
+  median 0.6 s, at most 67 s), which made the linking rule accept 8 more links on the felix
+  hour and none on golden. The lap that applies them costs about 2 minutes on felix because
+  the solve keeps its association (`solve_state/`, 384 MB for the hour) and the recovery
+  continues from its previous result. Viewed (`experiments/coverage/link_sheets.py`), two
+  of the eight join two different people, so `relink.apply` is `False`: the links are the
+  first candidate of the re-identification question. Using the recovered positions in the
+  swap check was evaluated and not adopted (`experiments/switches/REPORT.md` 3c).
+* **2026-11-19 - automatic identity links capped at 1.5 m (`temporal.auto_max_distance_m`).**
+  Found while viewing the links above: of the links the solve had made on measured
+  positions on the felix hour (115; 18 beyond 2 m), six of the seven viewed beyond 3.5 m
+  join two different people; the three viewed up to 0.41 m are right. The rule ("the only
+  track that begins within reach") assumes the earlier person left; in a busy room they
+  are often still there, untracked. Golden's ten links are right and span at most 1.39 m,
+  so the bench never exercised the long range. With the cap felix has 95 links (farthest
+  1.26 m), 299 identities instead of 279 and 203 open re-identification questions instead
+  of 197; the six links still proposed through recovered positions are the six that looked
+  right. Golden is unchanged (29 identities, 10 links). Felix links between 0.41 and
+  1.26 m were not viewed, and no independent cue checks a link.
 * **2026-11-19 - hand-offs singled out by the 2D trackers.** 38 track endings on the felix
   hour had another track born at the same spot within a few frames - one person tracked
   twice - that neither the hand-off merge nor identity linking joined: in a crowd the
