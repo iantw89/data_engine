@@ -207,6 +207,22 @@ thresholds (500 and 0.1% of Autofit's input); the share threshold is now 0.5%, w
 the golden and first felix laps and drops this one. Three laps are the whole evidence for
 that number. After lap 2 the recovery found 2,299 new detections (0.15%) and declined.
 
+## 10. What the recovery says about identity and association (`recovery_as_identity_evidence.py`)
+
+Not used by the engine yet. Running the solve again after the recovery changes nothing by
+itself: recovered poses are not among its inputs (they reach it only through an Autofit
+lap). But a recovered pose of identity A that lies on a raw detection with the same pose is
+direct evidence about that detection:
+
+| Evidence | Golden 10 min | Felix hour |
+|---|---|---|
+| Unassigned tracklet pieces under A's recovered poses, claimed by one identity | 10 pieces, 2,107 detections; the 7 labelled pieces (2,101 detections) are A's golden person | 753 pieces, 7,196 detections (2,213 directly under a pose) |
+| Pairs A, B never measured at the same instant, at least 5 instants of evidence (link candidates) | 1, the same golden person | 21 (of 283 identities) |
+| Pairs measured at one place at the same instants (duplicates), at least 5 instants | 0 (1 weak, same golden person) | 9 |
+| Pairs measured apart at the same instants (cannot be one person: a wrong recovery or a wrong assignment there) | 3 weak, all different golden people | 44 with at least 5 instants, 124 weak |
+
+Golden's sample is small (one link, seven labelled pieces, three conflicts), all consistent.
+
 ## Reproduce
 
 Research: run the scripts with data_management's interpreter in the order given in each
