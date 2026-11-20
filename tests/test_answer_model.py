@@ -405,3 +405,46 @@ def test_the_worse_pose_of_a_duplicate_does_not_win_the_slot():
     _, ts, table, _ = member_table(scene.scene, labels)
     assert table[ts == 40][0][camera] == other, "unless a person said the other pose is better"
     assert len(order)
+
+
+# --------------------------------------------------------------------------- the comparison images of a swap check
+def swap_with_before(context, before):
+    unknown = {"detail": {"moment": "crossing", "identity": 7, "other": 9, "t": 100, "min_distance_m": 0.4, "why": "w",
+                          "cues": {}, "reference_keys": REF, "after_a_keys": CAND_B, "after_b_keys": CAND_C,
+                          "before_b_keys": before}}
+    return stage_tasks.swap_task(context, unknown)
+
+
+def test_swap_check_the_other_person_before_can_be_flagged_like_any_image(workspace, context):
+    """The images of the other track before the moment are a group too: one of them can show someone else,
+    two people in one pose, or nothing a person can judge."""
+    before = ["5/9/0", "6/9/1", "4/8/0"]
+    answer = {"images": {before[0]: {"exclude": "other_person"}, before[1]: {"exclude": "mixed"},
+                         before[2]: {"bad_pose": True}},
+              "candidates": {"B": "same", "C": "different"}}
+    result, rows = applied(workspace, swap_with_before(context, before), answer)
+    assert result["decided"]
+    assert kinds(rows) == [("different", [before[0]], [before[2]]), ("not_person", [before[1]], []),
+                           ("bad_pose", [before[2]], []), ("same", REF, CAND_B), ("different", REF, CAND_C)]
+    # an image that is not shown is still refused, and 'someone else' needs an image left to differ from
+    task_type, payload = swap_with_before(context, before)
+    with pytest.raises(AnswerError, match="not an image of this task"):
+        validate_answer(payload["ui"], payload, {"images": {"9/9/9": {"exclude": "mixed"}}, "candidates": {"B": "same", "C": "different"}})
+    with pytest.raises(AnswerError, match="comparison images"):
+        validate_answer(payload["ui"], payload, {"images": {key: {"exclude": "other_person"} for key in before},
+                                                 "candidates": {"B": "same", "C": "different"}})
+
+
+def test_swap_check_both_the_follow_up_binds_only_the_before_images_left(workspace, context):
+    before = ["5/9/0", "6/9/1"]
+    both = {"candidates": {"B": "same", "C": "same"}}
+    flagged = {**both, "images": {before[0]: {"exclude": "mixed"}}, "other_before": "same"}
+    result, rows = applied(workspace, swap_with_before(context, before), flagged)
+    assert kinds(rows) == [("not_person", [before[0]], []), ("same", REF, CAND_B), ("same", REF, CAND_C),
+                           ("same", REF, [before[1]])], "the mixed pose is not joined to anyone"
+    # nothing left of the other track before the moment: the follow-up is not asked and nothing is recorded about it
+    gone = {**both, "images": {before[0]: {"exclude": "mixed"}, before[1]: {"exclude": "unsure"}}}
+    task_type, payload = swap_with_before(context, before)
+    assert validate_answer(payload["ui"], payload, {**gone, "other_before": "different"})["other_before"] is None
+    result, rows = applied(workspace, (task_type, payload), gone, subject="gone")
+    assert result["decided"] and kinds(rows)[4:] == [("not_person", [before[0]], []), ("same", REF, CAND_B), ("same", REF, CAND_C)]

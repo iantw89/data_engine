@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from ..web.validate import group_keys
+from ..web.validate import flag_groups as group_keys  # reference, candidates and the comparison images
 
 
 def carried_flags(payload: dict, answered: Iterable[dict], *, skip_task: int | None = None) -> dict[str, dict]:

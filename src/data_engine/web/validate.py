@@ -67,6 +67,23 @@ def group_keys(payload: dict) -> dict[str, list[str]]:
     return groups
 
 
+CONTEXT = "context"  # id of the group of comparison images (a swap check's "other person before")
+
+
+def context_keys(payload: dict) -> list[str]:
+    """Images shown for comparison only. They are one track too, so any of them can be flagged."""
+    return [panel["highlight"][0] for panel in payload.get("context_panels") or [] if panel.get("highlight")]
+
+
+def flag_groups(payload: dict) -> dict[str, list[str]]:
+    """Every group whose images can be flagged: reference, candidates and the comparison images."""
+    groups = group_keys(payload)
+    context = context_keys(payload)
+    if context:
+        groups[CONTEXT] = context
+    return groups
+
+
 def answer_mode(payload: dict) -> str:
     if payload.get("mode"):
         return payload["mode"]
@@ -101,8 +118,9 @@ def several_allowed(payload: dict) -> bool:
 def _groups(payload: dict, answer: dict, problems: list[str]) -> dict:
     """Answer model 2: flags on single images, then a verdict on what remains (taxonomy.IMAGE_FLAGS)."""
     groups = group_keys(payload)
+    flagged = flag_groups(payload)
     reference_id = str((payload.get("reference") or {}).get("id", "A"))
-    group_of = {key: gid for gid, keys in groups.items() for key in keys}
+    group_of = {key: gid for gid, keys in flagged.items() for key in keys}
     images = answer.get("images") or {}
     if not isinstance(images, dict):
         problems.append("images must be an object {detection key: {exclude, bad_pose}}")
@@ -123,10 +141,11 @@ def _groups(payload: dict, answer: dict, problems: list[str]) -> dict:
         if exclude or bad_pose:
             cleaned_images[key] = {"exclude": exclude,
                                    "bad_pose": bool(bad_pose) and exclude in (None, "other_person", "unsure")}
-    kept = {gid: [key for key in keys if not cleaned_images.get(key, {}).get("exclude")] for gid, keys in groups.items()}
+    kept = {gid: [key for key in keys if not cleaned_images.get(key, {}).get("exclude")] for gid, keys in flagged.items()}
     for key, flags in cleaned_images.items():
         if flags["exclude"] == "other_person" and not kept[group_of[key]]:
-            problems.append(f"'someone else' needs one image of group {group_of[key]} left to be the person the "
+            name = "the comparison images" if group_of[key] == CONTEXT else f"group {group_of[key]}"
+            problems.append(f"'someone else' needs one image of {name} left to be the person the "
                             "others differ from; flag the others, or use 'not a person' / 'two people in one pose'")
             break
     mode = answer_mode(payload)
@@ -158,11 +177,13 @@ def _groups(payload: dict, answer: dict, problems: list[str]) -> dict:
     other = other_before(payload)
     if other is not None:
         # Both tracks show the reference's person after the moment: was the other track this person before too?
+        # ... asked only while an image of that track before the moment is left to judge.
         before = answer.get("other_before")
-        if len(same) > 1 and before not in REFERENCE_VALUES:
+        asked = len(same) > 1 and any(not cleaned_images.get(key, {}).get("exclude") for key in other["keys"])
+        if asked and before not in REFERENCE_VALUES:
             problems.append(f"{' and '.join(same)} are both the reference: say whether track {other['track']} showed "
                             "this person before the moment as well (other_before: same, different or unsure)")
-        cleaned["other_before"] = before if len(same) > 1 else None
+        cleaned["other_before"] = before if asked else None
     if mode == "person":
         verdict = answer.get("verdict")
         if reference_alive and verdict not in ("person", "not_person", "unsure"):

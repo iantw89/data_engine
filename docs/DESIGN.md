@@ -176,6 +176,11 @@ person (one person tracked twice: joined), someone else (the other track moved o
 person: it is cut at the moment, `split`), or unsure (nothing recorded about its earlier
 part). Without such images the follow-up is not asked.
 
+The comparison images are a group like the others (`validate.flag_groups`): any of them can
+be flagged (someone else, two people in one pose, not a person, unsure, bad pose), with the
+same effect as elsewhere. The follow-up binds only the images left; with none left it is
+not asked and nothing is recorded about the other track's earlier part.
+
 Not yet: flags on the images of the strip and decision screens; the CVAT hand-off that
 would close `pose_quality`.
 
@@ -508,6 +513,9 @@ would close `pose_quality`.
   images left out as "unsure" are not shown again where the track has others: the
   reviewer was flagging the same image of a candidate track in question after question
   (9 of 58 flags on felix), because answers take effect only at the next round.
+* **2026-11-19 - the comparison images of a swap check can be flagged (answer model 4).**
+  The "other person before" images were display only; a mixed pose or another person among
+  them could not be reported, and the "both" follow-up would have joined or cut on them.
 * **2026-11-19 - image flag "unsure"; a swap check can be answered "both".** A sliver of a
   person can be impossible to assign; "unsure" on the image leaves it out of the answer and
   records nothing (unknown is not negative, and not positive either). In a swap check both

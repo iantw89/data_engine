@@ -35,11 +35,11 @@ def _groups(workspace: Workspace, task: dict, round_number: int) -> tuple[int, b
     candidate is the same person, when nothing is left of the reference, or when every candidate that
     could be judged is a different person and the engine holds no further candidates back.
     """
-    from ..web.validate import answer_mode, group_keys, other_before
+    from ..web.validate import answer_mode, flag_groups, other_before
 
     payload, answer = task["payload"], task["answer"]
     images = answer.get("images") or {}
-    groups = group_keys(payload)
+    groups = flag_groups(payload)  # with the comparison images: they can be flagged like any other
     reference_id = str((payload.get("reference") or {}).get("id", "A"))
 
     def excluded(key: str) -> str | None:
@@ -126,15 +126,16 @@ def _groups(workspace: Workspace, task: dict, round_number: int) -> tuple[int, b
         # The reference is both candidates: after the moment the two tracks show one person. What the other
         # track showed before decides whether it is that person tracked twice, or a track that changed person.
         before = answer.get("other_before")
-        if before == "same":
-            _add(workspace, "same", reference, other["keys"], task, round_number, reason="one person tracked twice")
+        before_keys = [key for key in other["keys"] if not excluded(key)]  # images taken out say nothing here
+        if before == "same" and before_keys:
+            _add(workspace, "same", reference, before_keys, task, round_number, reason="one person tracked twice")
             created += 1
-        elif before == "different":
+        elif before == "different" and before_keys:
             for key in kept.get(other["id"]) or []:
-                _add(workspace, "split", other["keys"], [key], task, round_number,
+                _add(workspace, "split", before_keys, [key], task, round_number,
                      reason="the other track moved onto the reference's person")
                 created += 1
-            _add(workspace, "different", reference, other["keys"], task, round_number)
+            _add(workspace, "different", reference, before_keys, task, round_number)
             created += 1
     if mode == "match" and not decided and judged and all(verdict == "different" for verdict in judged) \
             and not payload.get("more_candidates"):

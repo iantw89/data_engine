@@ -139,8 +139,9 @@ IMAGE_FLAGS = {
                  "bad_pose(image): its keypoints are left out of 3D and it is listed for pose correction"),
 }
 # Version of the 'reference_candidates' answer the server understands
-# (1: reference_ok / none_of_these / problems; 2: flags on single images; 3: 'unsure' image flag, swap check 'both').
-ANSWER_MODEL = 3
+# (1: reference_ok / none_of_these / problems; 2: flags on single images; 3: 'unsure' image flag, swap check 'both';
+# 4: flags on the comparison images of a swap check).
+ANSWER_MODEL = 4
 
 # --------------------------------------------------------------------------- task types
 

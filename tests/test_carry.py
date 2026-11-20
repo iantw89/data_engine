@@ -95,3 +95,14 @@ def test_the_server_sends_the_carried_flags_with_an_open_task(tmp_path):
         assert task["id"] == two and task["known_flags"][TRACK[1]]["exclude"] == "other_person"
     finally:
         client.close()
+
+
+def test_a_flag_on_a_comparison_image_carries_too():
+    """The 'other person before' images of a swap check are shown again as that track's images elsewhere."""
+    swap = task_payload(["0/10/0"], B=["7/1/0"], C=["7/2/0"])
+    swap["context_panels"] = [panel(key) for key in TRACK]
+    first = answered(1, swap, {TRACK[1]: {"exclude": "other_person", "bad_pose": False}})
+    assert carried_flags(task_payload(["0/99/0"], B=TRACK), [first])[TRACK[1]]["exclude"] == "other_person"
+    # and into the comparison images of another swap check
+    earlier = answered(2, task_payload(["0/10/0"], B=TRACK), {TRACK[0]: {"exclude": "mixed", "bad_pose": False}})
+    assert carried_flags(swap, [earlier]) == {TRACK[0]: {"exclude": "mixed", "bad_pose": False, "task": 2}}

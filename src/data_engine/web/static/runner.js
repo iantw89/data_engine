@@ -483,6 +483,10 @@ function buildReference(ctx, task, sizes) {
   const groups = {};
   if (ref) groups[refId] = (ref.panels || []).map(keyOf).filter(Boolean);
   candidates.forEach((c) => { groups[String(c.id)] = (c.panels || []).map(keyOf).filter(Boolean); });
+  // Images shown for comparison (a swap check's "other person before") are a track too: they can be flagged.
+  const CONTEXT = 'context';
+  const contextKeys = (p.context_panels || []).map(keyOf).filter(Boolean);
+  if (contextKeys.length) groups[CONTEXT] = contextKeys;
   const ids = candidates.map((c) => String(c.id));
   const s = { images: {}, values: Object.fromEntries(ids.map((id) => [id, null])), verdict: null, better: null, otherBefore: null };
   const flagOf = (key) => (s.images[key] || {}).exclude || null;
@@ -496,6 +500,8 @@ function buildReference(ctx, task, sizes) {
   const beforeKeys = ((p.other_before || {}).keys || (p.context_panels || []).map(keyOf).filter(Boolean));
   const otherBefore = isSwap && other && beforeKeys.length ? { track: (p.other_before || {}).track ?? other.track } : null;
   const bothSame = () => isSwap && ids.filter((id) => kept(id).length && kept(refId).length && s.values[id] === 'same').length > 1;
+  // The follow-up about the other track before the moment needs an image of it left to judge.
+  const beforeAlive = () => beforeKeys.some((key) => !flagOf(key));
   const refAlive = () => !ref || kept(refId).length > 0;
   const alive = (id) => refAlive() && kept(id).length > 0;
   const conflict = () => cannotBoth.find((pair) => pair.ids.every((id) => alive(String(id)) && s.values[String(id)] === 'same')) || null;
@@ -586,6 +592,7 @@ function buildReference(ctx, task, sizes) {
     if (vStay === 'same' && vOther === 'same') {
       const head = `${refId} is both: no swap, track ${a} stays on this person, and track ${b} shows the same person after this moment.`;
       if (!otherBefore) return [`${head} Track ${b} is joined to this person.`, null];
+      if (!beforeAlive()) return [`${head} Track ${b} is joined to this person; no image of it before this moment is left, so nothing is recorded about its earlier part.`, null];
       if (!s.otherBefore) return [null, `${refId} is both candidates: did track ${b} show this person before the moment too? Answer under the comparison images - Unsure is a valid answer.`];
       if (s.otherBefore === 'same') return [`${head} It did before as well: one person tracked twice, and the two tracks are joined.`, null];
       if (s.otherBefore === 'different') return [`${head} Before, track ${b} showed someone else: it is cut at this moment and only its later part is joined to this person.`, null];
@@ -668,7 +675,7 @@ function buildReference(ctx, task, sizes) {
       betterBtns.forEach((b) => { const on = b.dataset.value === (s.better || 'equal'); b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); });
     }
     if (beforeRow) {
-      beforeRow.hidden = !bothSame();
+      beforeRow.hidden = !(bothSame() && beforeAlive());
       beforeBtns.forEach((b) => { const on = b.dataset.value === s.otherBefore; b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); });
     }
     if (refCard) refCard.classList.toggle('bad', !refAlive());
@@ -681,7 +688,7 @@ function buildReference(ctx, task, sizes) {
     h('div', { class: 'cand-head' }, h('span', { class: 'ref-badge' }, refId), h('strong', {}, 'Reference'), h('span', { class: 'muted cap' }, ref.caption || '')),
     verdictBtns.length ? h('div', { class: 'cand-controls verdict' }, h('div', { class: 'seg', role: 'group', 'aria-label': 'Is this a real person?' }, verdictBtns)) : null,
     images(ref.panels, refId),
-    (p.context_panels || []).length ? h('div', { class: 'context-block' }, h('div', { class: 'muted small' }, beforeRow ? `For comparison - asked about only when ${refId} is both candidates` : 'For comparison - not part of the answer'), panelRow(ctx, p.context_panels, { lo: sizes.lo, hi: sizes.hi }), beforeRow) : null) : null;
+    (p.context_panels || []).length ? h('div', { class: 'context-block' }, h('div', { class: 'muted small' }, (beforeRow ? `For comparison - asked about only when ${refId} is both candidates.` : 'For comparison - not part of the answer.') + (contextKeys.length ? ' An image that does not belong can be flagged like any other.' : '')), contextKeys.length ? images(p.context_panels, CONTEXT) : panelRow(ctx, p.context_panels, { lo: sizes.lo, hi: sizes.hi }), beforeRow) : null) : null;
   if (betterRow && cardEls.length) cardEls[0].append(betterRow);  // right under the answer it belongs to
   const el = h('section', { class: `ref-ui ${ref ? '' : 'no-ref'} ${ids.length ? '' : 'no-cand'}`, style: { '--cols': Math.min(candidates.length, 3) } },
     refCard, ids.length ? h('div', { class: 'cand-grid' }, cardEls) : null);
@@ -725,7 +732,7 @@ function buildReference(ctx, task, sizes) {
       return false;
     },
     check() {
-      if ((ctx.answerModel || 1) < 3) return 'This web server runs an older version of the engine than this page and would refuse or lose parts of the answer. Restart it (data-engine serve), reload this page, then answer.';
+      if ((ctx.answerModel || 1) < 4) return 'This web server runs an older version of the engine than this page and would refuse or lose parts of the answer. Restart it (data-engine serve), reload this page, then answer.';
       return summary().warn;
     },
     answer() {
@@ -734,7 +741,7 @@ function buildReference(ctx, task, sizes) {
       const out = { images: flagged, candidates: Object.fromEntries(ids.map((id) => [id, alive(id) ? s.values[id] : null])) };
       if (mode === 'person') out.verdict = refAlive() ? s.verdict : null;
       if (mode === 'duplicate') out.better = ids.length && s.values[ids[0]] === 'same' ? (s.better || 'equal') : null;
-      if (otherBefore) out.other_before = bothSame() ? s.otherBefore : null;
+      if (otherBefore) out.other_before = bothSame() && beforeAlive() ? s.otherBefore : null;
       return out;
     },
     prefill(flags) {
