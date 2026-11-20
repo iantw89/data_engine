@@ -1,0 +1,166 @@
+{
+ "any": {
+  "fragments_with_views": 858,
+  "share_pairs_known": 1.0,
+  "same_camera": {
+   "same": 23671,
+   "different": 304364,
+   "auc": 0.956,
+   "same_mean": 0.635,
+   "different_mean": 0.299,
+   "different_p99": 0.572,
+   "same_p10": 0.447,
+   "slope": 17.79,
+   "midpoint": 0.46
+  },
+  "gallery": {
+   "asked": 23671,
+   "true_has_appearance": 1.0,
+   "rank1_when_it_has": 0.816
+  }
+ },
+ "joints13": {
+  "fragments_with_views": 855,
+  "share_pairs_known": 0.993,
+  "same_camera": {
+   "same": 23500,
+   "different": 301803,
+   "auc": 0.957,
+   "same_mean": 0.64,
+   "different_mean": 0.297,
+   "different_p99": 0.57,
+   "same_p10": 0.448,
+   "slope": 17.6,
+   "midpoint": 0.461
+  },
+  "gallery": {
+   "asked": 23671,
+   "true_has_appearance": 0.993,
+   "rank1_when_it_has": 0.821
+  }
+ },
+ "alone": {
+  "fragments_with_views": 858,
+  "share_pairs_known": 1.0,
+  "same_camera": {
+   "same": 23650,
+   "different": 296280,
+   "auc": 0.9558,
+   "same_mean": 0.635,
+   "different_mean": 0.294,
+   "different_p99": 0.567,
+   "same_p10": 0.44,
+   "slope": 17.52,
+   "midpoint": 0.456
+  },
+  "cross_camera": {
+   "same": 21,
+   "different": 30158,
+   "auc": 0.9879,
+   "same_mean": 0.641,
+   "different_mean": 0.273,
+   "different_p99": 0.639,
+   "same_p10": 0.545,
+   "slope": 33.75,
+   "midpoint": 0.5
+  },
+  "gallery": {
+   "asked": 23671,
+   "true_has_appearance": 1.0,
+   "rank1_when_it_has": 0.806
+  }
+ },
+ "clear": {
+  "fragments_with_views": 852,
+  "share_pairs_known": 0.986,
+  "same_camera": {
+   "same": 23354,
+   "different": 280217,
+   "auc": 0.9545,
+   "same_mean": 0.641,
+   "different_mean": 0.292,
+   "different_p99": 0.573,
+   "same_p10": 0.441,
+   "slope": 16.57,
+   "midpoint": 0.461
+  },
+  "cross_camera": {
+   "same": 137,
+   "different": 41508,
+   "auc": 0.6941,
+   "same_mean": 0.42,
+   "different_mean": 0.274,
+   "different_p99": 0.628,
+   "same_p10": 0.121,
+   "slope": 4.4,
+   "midpoint": 0.343
+  },
+  "gallery": {
+   "asked": 23671,
+   "true_has_appearance": 0.992,
+   "rank1_when_it_has": 0.804
+  }
+ },
+ "clear15": {
+  "fragments_with_views": 841,
+  "share_pairs_known": 0.961,
+  "same_camera": {
+   "same": 22839,
+   "different": 249683,
+   "auc": 0.9494,
+   "same_mean": 0.64,
+   "different_mean": 0.291,
+   "different_p99": 0.583,
+   "same_p10": 0.434,
+   "slope": 15.51,
+   "midpoint": 0.459
+  },
+  "cross_camera": {
+   "same": 305,
+   "different": 63537,
+   "auc": 0.8038,
+   "same_mean": 0.525,
+   "different_mean": 0.289,
+   "different_p99": 0.64,
+   "same_p10": 0.214,
+   "slope": 6.45,
+   "midpoint": 0.402
+  },
+  "gallery": {
+   "asked": 23671,
+   "true_has_appearance": 0.978,
+   "rank1_when_it_has": 0.78
+  }
+ },
+ "unclear": {
+  "fragments_with_views": 786,
+  "share_pairs_known": 0.839,
+  "same_camera": {
+   "same": 19294,
+   "different": 221225,
+   "auc": 0.9164,
+   "same_mean": 0.577,
+   "different_mean": 0.293,
+   "different_p99": 0.59,
+   "same_p10": 0.382,
+   "slope": 13.58,
+   "midpoint": 0.431
+  },
+  "cross_camera": {
+   "same": 1277,
+   "different": 51950,
+   "auc": 0.7527,
+   "same_mean": 0.451,
+   "different_mean": 0.314,
+   "different_p99": 0.62,
+   "same_p10": 0.262,
+   "slope": 6.8,
+   "midpoint": 0.383
+  },
+  "gallery": {
+   "asked": 23671,
+   "true_has_appearance": 0.869,
+   "rank1_when_it_has": 0.657
+  }
+ }
+}

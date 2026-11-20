@@ -176,9 +176,19 @@ def _task_ui(task: dict) -> str:
     return ui or ""
 
 
+def _known_flags(workspace: Workspace, task: dict) -> dict:
+    """Flags the person already put, in answers to other tasks, on images this open task shows too."""
+    if task["status"] != "open" or _task_ui(task) != "reference_candidates":
+        return {}
+    from ..tasks.carry import carried_flags
+
+    answered = workspace.db.tasks(status="answered") + workspace.db.tasks(status="applied")
+    return carried_flags(task["payload"], answered, skip_task=task["id"])
+
+
 def _task_detail(workspace: Workspace, task: dict) -> dict:
     info = TASK_TYPES.get(task["type"])
-    return {**task, "ui": _task_ui(task),
+    return {**task, "ui": _task_ui(task), "known_flags": _known_flags(workspace, task),
             "type_info": {"title": info.title, "question": info.question, "ui": info.ui} if info else None,
             "unknown_ids": workspace.db.task_unknown_ids(task["id"])}
 

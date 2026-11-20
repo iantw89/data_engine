@@ -156,7 +156,9 @@ def identity_task(context: Context, unknown: dict) -> tuple[str, dict]:
     seconds, clock = time_text(context, detail.get("t"))
     payload = base_payload(
         "reidentify", f"Person {detail['identity']} appears at {clock} - who are they?", detail["why"],
-        {"earlier people who could have reached this spot": detail["feasible_candidates"]}, seconds)
+        {"earlier people who could have reached this spot": detail["feasible_candidates"],
+         **({"shown first": "the likeliest: by distance for the time passed, and by appearance where both tracks "
+                            "have clear views"} if any("score" in c for c in detail["candidates"]) else {})}, seconds)
     payload["reference"] = {"id": "A", "caption": f"person {detail['identity']}, just after appearing",
                             "panels": [panel(context, key, label="A") for key in detail["reference_keys"]]}
     payload["candidates"] = []
@@ -167,10 +169,22 @@ def identity_task(context: Context, unknown: dict) -> tuple[str, dict]:
         tracked = ""
         if candidate.get("tracked_t"):
             tracked = f", tracked {time_text(context, candidate['tracked_t'][0])[1]} to {time_text(context, candidate['tracked_t'][1])[1]}"
+        looks = ""
+        if "score" in candidate or "similarity" in candidate:
+            # What the order of the candidates rests on (solve/link_ranking.py): shown, never decisive.
+            if candidate.get("similarity") is None:
+                looks = "; appearance not compared (no clear view of both)"
+            else:
+                evidence = candidate.get("appearance", 0)
+                word = "alike" if evidence > 1 else "different" if evidence < -1 else "inconclusive"
+                where = "same camera" if candidate.get("compared") == "same_camera" else "different cameras"
+                looks = f"; appearance {word} ({candidate['similarity']:.2f}, {where})"
         payload["candidates"].append({
             "id": letter, "track": candidate["identity"],
+            "ranking": {name: candidate[name] for name in ("score", "motion", "appearance", "similarity", "compared",
+                                                           "speed_mps", "clear_views") if name in candidate},
             "caption": f"person {candidate['identity']}, last seen {candidate['gap_s']} s earlier, "
-                       f"{candidate['distance_m']} m away{tracked}"
+                       f"{candidate['distance_m']} m away{looks}{tracked}"
                        + (" - the only one that fits once recovered positions are known" if candidate.get("proposed_after_recovery") else ""),
             "panels": [panel(context, key, label=letter, color=COLORS[index % len(COLORS)])
                        for key in candidate["keys"]],

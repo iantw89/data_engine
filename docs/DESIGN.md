@@ -141,6 +141,34 @@ Several candidates can be the same person in `reidentify` (a track that broke mo
 once); two candidates measured at the same instants in different places exclude each other
 (`cannot_both`). `cross_view_match` takes one.
 
+**Candidates of a re-identification are ranked** (`solve/link_ranking.py`,
+`RECIPE["link_ranking"]`, `experiments/links/REPORT.md`). Every earlier track that had ended
+and could physically have reached the spot (12 m/s, within 120 s) is a candidate; the four
+likeliest are shown, the rest follow when those are rejected. The order adds two
+log-likelihood ratios (same person against a different person):
+
+* *motion* - the distance between the candidate's last and the new track's first position
+  for the time that passed: people mostly stay where they are, or walk;
+* *appearance* - ReID similarity of the 10 s of each track next to the gap, **only on clear
+  views**: at least 13 of 17 joints found, the box not cut by the image border, not
+  overlapped by another person's box, at least 96 px tall. Tracks seen in the same camera are
+  compared there (the reliable comparison); otherwise their views are pooled. Without a
+  clear view of both tracks appearance is *unknown* (zero), never "different".
+
+The card of each candidate says what its place rests on ("appearance alike (0.71, same
+camera)", "appearance not compared (no clear view of both)"). The ranking joins, excludes
+and closes nothing; a link proposed after the coverage recovery still comes first. The
+images shown for a candidate are clear views where the track has any.
+
+**What a person said about an image is used at once and again later.** One track is a
+candidate in many questions and every question shows the same few images of it. A flag is
+therefore pre-set on the same image in every other open question, marked "you said so in
+#N" and undoable (`tasks/carry.py`; "someone else" only next to at least one image it was
+said about). At the next round the answer is applied: an image flagged "someone else" may
+not share a track with the rest of its group (cannot-link in the association), so its piece
+leaves the track; an image left out as "unsure" is not shown again where the track has
+another one.
+
 `swap_check` takes both: after the moment the two tracks then show one person. The reference
 is joined to both, and one more answer is asked for on the same screen, about the images of
 the other track just before the moment (shown for comparison in every swap check): the same
@@ -287,8 +315,22 @@ would close `pose_quality`.
   still there but no longer tracked and somebody else's track begins nearby. The 1.5 m cap
   removes the cases seen on felix beyond 3.5 m; one wrong link was seen at 0.12 m (two
   people side by side, through recovered positions), so short links can be wrong too and
-  nothing independent (appearance, body proportions) checks a link today. Of the felix
-  links at most 0.41 m apart, the three viewed are right.
+  nothing independent (appearance, body proportions) checks an automatic link today
+  (appearance only orders the candidates of the questions). Of the felix links at most
+  0.41 m apart, the three viewed are right.
+* Re-identification candidates end 120 s before the new track at most
+  (`temporal.candidate_gap_s`). Someone away for longer is never offered, and "none of
+  these" then closes the question as a separate person. Felix answers confirm matches up to
+  118 s, so the limit cuts real matches off; it was left alone until the ranking has been
+  used for a round (a wider window multiplies the candidates of every question).
+* An image flagged "someone else" leaves its track with its piece (the part of the
+  camera's tracklet the solver handles as a unit). Neighbouring pieces of the same
+  tracklet can stay in the track (felix dry run: 4 of 23 flagged images, 9 to 78
+  detections each); whether they show the other person too is not asked yet (it is a
+  continuity question on that tracklet).
+* The ranking's motion model uses round numbers and its appearance curve was fitted on
+  the golden recording; on the felix answers appearance orders well and motion adds little
+  beyond what distance already gave (`experiments/links/REPORT.md`).
 * Swap check: its body and appearance thresholds were fitted on one recording, and its
   recall is known only for injected swaps. A swap of two people who pass within about
   0.3 m with similar builds and similar clothes rests on the 2D tracklet cue or a person.
@@ -305,8 +347,8 @@ would close `pose_quality`.
 * `coverage`, `pose_quality`, `continuity` and `audit` tasks have UI and answer handling
   but no generator yet; the CVAT pose-correction hand-off is not implemented.
 * Appearance ReID was tested and is not reliable enough to decide (0.5-1% wrong in its best
-  case, `experiments/reid/REPORT.md`): identity across long gaps goes to a human. Using it
-  to rank the candidates shown is implemented in `reid.py` but not wired into tasks yet.
+  case, `experiments/reid/REPORT.md`): identity across long gaps goes to a human. It orders
+  the candidates that person is shown (above), on clear views only.
 * People that only one camera can see (outside the 3D-covered floor) need a scope decision
   per piece today; grouping them into one decision per camera region is implemented but only
   triggers where no 3D-tracked person ever appears in that part of the image.
@@ -450,6 +492,22 @@ would close `pose_quality`.
   pose are different facts with different consequences. Re-identification takes several
   "same" answers. Pose ownership asks which pose is better. Answers given under model 1
   keep their meaning (`apply._reference_candidates`).
+* **2026-11-19 - re-identification candidates ranked by motion and clear-view appearance;
+  image flags carried between open tasks.** Before: candidates within reach, nearest
+  first, four at a time, appearance unused. The reviewer's answers on felix showed that
+  distance orders well only for people who barely moved (11 of 23 confirmed matches within
+  0.25 m, 8 between 1.9 and 8.8 m among the rejected ones) and that 9 of 23 questions had no
+  match among the four shown. Now the order is motion + appearance (`link_ranking`,
+  recipe section added). Appearance counts only on clear views - the reviewer's
+  observation that ReID is useless on partial skeletons and heavy occlusion, measured on
+  the golden reference: with only partial or overlapped crops the right person is first in
+  66% of galleries, with clear views in 80%. A new section of the recipe, no label
+  threshold: nothing is joined, excluded or closed by it. Its embeddings are a cache of
+  their own (`evidence/appearance_links`), so the swap check's cue values are untouched.
+  Flags on images are pre-set in the other open tasks that show the same image, and
+  images left out as "unsure" are not shown again where the track has others: the
+  reviewer was flagging the same image of a candidate track in question after question
+  (9 of 58 flags on felix), because answers take effect only at the next round.
 * **2026-11-19 - image flag "unsure"; a swap check can be answered "both".** A sliver of a
   person can be impossible to assign; "unsure" on the image leaves it out of the answer and
   records nothing (unknown is not negative, and not positive either). In a swap check both

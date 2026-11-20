@@ -27,7 +27,7 @@ import numpy as np
 from ..config import RECIPE
 from ..engine import Context, StageResult
 from ..solve import coverage as coverage_module
-from ..solve import recover
+from ..solve import link_ranking, recover
 from ..solve.pipeline import Associated, Constraints, Solved, associate_and_refine, coverage_metrics, identify, unit_scene
 from ..solve.scene import Scene, load_scene
 from ..store import parse_det_key
@@ -285,23 +285,97 @@ def representative_keys(scene: Scene, camera_index: int, rows: np.ndarray, count
     return [camera.detections.key(int(r)) for r in picks]
 
 
+def image_sizes(scene: Scene) -> list[tuple[int, int]]:
+    cameras = scene.workspace.dataset.cameras
+    return [(int(cameras[camera.camera].width), int(cameras[camera.camera].height)) for camera in scene.cameras]
+
+
 def component_keys_at(scene: Scene, labels: recover.Labels, label: int, t: int, *, exclude_camera: int | None = None,
-                      count: int = 2, tolerance: int = 15) -> list[str]:
-    """Up to ``count`` detections of a component near sync index ``t`` (largest boxes, distinct cameras)."""
+                      count: int = 2, tolerance: int = 15, avoid: frozenset[str] | set[str] = frozenset(),
+                      clear: dict | None = None) -> list[str]:
+    """Up to ``count`` detections of a component near sync index ``t`` (largest boxes, distinct cameras).
+
+    ``avoid``: detections a person could not judge ("unsure": too little visible); another detection of the
+    camera within the tolerance is taken instead where there is one. ``clear`` (the clear-view rule of
+    ``RECIPE["link_ranking"]``): prefer detections that show the whole person, not overlapped by anyone -
+    within a camera the nearest clear one, and cameras with a clear view before the others."""
     options = []
+    sizes = image_sizes(scene) if clear is not None else None
     for camera in scene.cameras:
         if camera.index == exclude_camera:
             continue
         rows = np.flatnonzero(labels.label[camera.index] == label)
-        rows = rows[camera.t[rows] >= 0]
+        rows = rows[(camera.t[rows] >= 0) & (np.abs(camera.t[rows] - t) <= tolerance)]
         if not len(rows):
             continue
+        if avoid:
+            judged = np.array([camera.detections.key(int(row)) not in avoid for row in rows])
+            rows = rows[judged] if judged.any() else rows
+        is_clear = False
+        if clear is not None:
+            good = link_ranking.clear_view(
+                link_ranking.view_quality(camera, rows, sizes[camera.index], scene.joint_peak, clear["border_px"]), clear)
+            if good.any():
+                rows, is_clear = rows[good], True
         nearest = rows[np.argmin(np.abs(camera.t[rows] - t))]
-        if abs(int(camera.t[nearest]) - t) > tolerance:
-            continue
         box = camera.detections.boxes[nearest]
-        options.append((float((box[2] - box[0]) * (box[3] - box[1])), camera.detections.key(int(nearest))))
-    return [key for _, key in sorted(options, reverse=True)[:count]]
+        options.append((is_clear, float((box[2] - box[0]) * (box[3] - box[1])), camera.detections.key(int(nearest))))
+    return [key for *_, key in sorted(options, reverse=True)[:count]]
+
+
+def rank_link_candidates(solved: Solved, embed=None, log=print) -> dict[int, list[dict]]:
+    """For every track that starts inside the recording: its feasible earlier tracks, likeliest first.
+
+    ``{later component: [{"component", "gap_s", "distance_m", "score", "motion", "appearance", "similarity",
+    "compared", "speed_mps", "clear_views"}, ...]}``. The order is by ``solve/link_ranking.py``: motion, plus
+    appearance where both tracks have clear views next to the gap (``embed``: ``appearance.embedder``; without
+    it, or without clear views, appearance is unknown and motion alone orders). Nothing is decided here."""
+    recipe = RECIPE["link_ranking"]
+    scene, labels = solved.scene, solved.labels
+    summaries = {s.label: s for s in solved.summaries if s is not None}
+    starts = [end for end in solved.links.open_ends if end["end"] == "start" and end["candidates"]]
+    window = int(round(recipe["window_s"] * 10))
+    views: dict[tuple[int, str], tuple[dict, dict]] = {}
+    if embed is not None and starts:
+        index, sizes = link_ranking.ComponentRows(scene, labels.label), image_sizes(scene)
+        for end in starts:
+            wanted = [(end["component"], "start")] + [(option["component"], "end") for option in end["candidates"]]
+            for label, side in wanted:
+                if (label, side) in views or label not in summaries:
+                    continue
+                summary = summaries[label]
+                lo, hi = (summary.t_first, summary.t_first + window) if side == "start" \
+                    else (summary.t_last - window, summary.t_last)
+                views[(label, side)] = link_ranking.window_views(index, label, lo, hi, recipe, sizes)
+    embeddings = None
+    if views:
+        rows: dict[int, list] = {}
+        for chosen, _ in views.values():
+            for camera_index, mine in chosen.items():
+                rows.setdefault(camera_index, []).append(mine)
+        try:
+            embeddings = embed({camera: np.unique(np.concatenate(parts)) for camera, parts in rows.items()})
+        except Exception as exc:  # appearance is optional: never fail the solve over it
+            log(f"appearance for ranking link candidates unavailable ({type(exc).__name__}: {exc})")
+    described = {}
+    if embeddings is not None:
+        described = {which: link_ranking.descriptors(chosen, embeddings) for which, (chosen, _) in views.items()}
+    ranked, compared = {}, 0
+    for end in starts:
+        later = end["component"]
+        options = []
+        for option in end["candidates"]:
+            earlier = (option["component"], "end")
+            found = link_ranking.similarity(described.get((later, "start")) or {}, described.get(earlier) or {})
+            compared += found is not None
+            clear = [views[which][1]["clear"] if which in views else 0 for which in ((later, "start"), earlier)]
+            options.append({**option, **link_ranking.score(option["gap_s"], option["distance_m"], found, recipe),
+                            "clear_views": clear})
+        ranked[later] = sorted(options, key=lambda option: -option["score"])
+    pairs = sum(len(options) for options in ranked.values())
+    log(f"link candidates ranked: {len(ranked)} track starts, {pairs} candidates, appearance compared for {compared} "
+        f"(both tracks have clear views)")
+    return ranked
 
 
 def measured_apart(first: tuple[np.ndarray, np.ndarray], second: tuple[np.ndarray, np.ndarray], *,
@@ -387,8 +461,13 @@ def human_unknowns(solved: Solved, constraints: Constraints) -> dict[str, list[d
     return {"tracklet_purity": purity, "pose_quality": quality}
 
 
-def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[dict]]:
+def extract_unknowns(solved: Solved, resolved_keys: set[str], *, ranked: dict[int, list[dict]] | None = None,
+                     avoid: frozenset[str] | set[str] = frozenset()) -> dict[str, list[dict]]:
+    """``ranked``: ``rank_link_candidates`` (without it, candidates are ordered by distance). ``avoid``:
+    detections a person left out as "unsure"; other images are shown where there are any."""
     scene, labels, association = solved.scene, solved.labels, solved.association
+    ranked = ranked or {}
+    clear = RECIPE["link_ranking"]
     cams = recover.camera_counts(scene, labels)
     multi = {label for label, cameras in cams.items() if len(cameras) >= 2}
     identity = solved.identity_of_label
@@ -567,6 +646,8 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
         keys = component_keys_at(scene, labels, label, end["t"] + 5, count=3, tolerance=40)
         if not keys or resolved_keys & set(keys):
             continue
+        if avoid & set(keys):
+            keys = component_keys_at(scene, labels, label, end["t"] + 5, count=3, tolerance=40, avoid=avoid)
         size = identity_size.get(int(identity[label]), 0)
         if size < MIN_IDENTITY_DETECTIONS and "policy:review_short_identities" not in resolved_keys:
             brief["count"] += 1
@@ -574,22 +655,33 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
             brief["examples"].append((size, keys[0]))
             continue
         candidates = []
-        for option in end["candidates"][:6]:
+        # Likeliest first (motion, and appearance where both tracks have clear views); the four best are shown.
+        for option in ranked.get(label) or end["candidates"]:
+            if len(candidates) >= 4:
+                break
             other = summaries.get(option["component"])
             if other is None:
                 continue
-            other_keys = component_keys_at(scene, labels, other.label, other.t_last - 5, count=3, tolerance=40)
+            other_keys = component_keys_at(scene, labels, other.label, other.t_last - 5, count=3, tolerance=40,
+                                           avoid=avoid, clear=clear)
             if other_keys:
                 candidates.append({"component": int(other.label), "identity": int(identity[other.label]),
                                    "gap_s": option["gap_s"], "distance_m": option["distance_m"], "keys": other_keys,
-                                   "tracked_t": identity_span.get(int(identity[other.label]))})
+                                   "tracked_t": identity_span.get(int(identity[other.label])),
+                                   **{name: option[name] for name in ("score", "motion", "appearance", "similarity",
+                                                                      "compared", "speed_mps", "clear_views")
+                                      if name in option}})
         proposal = proposed.get(label)
         if proposal is not None and proposal["from"] in summaries:
             other = summaries[proposal["from"]]
-            other_keys = component_keys_at(scene, labels, other.label, other.t_last - 5, count=3, tolerance=40)
+            other_keys = component_keys_at(scene, labels, other.label, other.t_last - 5, count=3, tolerance=40,
+                                           avoid=avoid, clear=clear)
             if other_keys:
+                scored = next((option for option in ranked.get(label) or [] if option["component"] == other.label), {})
                 candidates = [c for c in candidates if c["component"] != other.label]
-                candidates.insert(0, {"component": int(other.label), "identity": int(identity[other.label]),
+                candidates.insert(0, {**{name: scored[name] for name in ("appearance", "similarity", "compared", "clear_views")
+                                         if name in scored},
+                                      "component": int(other.label), "identity": int(identity[other.label]),
                                       "gap_s": proposal["gap_s"], "distance_m": proposal["distance_m"],
                                       "keys": other_keys, "proposed_after_recovery": True,
                                       "rule": proposal["source"].split(":")[-1],
@@ -738,7 +830,18 @@ def run(context: Context) -> StageResult:
     outputs = save_solution(context, solved, {
         "association_reused": state is not None,
         "recovered": {"positions_sha256": recovered["positions_sha256"], "count": recovered["count"]} if recovered else None})
-    unknowns = extract_unknowns(solved, info["resolved_keys"])
+    from .. import appearance
+    from ..tasks.carry import flagged_unsure
+
+    try:
+        embed_links = appearance.embedder(workspace, [camera.camera for camera in scene.cameras], context.log,
+                                          directory="appearance_links", incremental=True)
+    except Exception as exc:  # optional evidence: never fail the solve over it
+        context.log(f"appearance for ranking link candidates unavailable ({exc})", level="warning")
+        embed_links = None
+    ranked = rank_link_candidates(solved, embed_links, context.log)
+    answered = context.db.tasks(status="answered") + context.db.tasks(status="applied")
+    unknowns = extract_unknowns(solved, info["resolved_keys"], ranked=ranked, avoid=flagged_unsure(answered))
     unknowns.update(human_unknowns(solved, constraints))
     (workspace.round_dir(context.round) / "alignment_check.json").write_text(json.dumps(checked, indent=1), encoding="utf-8")
     unknowns["alignment"] = []

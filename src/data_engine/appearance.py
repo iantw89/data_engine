@@ -124,10 +124,18 @@ def prepare(image_bgr: np.ndarray, box) -> np.ndarray | None:
     return np.ascontiguousarray(crop.transpose(2, 0, 1).astype(np.float32))
 
 
-def embedder(workspace, camera_names: list[str], log: Callable[[str], None] = print) -> Callable | None:
+_MODELS: dict[str, tuple] = {}  # weights path -> (model, meta): one copy on the GPU however many embedders ask
+
+
+def embedder(workspace, camera_names: list[str], log: Callable[[str], None] = print, *,
+             directory: str = "appearance", incremental: bool = False) -> Callable | None:
     """``embed(rows_by_camera_index) -> [(row -> slot, unit vectors)] per camera`` for a workspace, or None when
     the model, its weights or a GPU are not available (the reason is logged). ``camera_names`` gives the camera
-    of every index (the scene's order)."""
+    of every index (the scene's order).
+
+    Embeddings are kept in ``evidence/<directory>``. By default a camera's file holds exactly the rows last
+    asked for (the swap check: its cue values then depend on its own choice of crops only). With
+    ``incremental`` the file is a cache that grows: only rows it does not hold are embedded."""
     site = workspace.site
     try:
         repo, weights = Path(site.repo("fast_reid")), Path(site.model("reid_fastreid"))
@@ -150,27 +158,62 @@ def embedder(workspace, camera_names: list[str], log: Callable[[str], None] = pr
     def embed(rows_by_camera: dict[int, np.ndarray]):
         from . import reid
 
-        if "model" not in state:
-            state["model"] = build_model(repo, weights)
-            state["meta"] = {"name": MODEL_NAME, "input_hw": list(INPUT_HW),
-                             "weights_sha256": hashlib.sha256(weights.read_bytes()).hexdigest()}
+        import json
+        import os
+
         scene_names = list(camera_names)
         wanted = {scene_names[index]: np.unique(np.asarray(rows, np.int64)) for index, rows in rows_by_camera.items()
                   if len(rows)}
-        out_dir = workspace.path("evidence", "appearance")
+        out_dir = workspace.path("evidence", directory)
+        held: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        if incremental and "sha" not in state:
+            state["sha"] = hashlib.sha256(weights.read_bytes()).hexdigest()
+        if incremental:
+            for camera in list(wanted):
+                path = out_dir / f"{camera}.npz"
+                if not path.is_file():
+                    continue
+                with np.load(path) as old:
+                    if json.loads(str(old["model"])).get("weights_sha256") != state["sha"]:
+                        continue  # another model: the cache starts again
+                    held[camera] = (old["rows"].astype(np.int64), old["embedding"])
+                wanted[camera] = np.setdiff1d(wanted[camera], held[camera][0])
+                if not len(wanted[camera]):
+                    del wanted[camera]
+        if wanted and "model" not in state:
+            if str(weights) not in _MODELS:
+                _MODELS[str(weights)] = (build_model(repo, weights), {
+                    "name": MODEL_NAME, "input_hw": list(INPUT_HW),
+                    "weights_sha256": state.get("sha") or hashlib.sha256(weights.read_bytes()).hexdigest()})
+            state["model"], state["meta"] = _MODELS[str(weights)]
         frames = {}
         for camera, rows in wanted.items():
             frames[camera] = np.unique(workspace.detections.camera(camera).frame_of_row[rows])
         if wanted:
-            reid.extract_embeddings(workspace, cameras=list(wanted), frames=frames, batch=64, out_dir=out_dir,
+            target = out_dir / "_new" if incremental else out_dir
+            reid.extract_embeddings(workspace, cameras=list(wanted), frames=frames, batch=64, out_dir=target,
                                     row_filter=lambda camera, rows: np.isin(rows, wanted[camera]),
                                     backend=(state["model"], state["meta"], prepare, DIM), log=log)
+            if incremental:
+                for camera in wanted:
+                    with np.load(target / f"{camera}.npz") as new:
+                        rows, vectors, model = new["rows"].astype(np.int64), new["embedding"], str(new["model"])
+                    if camera in held:
+                        rows = np.concatenate([held[camera][0], rows])
+                        vectors = np.concatenate([held[camera][1], vectors])
+                    order = np.argsort(rows, kind="stable")
+                    temporary = out_dir / f"{camera}.tmp.npz"
+                    np.savez(temporary, rows=rows[order].astype(np.int32), embedding=vectors[order], frames_hash="cache",
+                             model=model)
+                    os.replace(temporary, out_dir / f"{camera}.npz")
+                    (target / f"{camera}.npz").unlink()
+        asked = set(wanted) | set(held)
         result = []
         for index, camera in enumerate(scene_names):
             count = len(workspace.detections.camera(camera).boxes)
             slot = np.full(count, -1, np.int32)
             vectors = np.zeros((0, DIM), np.float32)
-            if camera in wanted and (out_dir / f"{camera}.npz").is_file():
+            if camera in asked and (out_dir / f"{camera}.npz").is_file():
                 rows, vectors = reid.load_embeddings(out_dir, camera)
                 slot[rows] = np.arange(len(rows), dtype=np.int32)
                 vectors = reid.l2_normalize(vectors)

@@ -177,6 +177,22 @@ RECIPE: dict[str, Any] = {
         # joined (the machinery is tested); that needs an independent check of each link first.
         "enabled": True, "apply": False, "max_laps_per_round": 6,
     },
+    "link_ranking": {
+        # NEW 2026-11-19 (solve/link_ranking.py, experiments/links/REPORT.md): the order in which the earlier
+        # tracks that could be a newly appearing person are shown in a re-identification question. Nothing
+        # here joins, excludes or closes anything: it is the order of the candidates, four at a time.
+        # Appearance is compared on crops from the 10 s of each track next to the gap, and only on CLEAR
+        # VIEWS: most of the skeleton found, the box not cut by the image border and not overlapped by
+        # another person's box, tall enough. Without a clear view of both tracks appearance is unknown.
+        "window_s": 10.0, "crops_per_camera": 6,
+        "min_joints": 13, "max_overlap": 0.2, "min_height_px": 96, "border_px": 4.0,
+        # Log-likelihood ratio same : different person of a cosine similarity, slope * (similarity - midpoint),
+        # per kind of comparison, limited to +-limit (golden reference, 350,000 pairs of 10 s windows).
+        "appearance": {"same_camera": [16.6, 0.46], "cross_camera": [4.4, 0.34], "limit": 6.0},
+        # Motion: the same person stayed (displacement about stay_m) or walked (walk_m + walk_mps x gap); a
+        # different person's track ended anywhere within room_m. Round numbers, checked not fitted.
+        "motion": {"stay": 0.5, "stay_m": 0.3, "walk_m": 0.5, "walk_mps": 0.5, "room_m": 8.0},
+    },
     "coverage": {
         # NEW 2026-11-18 (solve/coverage.py, experiments/coverage): recover positions inside and next
         # to tracks by reading poses where the person must be. A neighbouring measured pose within

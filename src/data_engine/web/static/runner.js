@@ -174,6 +174,7 @@ export async function renderRunner(root, id) {
       .map(([k, l]) => h('span', { class: 'hint' }, h('kbd', {}, k), ' ', l)));
     const answer = restoreAnswer || (task.status === 'answered' ? task.answer : null);
     if (answer && view.restore) { view.restore(answer); if (answer.notes) notes.value = answer.notes; }
+    else if (!answer && task.status === 'open' && view.prefill && task.known_flags) view.prefill(task.known_flags);
     window.scrollTo(0, 0);
     document.title = `#${task.id} ${t.title || ''} - Data Engine`;
     if (task.status === 'open' || task.status === 'answered') preloadNext(task);
@@ -501,6 +502,8 @@ function buildReference(ctx, task, sizes) {
 
   // ---- images and their flags
   const tiles = [];
+  const carried = {};  // flags pre-set from the person's answers to other tasks that show the same image
+  const isCarried = (key) => { const c = carried[key], f = s.images[key] || {}; return !!c && (f.exclude || null) === c.exclude && !!f.bad_pose === c.bad_pose; };
   let menu = null, hovered = null;
   const closeMenu = () => { if (menu) { menu.remove(); menu = null; } };
   closeFlagMenu = closeMenu;
@@ -638,6 +641,8 @@ function buildReference(ctx, task, sizes) {
     const out = Object.entries(counts).map(([flag, n]) => `${n} ${FLAG_TEXT[flag]}`);
     if (out.length) said.push(`Taken out: ${out.join(', ')}.`);
     if (bad) said.push(`${bad} bad pose${bad > 1 ? 's' : ''} reported.`);
+    const again = Object.keys(carried).filter(isCarried).length;
+    if (again) said.push(`${again} flag${again > 1 ? 's are' : ' is'} carried over from your earlier answers; undo any that does not hold here.`);
     return { warn, text: said.join(' ') };
   }
 
@@ -647,7 +652,9 @@ function buildReference(ctx, task, sizes) {
       t.wrap.classList.toggle('out', !!f.exclude);
       t.wrap.classList.toggle('bad', !!f.bad_pose);
       t.wrap.classList.toggle('flagged', !!(f.exclude || f.bad_pose));
-      t.state.textContent = [f.exclude ? FLAG_TEXT[f.exclude] : null, f.bad_pose ? 'bad pose' : null].filter(Boolean).join(' + ');
+      t.state.textContent = [f.exclude ? FLAG_TEXT[f.exclude] : null, f.bad_pose ? 'bad pose' : null].filter(Boolean).join(' + ')
+        + (isCarried(t.key) ? ` - you said so in #${carried[t.key].task}` : '');
+      t.wrap.classList.toggle('carried', isCarried(t.key));
     });
     candidates.forEach((c, i) => {
       const id = String(c.id), card = cardEls[i], live = alive(id), v = live ? s.values[id] : null;
@@ -729,6 +736,14 @@ function buildReference(ctx, task, sizes) {
       if (mode === 'duplicate') out.better = ids.length && s.values[ids[0]] === 'same' ? (s.better || 'equal') : null;
       if (otherBefore) out.other_before = bothSame() ? s.otherBefore : null;
       return out;
+    },
+    prefill(flags) {
+      for (const [key, f] of Object.entries(flags || {})) {
+        if (!tiles.some((t) => t.key === key)) continue;
+        carried[key] = { exclude: f.exclude || null, bad_pose: !!f.bad_pose, task: f.task };
+        s.images[key] = { exclude: carried[key].exclude, bad_pose: carried[key].bad_pose };
+      }
+      refresh();
     },
     restore(a) {
       for (const [id, v] of Object.entries(a.candidates || {})) if (id in s.values) s.values[id] = v;
