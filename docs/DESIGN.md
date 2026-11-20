@@ -169,6 +169,16 @@ not share a track with the rest of its group (cannot-link in the association), s
 leaves the track; an image left out as "unsure" is not shown again where the track has
 another one.
 
+The piece is the part of the camera's tracklet the solver handles as a unit; the
+single-camera tracker may have followed the same box for longer. When, after the solve,
+at least 5 detections of that tracker's tracklet within 15 s of the flagged image are
+still in the track, a `tracklet_purity` unknown asks a `continuity` question on that
+stretch, with the flagged image marked among the crops (`stages/solve.py: left_behind`;
+felix dry run: 4 of 23 flagged images, 9 to 78 detections each). "The track changes person
+at crop n" cuts the tracklet there and keeps each side together; "all one person" joins
+the neighbours to the flagged image, and they leave the track with it. Detections beyond a
+cut a person already confirmed are not asked about again.
+
 `swap_check` takes both: after the moment the two tracks then show one person. The reference
 is joined to both, and one more answer is asked for on the same screen, about the images of
 the other track just before the moment (shown for comparison in every swap check): the same
@@ -328,11 +338,10 @@ would close `pose_quality`.
   these" then closes the question as a separate person. Felix answers confirm matches up to
   118 s, so the limit cuts real matches off; it was left alone until the ranking has been
   used for a round (a wider window multiplies the candidates of every question).
-* An image flagged "someone else" leaves its track with its piece (the part of the
-  camera's tracklet the solver handles as a unit). Neighbouring pieces of the same
-  tracklet can stay in the track (felix dry run: 4 of 23 flagged images, 9 to 78
-  detections each); whether they show the other person too is not asked yet (it is a
-  continuity question on that tracklet).
+* A verdict "group A is not group B" can contradict the single-camera tracker in the same
+  way a flag on an image can: an image of A lies in a tracklet whose neighbouring detections
+  are in B's track (felix dry run: 14 cases). It is not asked about yet; unlike a flag on
+  one image, "all one person" would there contradict the verdict itself.
 * The ranking's motion model uses round numbers and its appearance curve was fitted on
   the golden recording; on the felix answers appearance orders well and motion adds little
   beyond what distance already gave (`experiments/links/REPORT.md`).
@@ -513,6 +522,16 @@ would close `pose_quality`.
   images left out as "unsure" are not shown again where the track has others: the
   reviewer was flagging the same image of a candidate track in question after question
   (9 of 58 flags on felix), because answers take effect only at the next round.
+* **2026-11-20 - neighbours of a flagged image; human cuts land on the right piece.** A
+  "someone else" flag takes the image's piece out of its track; the rest of the
+  single-camera tracklet around it could stay. It is now asked about (continuity question,
+  above). The answer "breaks here" records, besides the cut, that each side is one person
+  (`same` per side): the screen shows the answer that way, and without it the pieces between
+  the flagged image and the cut were bound to nothing. Found on the way and fixed
+  (`pipeline.unit_cuts`): a human cut names the tracker's tracklet, but the solver's pieces
+  are renumbered when Autofit evidence is used, so the cut was applied to an unrelated
+  piece and the intended one stayed whole. No cut had been applied in a real round yet
+  (felix: 2 waiting from swap checks).
 * **2026-11-19 - the comparison images of a swap check can be flagged (answer model 4).**
   The "other person before" images were display only; a mixed pose or another person among
   them could not be reported, and the "both" follow-up would have joined or cut on them.

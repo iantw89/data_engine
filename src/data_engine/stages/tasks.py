@@ -264,9 +264,14 @@ def purity_task(context: Context, unknown: dict) -> tuple[str, dict]:
     """A reviewer said two crops of one single-camera tracklet show different people: where does it change?"""
     detail = unknown["detail"]
     seconds, clock = time_text(context, detail.get("t"))
+    facts = {"detections in between": detail["detections"]}
+    if detail.get("flagged_crop"):
+        facts.update({"crop you flagged as someone else": detail["flagged_crop"],
+                      "detections still in the track": detail["left_in_track"]})
     payload = base_payload("continuity", f"Where does this track change person? {detail['camera']} at {clock}",
-                           detail["why"], {"detections in between": detail["detections"]}, seconds)
-    payload["panels"] = [panel(context, key, label=str(index + 1)) for index, key in enumerate(detail["keys"])]
+                           detail["why"], facts, seconds)
+    payload["panels"] = [panel(context, key, label=f"{index + 1} flagged" if key == detail.get("flagged_key") else str(index + 1))
+                         for index, key in enumerate(detail["keys"])]
     payload["reference_keys"] = detail["keys"]
     return "continuity", payload
 

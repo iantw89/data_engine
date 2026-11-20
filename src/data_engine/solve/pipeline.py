@@ -25,6 +25,9 @@ class Constraints:
     bad_pose: list[tuple[int, int]] = field(default_factory=list)  # rows whose keypoints a human reported as wrong
     demoted: list[tuple[int, int]] = field(default_factory=list)  # of two poses of one person, the worse one
     cuts: dict[int, list[int]] = field(default_factory=dict)  # tracklet -> window cuts (human splits)
+    # The 'different' pairs that are a flag on one image ("someone else": not the person the rest of its group
+    # shows), as (image rows, rows of the rest). They are in ``different`` too.
+    flagged: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = field(default_factory=list)
     # Track ids from an independent tracker, per camera per raw row (-1 = none). Used to cut 2D
     # tracklets where that tracker changes person and to propose links (see ``with_external_units``).
     external: list[np.ndarray] | None = None
@@ -159,6 +162,31 @@ def external_links(external: list[np.ndarray], atom_rows, atom_camera, atom_t, m
     return sorted(links)
 
 
+def unit_cuts(scene: Scene, cuts: dict[int, list[int]], window: int = 20) -> dict[int, list[int]]:
+    """Human cuts, which name the single-camera tracker's tracklets, for the tracklets of ``scene``.
+
+    The unit scene renumbers the tracklets (each is a piece of one of the tracker's). A cut of the tracker's
+    tracklet at a window belongs to the unit that has detections on both sides of it; applied under the
+    tracker's number it would cut an unrelated unit and leave the intended one whole."""
+    if not cuts:
+        return {}
+    result: dict[int, list[int]] = {}
+    for camera in scene.cameras:
+        source = getattr(camera, "source_tracklet", None)
+        if source is None:
+            return {int(tracklet): list(windows) for tracklet, windows in cuts.items()}  # not a unit scene
+        for tracklet, windows in cuts.items():
+            rows = np.flatnonzero((source == int(tracklet)) & (camera.t >= 0))
+            if not len(rows):
+                continue
+            at, unit = camera.t[rows] // window, camera.tracklet[rows]
+            for cut in sorted(set(int(w) for w in windows)):
+                for piece in np.unique(unit[at >= cut]):
+                    if piece >= 0 and (at[unit == piece] < cut).any():
+                        result.setdefault(int(piece), []).append(cut)
+    return result
+
+
 def unit_scene(scene: Scene, recipe: dict, constraints: Constraints) -> tuple[Scene, dict | None]:
     """The scene the solver works on: 2D tracklets cut where the independent tracker changes person."""
     if constraints.external is None:
@@ -202,7 +230,8 @@ def associate_and_refine(scene: Scene, recipe: dict, constraints: Constraints, *
                 evidence)
 
     started = time.time()
-    association = associate(scene, recipe, step=step, samples=samples, cuts=constraints.cuts, constraints=mapper)
+    association = associate(scene, recipe, step=step, samples=samples, cuts=unit_cuts(scene, constraints.cuts),
+                            constraints=mapper)
     timings["associate"] = time.time() - started
     row_atom = association.row_atom(scene)
     labels = recover.Labels(association.row_component(scene), row_atom,

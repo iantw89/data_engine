@@ -218,7 +218,14 @@ def _strip(workspace: Workspace, task: dict, round_number: int) -> tuple[int, bo
         if before and after:
             # 'split' cuts the tracklet at the first different crop and keeps the sides apart.
             _add(workspace, "split", before, after, task, round_number, first_different=index)
-            return 1, True
+            created = 1
+            # The screen shows the answer as "crops 1..n-1 one person, crops n.. another": each side is one
+            # person, so the pieces of a side stay together (a crop marked unclear is on neither side).
+            for side in (before, after):
+                if len(side) > 1:
+                    _add(workspace, "same", [side[0]], side[1:], task, round_number, reason="one side of a confirmed break")
+                    created += 1
+            return created, True
     return 0, False
 
 

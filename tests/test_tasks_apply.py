@@ -275,10 +275,13 @@ def test_strip_continuous_skips_unclear_crops(workspace):
 def test_strip_break_is_split_before_first_different(workspace):
     payload, keys = strip_payload()
     task = make_task(workspace, "continuity", "s", payload, {"verdict": "break", "first_different": 3, "unclear": [1]})
-    assert apply_task_answer(workspace, task, 2) == {"constraints": 1, "decided": True}
-    [row] = constraints(workspace)
+    assert apply_task_answer(workspace, task, 2) == {"constraints": 3, "decided": True}
+    row, before, after = constraints(workspace)
     assert (row["kind"], row["a"], row["b"]) == ("split", [keys[0], keys[2]], keys[3:])
     assert row["detail"]["first_different"] == 3
+    # each side is one person (the crop marked unclear is on neither): its pieces stay together
+    assert (before["kind"], before["a"], before["b"]) == ("same", [keys[0]], [keys[2]])
+    assert (after["kind"], after["a"], after["b"]) == ("same", [keys[3]], keys[4:])
 
 
 def test_strip_unclear_verdict_is_open(workspace):

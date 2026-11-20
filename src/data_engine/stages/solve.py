@@ -239,6 +239,8 @@ def load_constraints(context: Context, scene: Scene) -> tuple[Constraints, dict]
             constraints.same.append((a, b))
         elif kind == "different" and a and b:
             constraints.different.append((a, b))
+            if row["detail"].get("image_flag") == "other_person":
+                constraints.flagged.append((a, b))
         elif kind == "duplicate" and a and b:
             constraints.duplicate.append((a, b))
             constraints.same.append((a, b))
@@ -413,12 +415,87 @@ def apply_image_answers(scene: Scene, constraints: Constraints) -> None:
         camera.demoted[row] = True
 
 
+LEFT_BEHIND = {"reach_frames": 150, "min_detections": 5}  # which questions are asked, not what a label is
+
+
+def left_behind(solved: Solved, constraints: Constraints, seen: set | None = None) -> list[dict]:
+    """A person said a detection is not the person of a track ("someone else"), and its piece left that track -
+    but other detections of the same single-camera tracklet, right next to it, are still in the track.
+
+    The single-camera tracker followed one box through all of them. Either it changed person on the way
+    (where is a continuity question; its answer cuts the tracklet), or all of them show the flagged
+    detection's person and belong out of the track with it. Looked at: the tracker's own tracklet (not the
+    solver's pieces of it), ``reach_frames`` around the detection, and never across a cut a person already
+    confirmed - beyond it the tracklet is known to show somebody else."""
+    scene, labels, identity = solved.scene, solved.labels, solved.identity_of_label
+    seen = set() if seen is None else seen
+    reach, minimum = LEFT_BEHIND["reach_frames"], LEFT_BEHIND["min_detections"]
+    found = []
+
+    def identities(rows) -> set[int]:
+        result = set()
+        for camera_index, row in rows:
+            label = int(labels.label[camera_index][row])
+            if label >= 0:
+                result.add(int(identity[label]))
+        return result
+
+    # Only flags on single images. A verdict "group A is not group B" whose images share a tracklet with the
+    # other track is a contradiction too, but a different question (which of the two statements gives way).
+    for said, track_rows in constraints.flagged:
+        track = identities(track_rows)
+        if not track:
+            continue
+        for camera_index, row in said:
+            camera = scene.cameras[camera_index]
+            source = getattr(camera, "source_tracklet", camera.tracklet)
+            tracklet, t = int(source[row]), int(camera.t[row])
+            if tracklet < 0 or t < 0 or (camera_index, tracklet) in seen or identities([(camera_index, row)]) & track:
+                continue  # (still in the track: its piece could not be separated; the rule above asks)
+            rows = np.flatnonzero((source == tracklet) & (camera.t >= 0))
+            lo, hi = t - reach, t + reach
+            for cut in constraints.cuts.get(tracklet, []):  # a confirmed change of person bounds the search
+                if cut * WINDOW > t:
+                    hi = min(hi, cut * WINDOW - 1)
+                else:
+                    lo = max(lo, cut * WINDOW)
+            rows = rows[(camera.t[rows] >= lo) & (camera.t[rows] <= hi)]
+            label = labels.label[camera_index][rows]
+            still = rows[(label >= 0) & np.isin(identity[np.clip(label, 0, None)], sorted(track))]
+            if len(still) < minimum:
+                continue
+            seen.add((camera_index, tracklet))
+            first_t, last_t = min(t, int(camera.t[still].min())), max(t, int(camera.t[still].max()))
+            span = rows[(camera.t[rows] >= first_t) & (camera.t[rows] <= last_t)]
+            span = span[np.argsort(camera.t[span], kind="stable")]
+            picks = span[np.unique(np.linspace(0, len(span) - 1, min(10, len(span))).round().astype(int))]
+            if row not in picks:  # the flagged detection is always one of the crops
+                picks[np.argmin(np.abs(camera.t[picks] - t))] = row
+                picks = picks[np.argsort(camera.t[picks], kind="stable")]
+            keys = [camera.detections.key(int(pick)) for pick in picks]
+            flagged = camera.detections.key(int(row))
+            found.append({
+                "subject": f"tracklet_purity:{keys[0]}|{keys[-1]}", "severity": float(len(still)),
+                "detail": {"camera": camera.camera, "t": int((first_t + last_t) // 2), "span_t": [first_t, last_t],
+                           "detections": int(len(span)), "left_in_track": int(len(still)), "keys": keys,
+                           "flagged_key": flagged, "flagged_crop": keys.index(flagged) + 1,
+                           "why": f"a reviewer said crop {keys.index(flagged) + 1} is not the person of the track it "
+                                  f"was shown in, and its piece left that track - but {len(still)} detections of the "
+                                  "same single-camera track next to it are still in it. Either the single-camera "
+                                  "track changes person here, or all of these crops show the flagged crop's "
+                                  "person and they all leave the track",
+                           "resolve_by": "a human clicks the first crop that shows a different person than crop 1, "
+                                         "or says they all show one person"}})
+    return found
+
+
 def human_unknowns(solved: Solved, constraints: Constraints) -> dict[str, list[dict]]:
     """Questions that follow from what reviewers flagged on single images.
 
     tracklet_purity   a person said two detections are different people, and both lie in one piece of a
                       single-camera tracklet: the tracklet changes person somewhere between them. Where is a
-                      continuity question; its answer cuts the tracklet.
+                      continuity question; its answer cuts the tracklet. Also (``left_behind``): the flagged
+                      detection's piece left the track, but its neighbours in the same tracklet did not.
     pose_quality      a person reported a pose as wrong: open until it is corrected.
     """
     scene, labels = solved.scene, solved.labels
@@ -449,6 +526,7 @@ def human_unknowns(solved: Solved, constraints: Constraints) -> dict[str, list[d
                                       "and both belong to one single-camera track: the track changes person "
                                       "somewhere in between",
                                "resolve_by": "a human clicks the first crop that shows the other person"}})
+    purity.extend(left_behind(solved, constraints))
     quality = []
     for camera_index, row in sorted(set(constraints.bad_pose)):
         camera = scene.cameras[camera_index]
