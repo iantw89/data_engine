@@ -174,7 +174,8 @@ TASK_TYPES: dict[str, TaskType] = {task.name: task for task in [
         "Same/different pairs with their geometry features retrain the association accept/reject thresholds."),
     TaskType(
         "reidentify", "Re-identification across a gap",
-        "Which earlier person is reference A (seen again later)? Choose one, or 'none of these'.",
+        "Which of these earlier tracks show the same person as reference A (seen again later)? More than one "
+        "can be right when a person's track broke several times. Or 'none of these'.",
         "reference_candidates",
         {"reference_ok": "bool", "candidates": "{candidate id: 'same' | 'different' | 'unsure'}",
          "none_of_these": "bool (A is a person not among the candidates)", "notes": "str"},

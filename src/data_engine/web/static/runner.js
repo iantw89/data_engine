@@ -460,6 +460,9 @@ function buildReference(ctx, task, sizes) {
   const ref = p.reference || null;
   const refId = ref ? String(ref.id || 'A') : 'A';
   const singleChoice = !!p.single_choice, allowNone = p.allow_none !== false && task.type !== 'pose_ownership';
+  // Pairs of candidates that cannot both be the reference (tracked at the same time in different places).
+  const cannotBoth = p.cannot_both || [];
+  const conflict = () => cannotBoth.find((pair) => pair.ids.every((id) => s.values[String(id)] === 'same')) || null;
   const problemKinds = p.problem_kinds || PROBLEM_DEFAULTS[task.type] || [];
   const s = { refOk: true, none: false, values: Object.fromEntries(candidates.map((c) => [String(c.id), null])), problems: {} };
   const CYCLE = [null, 'same', 'different', 'unsure'];
@@ -502,11 +505,13 @@ function buildReference(ctx, task, sizes) {
     refCard && refCard.classList.toggle('bad', !s.refOk);
     const undecided = candidates.filter((c) => !s.values[String(c.id)]).length;
     const sames = Object.entries(s.values).filter(([, v]) => v === 'same').map(([k]) => k);
-    status.className = `cand-status ${s.refOk && (undecided || (singleChoice && sames.length > 1)) ? 'warn' : 'ok'}`;
+    const clash = conflict();
+    status.className = `cand-status ${s.refOk && (undecided || clash || (singleChoice && sames.length > 1)) ? 'warn' : 'ok'}`;
     status.textContent = !s.refOk ? `Reference ${refId} marked unusable - candidates are not needed.`
-      : undecided ? `${candidates.length - undecided}/${candidates.length} decided - ${undecided} still need Same / Different / Unsure.`
-        : singleChoice && sames.length > 1 ? `Only one candidate can be the same person (now ${sames.join(', ')}).`
-          : s.none ? `${refId} is none of these.` : sames.length ? `${refId} = ${sames.join(', ')}` : 'All decided.';
+      : clash ? `${clash.ids.join(' and ')} cannot both be ${refId}: ${clash.why}.`
+        : undecided ? `${candidates.length - undecided}/${candidates.length} decided - ${undecided} still need Same / Different / Unsure.`
+          : singleChoice && sames.length > 1 ? `Only one candidate can be the same person (now ${sames.join(', ')}).`
+            : s.none ? `${refId} is none of these.` : sames.length ? `${refId} = ${sames.join(' = ')}${sames.length > 1 ? ' (one person, several tracks)' : ''}` : 'All decided.';
   }
 
   const refCard = ref ? h('div', { class: 'ref-card' },
@@ -533,7 +538,7 @@ function buildReference(ctx, task, sizes) {
   };
   return {
     el,
-    hints: [['1-9', 'cycle same / different / unsure'], ['Shift+1-9', 'this one, rest different'], ['U', 'unsure for the rest'], ...(allowNone ? [['N', 'none of these']] : []), ['R', 'reference unusable']],
+    hints: [['1-9', singleChoice ? 'cycle same / different / unsure' : 'cycle same / different / unsure (several can be same)'], ['Shift+1-9', 'this one, rest different'], ['U', 'unsure for the rest'], ...(allowNone ? [['N', 'none of these']] : []), ['R', 'reference unusable']],
     help: [['1 ... 6', 'Cycle that candidate: same, different, unsure'], ['Shift + 1 ... 6', 'Mark that candidate the same person; undecided others become different'], ['U', 'Mark every undecided candidate "unsure"'],
       ...(allowNone ? [['N', 'The reference is none of the candidates (undecided ones become different)']] : []), ['R', 'Reference is unusable (mixed pose, not a person...)']],
     onKey(e) {
@@ -551,6 +556,8 @@ function buildReference(ctx, task, sizes) {
       if (undecided.length) return `Decide ${undecided.join(', ')} first (Same / Different / Unsure - Unsure is fine).`;
       const sames = Object.values(s.values).filter((v) => v === 'same').length;
       if (singleChoice && sames > 1) return 'Only one candidate can be the same person.';
+      const clash = conflict();
+      if (clash) return `${clash.ids.join(' and ')} cannot both be the same person: ${clash.why}.`;
       return null;
     },
     answer: () => ({ reference_ok: s.refOk, candidates: s.refOk ? { ...s.values } : {}, none_of_these: s.refOk && s.none, problems: { ...s.problems } }),

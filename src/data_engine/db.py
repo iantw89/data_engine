@@ -302,6 +302,14 @@ class Database:
         return {**dict(row), "payload": _loads(row["payload"], {}), "answer": _loads(row["answer"]),
                 "external": _loads(row["external"])}
 
+    def update_task(self, task_id: int, payload: dict, *, priority: float | None = None) -> bool:
+        """Replace the payload of a task that is still open (nobody has answered it). Returns whether it was."""
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET payload = ?, priority = COALESCE(?, priority) WHERE id = ? AND status = 'open'",
+                (json.dumps(payload), priority, int(task_id)))
+            return cursor.rowcount == 1
+
     def tasks(self, status: str | None = None, task_type: str | None = None, limit: int | None = None) -> list[dict]:
         clauses, parameters = [], []
         if status:

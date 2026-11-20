@@ -79,6 +79,9 @@ def _reference_candidates(payload: dict, answer: dict, problems: list[str]) -> d
         same = [cid for cid, v in values.items() if v == "same"]
         if payload.get("single_choice") and len(same) > 1:
             problems.append(f"only one candidate can be 'same' (got {', '.join(map(str, same))})")
+        for pair in payload.get("cannot_both") or []:
+            if all(str(cid) in {str(s) for s in same} for cid in pair["ids"]):
+                problems.append(f"{' and '.join(map(str, pair['ids']))} cannot both be 'same': {pair['why']}")
         if none_of and same:
             problems.append("'none of these' contradicts a candidate marked 'same'")
     else:

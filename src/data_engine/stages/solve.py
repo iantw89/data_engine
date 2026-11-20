@@ -295,6 +295,20 @@ def component_keys_at(scene: Scene, labels: recover.Labels, label: int, t: int, 
     return [key for _, key in sorted(options, reverse=True)[:count]]
 
 
+def measured_apart(first: tuple[np.ndarray, np.ndarray], second: tuple[np.ndarray, np.ndarray], *,
+                   min_common: int = 5, apart_m: float = 0.5) -> dict | None:
+    """Two tracks, each (sync indices, roots in inches), measured at the same instants in different places:
+    {"seconds", "distance_m"} - they are two people - or None when that cannot be said (too few common
+    instants, or they are at one place: one person tracked twice)."""
+    common, ia, ib = np.intersect1d(first[0], second[0], return_indices=True)
+    if len(common) < min_common:
+        return None
+    distance = float(np.median(np.linalg.norm(first[1][ia] - second[1][ib], axis=1))) * 0.0254
+    if distance <= apart_m:
+        return None
+    return {"seconds": round(len(common) / 10.0, 1), "distance_m": round(distance, 2)}
+
+
 def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[dict]]:
     scene, labels, association = solved.scene, solved.labels, solved.association
     cams = recover.camera_counts(scene, labels)
@@ -447,8 +461,23 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
     # Identity: components that start inside the recording without a predecessor.
     summaries = {s.label: s for s in solved.summaries if s is not None}
     identity_size: dict[int, int] = {}
+    identity_span: dict[int, list[int]] = {}  # first and last sync index at which the identity has a detection
     for summary in summaries.values():
-        identity_size[int(identity[summary.label])] = identity_size.get(int(identity[summary.label]), 0) + summary.detections
+        who = int(identity[summary.label])
+        identity_size[who] = identity_size.get(who, 0) + summary.detections
+        span = identity_span.setdefault(who, [summary.t_first, summary.t_last])
+        span[0], span[1] = min(span[0], summary.t_first), max(span[1], summary.t_last)
+    frame_identity = identity[solved.frames.label]
+    frame_measured = np.isfinite(solved.frames.root[:, 0])
+    tracks: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def track_of(who: int) -> tuple[np.ndarray, np.ndarray]:
+        """Measured positions of an identity: (sync indices, roots), one per instant."""
+        if who not in tracks:
+            rows = np.flatnonzero(frame_measured & (frame_identity == who))
+            times, first = np.unique(solved.frames.t[rows], return_index=True)
+            tracks[who] = (times, solved.frames.root[rows][first].astype(np.float64))
+        return tracks[who]
     brief = {"count": 0, "detections": 0, "examples": []}
     # Links only the recovered positions make decidable, not applied (RECIPE["relink"]["apply"]): later component -> link
     proposed = {link["to"]: link for event in solved.log for link in event.get("links_proposed_after_recovery", [])}
@@ -473,7 +502,8 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
             other_keys = component_keys_at(scene, labels, other.label, other.t_last - 5, count=3, tolerance=40)
             if other_keys:
                 candidates.append({"component": int(other.label), "identity": int(identity[other.label]),
-                                   "gap_s": option["gap_s"], "distance_m": option["distance_m"], "keys": other_keys})
+                                   "gap_s": option["gap_s"], "distance_m": option["distance_m"], "keys": other_keys,
+                                   "tracked_t": identity_span.get(int(identity[other.label]))})
         proposal = proposed.get(label)
         if proposal is not None and proposal["from"] in summaries:
             other = summaries[proposal["from"]]
@@ -483,13 +513,23 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
                 candidates.insert(0, {"component": int(other.label), "identity": int(identity[other.label]),
                                       "gap_s": proposal["gap_s"], "distance_m": proposal["distance_m"],
                                       "keys": other_keys, "proposed_after_recovery": True,
-                                      "rule": proposal["source"].split(":")[-1]})
+                                      "rule": proposal["source"].split(":")[-1],
+                                      "tracked_t": identity_span.get(int(identity[other.label]))})
             else:
                 proposal = None
+        candidates = candidates[:4]
+        # A person whose track broke several times has several earlier tracks: more than one candidate can be
+        # the same person. Two candidates measured at the same instants in different places cannot.
+        cannot_both = []
+        for i, first in enumerate(candidates):
+            for second in candidates[i + 1:]:
+                apart = measured_apart(track_of(first["identity"]), track_of(second["identity"]))
+                if apart is not None:
+                    cannot_both.append({"components": [first["component"], second["component"]], **apart})
         unknowns["identity_link"].append({
             "subject": f"identity_link:{keys[0]}", "severity": float(summaries[label].detections),
             "detail": {"component": int(label), "identity": int(identity[label]), "t": int(end["t"]),
-                       "reference_keys": keys, "candidates": candidates[:4],
+                       "reference_keys": keys, "candidates": candidates, "cannot_both": cannot_both,
                        "feasible_candidates": len(end["candidates"]),
                        "why": "this person appears inside the recording; "
                               + ("several earlier people could have reached this spot" if len(end["candidates"]) > 1

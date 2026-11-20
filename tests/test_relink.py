@@ -279,3 +279,17 @@ def test_links_through_recovered_positions_are_proposed_unless_the_recipe_applie
     link = applied.links.accepted[0]
     assert link["after_recovery"] and link["end_moved_s"] == 8.0 and link["gap_s"] == 3.1
     assert not applied.log[-1]["links_proposed_after_recovery"]
+
+
+# --------------------------------------------------------------------------- which candidates exclude each other
+
+
+def test_two_tracks_measured_at_the_same_time_in_different_places_are_two_people():
+    t = np.arange(100, 160)
+    here = np.tile([0.0, 0.0, 36.0], (len(t), 1))
+    there = here + [3.0 * METRE, 0.0, 0.0]
+    apart = solve_stage.measured_apart((t, here), (t[20:], there[20:]))
+    assert apart == {"seconds": 4.0, "distance_m": 3.0}
+    assert solve_stage.measured_apart((t, here), (t + 100, there)) is None, "one after the other: could be one person"
+    assert solve_stage.measured_apart((t, here), (t, here + [0.2 * METRE, 0, 0])) is None, "one place: one person tracked twice"
+    assert solve_stage.measured_apart((t, here), (t[:3], there[:3])) is None, "three common instants prove nothing"

@@ -153,7 +153,7 @@ def make_tasks(workspace: Workspace, round_number: int, rng: random.Random) -> l
             {"gap seconds": 12.0, "endpoint distance m": round(rng.uniform(1.0, 6.0), 1), "ReID margin": round(rng.uniform(0.01, 0.07), 3)}, ref["frame"] / FPS),
             "reference": {"id": "A", "caption": f"later: {ref['camera']} f{ref['frame']}", "panels": [panel(ref, "A")]},
             "candidates": [{"id": "BCD"[i], "caption": f"earlier: {c['camera']} f{c['frame']}", "panels": [panel(c, "BCD"[i], COLORS[i])], "track": 20 + i} for i, c in enumerate(cands)],
-            "allow_none": True, "single_choice": True}, priority=6 - n)
+            "allow_none": True, "single_choice": False}, priority=6 - n)
 
     # detection triage
     for n in range(2):

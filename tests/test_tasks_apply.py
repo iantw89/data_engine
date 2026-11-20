@@ -450,3 +450,74 @@ def test_swap_neither_candidate_closes_the_question(workspace, context):
     assert apply_task_answer(workspace, task, 2) == {"constraints": 1, "decided": True}
     row = constraints(workspace, "undeterminable")[0]
     assert row["a"] == REF and row["detail"]["reason"] == "neither_candidate"
+
+
+# --------------------------------------------------------------------------- one person, several earlier tracks
+
+
+def fragmented_identity(context, cannot_both=()):
+    """Reference A and three earlier tracks; B and C are tracked one after the other, D at the same time as C."""
+    unknown = {"detail": {"identity": 3, "t": 3000, "reference_keys": REF, "feasible_candidates": 3, "why": "w",
+                          "cannot_both": list(cannot_both),
+                          "candidates": [
+                              {"component": 4, "identity": 1, "gap_s": 3.0, "distance_m": 0.4, "keys": CAND_B, "tracked_t": [100, 900]},
+                              {"component": 5, "identity": 2, "gap_s": 90.0, "distance_m": 0.6, "keys": CAND_C, "tracked_t": [1200, 2100]},
+                              {"component": 6, "identity": 7, "gap_s": 95.0, "distance_m": 2.0, "keys": ["4/9/0"], "tracked_t": [1500, 2050]}]}}
+    return stage_tasks.identity_task(context, unknown)
+
+
+def test_reidentify_lets_several_earlier_tracks_be_the_same_person(workspace, context):
+    from data_engine.web.validate import AnswerError, validate_answer
+
+    task_type, payload = fragmented_identity(
+        context, cannot_both=[{"components": [5, 6], "seconds": 55.0, "distance_m": 3.2}])
+    assert payload["single_choice"] is False
+    assert "tracked 0:10.0 to 1:30.0" in payload["candidates"][0]["caption"]
+    assert payload["cannot_both"] == [{"ids": ["C", "D"], "why": "they are tracked at the same time for 55.0 s, 3.2 m apart: two people"}]
+    answer = {"reference_ok": True, "candidates": {"B": "same", "C": "same", "D": "different"}}
+    assert validate_answer(payload["ui"], payload, answer)["candidates"] == answer["candidates"]
+    with pytest.raises(AnswerError, match="C and D cannot both be 'same'"):
+        validate_answer(payload["ui"], payload, {"reference_ok": True, "candidates": {"B": "same", "C": "same", "D": "same"}})
+
+    task = make_task(workspace, task_type, "s", payload, answer)
+    result = apply_task_answer(workspace, task, 2)
+    assert result == {"constraints": 3, "decided": True}
+    assert [(r["kind"], r["a"], r["b"]) for r in constraints(workspace)] == [
+        ("same", REF, CAND_B), ("same", REF, CAND_C), ("different", REF, ["4/9/0"])]
+
+
+def test_cross_camera_match_still_takes_one_candidate(context):
+    from data_engine.web.validate import AnswerError, validate_answer
+
+    _, payload = association(context)
+    assert payload["single_choice"] is True  # its candidates are people tracked at the same instant
+    with pytest.raises(AnswerError, match="only one"):
+        validate_answer(payload["ui"], payload, {"reference_ok": True, "candidates": {"B": "same", "C": "same"}})
+
+
+def test_open_tasks_follow_the_current_solve_and_answered_ones_do_not(workspace, context):
+    db = workspace.db
+
+    def report(candidates):
+        db.report_unknowns("solve", "identity_link", [{"subject": "identity_link:0/10/0", "severity": 500.0, "detail": {
+            "identity": 3, "t": 300, "reference_keys": REF, "feasible_candidates": len(candidates), "why": "w",
+            "candidates": candidates}}], 1)
+
+    one = {"component": 4, "identity": 1, "gap_s": 3.0, "distance_m": 1.0, "keys": CAND_B}
+    two = {"component": 5, "identity": 2, "gap_s": 4.0, "distance_m": 2.0, "keys": CAND_C}
+    report([one])
+    stage_tasks.run(context)
+    task = db.tasks(status="open")[0]
+    assert [c["id"] for c in task["payload"]["candidates"]] == ["B"]
+
+    report([two, one])  # the next solve: another candidate, shown first
+    result = stage_tasks.run(context)
+    assert result.metrics["refreshed"] == 1 and result.metrics["created_total"] == 0
+    same_task = db.tasks(status="open")[0]
+    assert same_task["id"] == task["id"] and [c["track"] for c in same_task["payload"]["candidates"]] == [2, 1]
+    assert stage_tasks.run(context).metrics["refreshed"] == 0, "nothing changed: nothing is rewritten"
+
+    db.answer_task(task["id"], {"reference_ok": True, "candidates": {"B": "same", "C": "different"}}, "ian")
+    report([one])
+    assert stage_tasks.run(context).metrics["refreshed"] == 0
+    assert len(db.task(task["id"])["payload"]["candidates"]) == 2, "an answered task keeps what the person saw"

@@ -142,16 +142,28 @@ def identity_task(context: Context, unknown: dict) -> tuple[str, dict]:
     payload["reference"] = {"id": "A", "caption": f"person {detail['identity']}, just after appearing",
                             "panels": [panel(context, key, label="A") for key in detail["reference_keys"]]}
     payload["candidates"] = []
+    letter_of = {}
     for index, candidate in enumerate(detail["candidates"]):
         letter = chr(ord("B") + index)
+        letter_of[candidate["component"]] = letter
+        tracked = ""
+        if candidate.get("tracked_t"):
+            tracked = f", tracked {time_text(context, candidate['tracked_t'][0])[1]} to {time_text(context, candidate['tracked_t'][1])[1]}"
         payload["candidates"].append({
             "id": letter, "track": candidate["identity"],
             "caption": f"person {candidate['identity']}, last seen {candidate['gap_s']} s earlier, "
-                       f"{candidate['distance_m']} m away",
+                       f"{candidate['distance_m']} m away{tracked}"
+                       + (" - the only one that fits once recovered positions are known" if candidate.get("proposed_after_recovery") else ""),
             "panels": [panel(context, key, label=letter, color=COLORS[index % len(COLORS)])
                        for key in candidate["keys"]],
             "keys": candidate["keys"], "component": candidate["component"]})
-    payload.update({"allow_none": True, "single_choice": True, "reference_keys": detail["reference_keys"]})
+    # Several candidates can be the same person (a track that broke more than once). Only two candidates that
+    # are measured at the same time in different places exclude each other.
+    payload["cannot_both"] = [
+        {"ids": [letter_of[a], letter_of[b]],
+         "why": f"they are tracked at the same time for {pair['seconds']} s, {pair['distance_m']} m apart: two people"}
+        for pair in detail.get("cannot_both", []) for a, b in [pair["components"]] if a in letter_of and b in letter_of]
+    payload.update({"allow_none": True, "single_choice": False, "reference_keys": detail["reference_keys"]})
     return "reidentify", payload
 
 
@@ -284,6 +296,27 @@ def run(context: Context) -> StageResult:
         if task["subject"] not in live_subjects:
             db.set_task_status(task["id"], "superseded")
             superseded += 1
+    # An open task shows the question as the last solve states it: candidates, their track numbers and what
+    # can be answered may have changed since the task was created. Answered tasks are never touched.
+    refreshed = 0
+    by_subject = {unknown["subject"]: unknown for unknown in open_unknowns}
+    for task in db.tasks(status="open"):
+        unknown, builder = by_subject.get(task["subject"]), None
+        if unknown is not None:
+            builder = BUILDERS.get(unknown["kind"])
+        if builder is None:
+            continue
+        try:
+            task_type, payload = builder(context, unknown)
+        except (KeyError, IndexError, ValueError):
+            continue
+        if task_type != task["type"]:
+            continue
+        payload["unknown"] = {"id": unknown["id"], "kind": unknown["kind"], "subject": unknown["subject"],
+                              "meaning": KINDS[unknown["kind"]].meaning}
+        if json.dumps(payload, sort_keys=True) != json.dumps(task["payload"], sort_keys=True):
+            db.update_task(task["id"], payload, priority=unknown["severity"])
+            refreshed += 1
     budget = dict(ROUND_BUDGET)
     for task in db.tasks(status="open"):
         budget[task["type"]] = budget.get(task["type"], 0) - 1
@@ -312,9 +345,10 @@ def run(context: Context) -> StageResult:
             created[task_type] = created.get(task_type, 0) + 1
             budget[task_type] -= 1
     total = sum(created.values())
-    metrics = {"created": created, "created_total": total, "withdrawn": superseded,
+    metrics = {"created": created, "created_total": total, "withdrawn": superseded, "refreshed": refreshed,
                "held_back_by_round_budget": skipped_budget, "not_repeated_after_unsure": skipped_unsure,
                "open_tasks": len(db.tasks(status="open")), "build_failures": failed}
     message = (f"{total} new tasks ({', '.join(f'{n} {t}' for t, n in created.items()) or 'none'}); "
-               f"{skipped_budget} unknowns held back for a later round")
+               + (f"{refreshed} open tasks updated to the current solve; " if refreshed else "")
+               + f"{skipped_budget} unknowns held back for a later round")
     return StageResult(metrics=metrics, message=message)
