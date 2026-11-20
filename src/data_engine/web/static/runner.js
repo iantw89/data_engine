@@ -6,11 +6,6 @@ const PREF = {
   set(key, value) { try { localStorage.setItem(`de.${key}`, JSON.stringify(value)); } catch (_) { /* ignore */ } },
 };
 
-const PROBLEM_DEFAULTS = {
-  cross_view_match: ['mixed_pose', 'not_person', 'wrong_box', 'identity_switch'],
-  pose_ownership: ['mixed_pose', 'duplicate', 'wrong_box'],
-};
-
 // Image sizes: a moderate first request, then a sharper one; sized by how many images share the screen.
 function plan(task) {
   const p = task.payload;
@@ -44,6 +39,7 @@ export async function renderRunner(root, id) {
   try {
     const tax = await api('/api/taxonomy');
     ctx.taxonomy = Object.fromEntries(tax.task_types.map((t) => [t.name, t]));
+    ctx.answerModel = tax.answer_model || 1;  // what this server understands; older servers drop image flags
   } catch (_) { /* titles fall back to ids */ }
 
   // ---------------------------------------------------------------- frame
@@ -173,7 +169,7 @@ export async function renderRunner(root, id) {
       task.status !== 'open' ? h('p', { class: 'warn-text' }, ctx.readOnly ? `This task is ${task.status}; its answer is already part of a round and cannot be changed here.` : `Already answered by ${task.answered_by || 'someone'}; submitting replaces that answer.`) : null);
     stage.replaceChildren(h('article', { class: `task ui-${task.ui}`, dataset: { taskId: task.id, ui: task.ui } },
       info, view.el,
-      h('footer', { class: 'actions' }, message, notes, h('div', { class: 'action-buttons' }, backBtn, skipBtn, submitBtn))));
+      h('footer', { class: 'actions' }, view.outcome || null, message, notes, h('div', { class: 'action-buttons' }, backBtn, skipBtn, submitBtn))));
     setChildren(keybar, [...(view.hints || []), ['Enter', 'submit'], ['S', 'skip'], ['Bksp', 'undo previous'], ['C', 'room view'], ['/', 'notes'], ['?', 'help']]
       .map(([k, l]) => h('span', { class: 'hint' }, h('kbd', {}, k), ' ', l)));
     const answer = restoreAnswer || (task.status === 'answered' ? task.answer : null);
@@ -278,6 +274,7 @@ export async function renderRunner(root, id) {
     const tag = (e.target.tagName || '').toLowerCase();
     const typing = tag === 'input' || tag === 'textarea' || tag === 'select';
     if (e.key === 'Escape') {
+      if (closeFlagMenu) closeFlagMenu();
       if (lightbox) return closeLightbox();
       if (helpNode) return toggleHelp();
       if (typing) e.target.blur();
@@ -453,117 +450,253 @@ function buildStrip(ctx, task, sizes) {
   };
 }
 
-// ---------------------------------------------------------------- reference + candidates
+// ---------------------------------------------------------------- groups of images: reference + candidates
+// Any image can be flagged. Three flags take the image out of its group - the answer then applies to the
+// images that remain - and 'bad pose' leaves it in and reports the keypoints (taxonomy.IMAGE_FLAGS).
+const IMAGE_FLAGS = [
+  ['other_person', 'X', 'Someone else', 'not the person the rest of this group shows'],
+  ['mixed', 'M', 'Two people in one pose', 'the skeleton takes joints from two people'],
+  ['not_person', 'N', 'Not a person', 'reflection, poster, equipment'],
+];
+const FLAG_TEXT = { other_person: 'someone else', mixed: 'two people in one pose', not_person: 'not a person' };
+let closeFlagMenu = null;
+document.addEventListener('click', () => { if (closeFlagMenu) closeFlagMenu(); });
+
 function buildReference(ctx, task, sizes) {
   const p = task.payload;
   const candidates = p.candidates || [];
   const ref = p.reference || null;
   const refId = ref ? String(ref.id || 'A') : 'A';
-  const singleChoice = !!p.single_choice, allowNone = p.allow_none !== false && task.type !== 'pose_ownership';
-  // Pairs of candidates that cannot both be the reference (tracked at the same time in different places).
+  // What is asked: 'match' (is each candidate the reference's person), 'person' (is the reference a real
+  // person), 'duplicate' (two poses: one person or two). Older payloads do not say; the task type does.
+  const mode = p.mode || (task.type === 'detection_triage' || !candidates.length ? 'person' : task.type === 'pose_ownership' ? 'duplicate' : 'match');
+  const multiple = p.multiple !== undefined ? !!p.multiple : task.type === 'reidentify';
   const cannotBoth = p.cannot_both || [];
-  const conflict = () => cannotBoth.find((pair) => pair.ids.every((id) => s.values[String(id)] === 'same')) || null;
-  const problemKinds = p.problem_kinds || PROBLEM_DEFAULTS[task.type] || [];
-  const s = { refOk: true, none: false, values: Object.fromEntries(candidates.map((c) => [String(c.id), null])), problems: {} };
+  const texts = p.texts || {};
+  const keyOf = (panel) => (panel.highlight && panel.highlight[0]) || null;
+  const groups = {};
+  if (ref) groups[refId] = (ref.panels || []).map(keyOf).filter(Boolean);
+  candidates.forEach((c) => { groups[String(c.id)] = (c.panels || []).map(keyOf).filter(Boolean); });
+  const ids = candidates.map((c) => String(c.id));
+  const s = { images: {}, values: Object.fromEntries(ids.map((id) => [id, null])), verdict: null, better: null };
+  const flagOf = (key) => (s.images[key] || {}).exclude || null;
+  const kept = (gid) => (groups[gid] || []).filter((key) => !flagOf(key));
+  const refAlive = () => !ref || kept(refId).length > 0;
+  const alive = (id) => refAlive() && kept(id).length > 0;
+  const conflict = () => cannotBoth.find((pair) => pair.ids.every((id) => alive(String(id)) && s.values[String(id)] === 'same')) || null;
+
+  // ---- images and their flags
+  const tiles = [];
+  let menu = null, hovered = null;
+  const closeMenu = () => { if (menu) { menu.remove(); menu = null; } };
+  closeFlagMenu = closeMenu;
+  const entry = (key) => (s.images[key] = s.images[key] || { exclude: null, bad_pose: false });
+  function setFlag(key, flag) {
+    const e = entry(key);
+    e.exclude = e.exclude === flag ? null : flag;
+    if (e.exclude === 'mixed' || e.exclude === 'not_person') e.bad_pose = false;
+    refresh();
+  }
+  function toggleBad(key) {
+    const e = entry(key);
+    if (e.exclude === 'mixed' || e.exclude === 'not_person') return;
+    e.bad_pose = !e.bad_pose;
+    refresh();
+  }
+  function openMenu(key, gid, wrap) {
+    const again = menu && menu.dataset.key === key;
+    closeMenu();
+    if (again) return;
+    const cur = s.images[key] || {};
+    const alone = (groups[gid] || []).length < 2;
+    const item = (label, hint, on, act, k) => h('button', { type: 'button', class: `flag-item ${on ? 'on' : ''}`, role: 'menuitemcheckbox', 'aria-checked': String(!!on),
+      onclick: (e) => { e.stopPropagation(); act(); closeMenu(); } }, h('span', { class: 'flag-label' }, label), h('span', { class: 'flag-hint' }, hint), h('kbd', {}, k));
+    menu = h('div', { class: 'flag-menu', role: 'menu', dataset: { key }, onclick: (e) => e.stopPropagation() },
+      h('div', { class: 'flag-head' }, 'Take this image out - it shows'),
+      IMAGE_FLAGS.filter(([flag]) => !(flag === 'other_person' && alone)).map(([flag, k, label, hint]) => item(label, hint, cur.exclude === flag, () => setFlag(key, flag), k)),
+      h('div', { class: 'flag-head' }, 'Or keep it, and report'),
+      item('Bad pose', 'right person, keypoints wrong', !!cur.bad_pose, () => toggleBad(key), 'P'));
+    wrap.append(menu);
+  }
+  function tile(panel, gid) {
+    const key = keyOf(panel);
+    const fig = panelFigure(ctx, panel, { lo: sizes.lo, hi: sizes.hi });
+    if (!key) return fig;
+    const state = h('div', { class: 'img-state' });
+    const flagBtn = h('button', { type: 'button', class: 'flag-btn', title: 'Flag this image: someone else (X), two people in one pose (M), not a person (N), bad pose (P)', 'aria-label': 'Flag this image', 'aria-haspopup': 'menu',
+      onclick: (e) => { e.stopPropagation(); openMenu(key, gid, wrap); } }, '⚑');
+    const wrap = h('div', { class: 'img-tile', dataset: { key } }, fig, flagBtn, state);
+    wrap.addEventListener('mouseenter', () => { hovered = { key, gid }; });
+    wrap.addEventListener('mouseleave', () => { if (hovered && hovered.key === key) hovered = null; });
+    tiles.push({ key, gid, wrap, state });
+    return wrap;
+  }
+  const images = (panels, gid) => h('div', { class: 'panel-row' }, (panels || []).map((panel) => tile(panel, gid)));
+
+  // ---- answers
+  const LABEL = mode === 'duplicate' ? { same: 'One person', different: 'Two people', unsure: 'Unsure' } : { same: 'Same', different: 'Different', unsure: 'Unsure' };
   const CYCLE = [null, 'same', 'different', 'unsure'];
-  const LABEL = { same: 'Same', different: 'Different', unsure: 'Unsure' };
-
-  const problemSelect = (id) => !problemKinds.length ? null : h('select', { class: 'problem', 'aria-label': `Problem with ${id}`, title: 'Flag a problem with this crop (optional)',
-    onchange: (e) => { if (e.target.value) s.problems[id] = e.target.value; else delete s.problems[id]; } },
-    h('option', { value: '' }, 'no problem'), problemKinds.map((k) => h('option', { value: k }, k.replace(/_/g, ' '))));
-
   const cardEls = candidates.map((c, idx) => {
     const id = String(c.id);
     const buttons = ['same', 'different', 'unsure'].map((v) => h('button', { type: 'button', class: `choice ${v}`, 'aria-pressed': 'false', dataset: { value: v },
       onclick: () => { s.values[id] = s.values[id] === v ? null : v; refresh(); } }, LABEL[v]));
+    const note = h('span', { class: 'muted small' });
     const card = h('div', { class: 'cand', dataset: { cand: id } },
       h('div', { class: 'cand-head' }, h('span', { class: 'num-badge' }, idx + 1), h('strong', {}, `${id}`), h('span', { class: 'muted cap' }, c.caption || ''),
         c.track !== null && c.track !== undefined ? h('span', { class: 'chip small' }, `track ${c.track}`) : null),
-      panelRow(ctx, c.panels, { lo: sizes.lo, hi: sizes.hi }),
-      h('div', { class: 'cand-controls' }, h('div', { class: 'seg', role: 'group', 'aria-label': `Is ${id} the same person as ${refId}?` }, buttons), problemSelect(id)));
-    card._buttons = buttons;
+      images(c.panels, id),
+      h('div', { class: 'cand-controls' }, h('div', { class: 'seg', role: 'group', 'aria-label': `Is ${id} the same person as ${refId}?` }, buttons), note));
+    card._buttons = buttons; card._note = note;
     return card;
   });
-
-  const refOkBtn = h('button', { type: 'button', class: 'btn small', 'aria-pressed': 'false', onclick: () => { s.refOk = !s.refOk; refresh(); } }, `Reference unusable (R)`);
-  const noneBtn = allowNone ? h('button', { type: 'button', class: 'btn small', 'aria-pressed': 'false', onclick: () => setNone(!s.none) }, 'None of these (N)') : null;
+  const verdictBtns = mode !== 'person' ? [] : [['person', 'Real person', 'same'], ['not_person', 'Not a person', 'different'], ['unsure', 'Unsure', 'unsure']].map(([v, label, cls]) =>
+    h('button', { type: 'button', class: `choice ${cls}`, 'aria-pressed': 'false', dataset: { value: v }, onclick: () => { s.verdict = s.verdict === v ? null : v; refresh(); } }, label));
+  const betterBtns = mode !== 'duplicate' || !ids.length ? [] : [[refId, `${refId} is better`], [ids[0], `${ids[0]} is better`], ['equal', 'No difference']].map(([v, label]) =>
+    h('button', { type: 'button', class: 'choice better', 'aria-pressed': 'false', dataset: { value: v }, onclick: () => { s.better = v; refresh(); } }, label));
+  const betterRow = betterBtns.length ? h('div', { class: 'better-row' }, h('span', {}, 'They are one person. Which pose should be used?'),
+    h('div', { class: 'seg', role: 'group', 'aria-label': 'Which pose is better' }, betterBtns)) : null;
   const status = h('div', { class: 'cand-status', 'aria-live': 'polite' });
 
-  function setNone(v) {
-    s.none = v;
-    if (v) for (const id of Object.keys(s.values)) { if (s.values[id] === 'same') s.values[id] = null; if (!s.values[id]) s.values[id] = 'different'; }
-    refresh();
+  const fill = (text, who, n) => String(text || '').replace('{ref}', refId).replace('{ids}', who || '').replace('{n}', n === undefined ? '' : n);
+  // What this answer will do, in words; `warn` is what still has to be answered before it can be sent.
+  function summary() {
+    const said = [];
+    let warn = null;
+    for (const t of tiles) if (flagOf(t.key) === 'other_person' && !kept(t.gid).length) warn = `"Someone else" needs one image of ${t.gid} left as the person the others differ from. Leave one unflagged, or use "not a person" / "two people in one pose".`;
+    if (!warn && !refAlive()) said.push(`No image of ${refId} is left: the flags are the whole answer.`);
+    else if (!warn && mode === 'person') {
+      if (s.verdict === 'person') said.push(texts.person || 'A real person.');
+      else if (s.verdict === 'not_person') said.push(texts.not_person || 'Not a person.');
+      else if (s.verdict === 'unsure') said.push('Unsure: nothing is recorded about the person, and the question stays open.');
+      else warn = 'Real person, not a person, or unsure?';
+    } else if (!warn) {
+      const live = ids.filter((id) => kept(id).length);
+      const undecided = live.filter((id) => !s.values[id]);
+      const sames = live.filter((id) => s.values[id] === 'same');
+      const clash = conflict();
+      if (clash) warn = `${clash.ids.join(' and ')} cannot both be ${refId}: ${clash.why}.`;
+      else if (!multiple && sames.length > 1) warn = `Only one of these can be ${refId} (now ${sames.join(', ')}).`;
+      else if (undecided.length) warn = `${undecided.join(', ')} still need${undecided.length === 1 ? 's' : ''} an answer - Unsure is a valid one.`;
+      else if (!live.length) said.push('No candidate has an image left to compare: the flags are the whole answer.');
+      else if (mode === 'duplicate') {
+        const v = s.values[live[0]];
+        if (v === 'same') said.push(`${texts.same || 'One person with two poses.'}${s.better && s.better !== 'equal' ? ` Pose ${s.better} is the one used.` : ''}`);
+        else said.push(v === 'different' ? (texts.different || 'Two people.') : 'Unsure: nothing is recorded, and the question stays open.');
+      } else if (sames.length) {
+        const special = sames.map((id) => candidates.find((c) => String(c.id) === id).if_same).filter(Boolean);
+        said.push(special.length ? special.join(' ') : fill(texts.same || '{ref} is {ids}.', sames.join(' and ')));
+      } else if (live.every((id) => s.values[id] === 'different')) {
+        said.push(p.more_candidates ? fill(texts.none_more || '{ref} is none of these.', '', p.more_candidates) : fill(texts.none_closed || '{ref} is none of these.'));
+      } else said.push('With "unsure" among the answers the question stays open; every "different" is still recorded.');
+    }
+    const counts = {};
+    let bad = 0;
+    Object.values(s.images).forEach((f) => { if (f.exclude) counts[f.exclude] = (counts[f.exclude] || 0) + 1; if (f.bad_pose) bad++; });
+    const out = Object.entries(counts).map(([flag, n]) => `${n} ${FLAG_TEXT[flag]}`);
+    if (out.length) said.push(`Taken out: ${out.join(', ')}.`);
+    if (bad) said.push(`${bad} bad pose${bad > 1 ? 's' : ''} reported.`);
+    return { warn, text: said.join(' ') };
   }
+
   function refresh() {
-    candidates.forEach((c, i) => {
-      const id = String(c.id), v = s.values[id], card = cardEls[i];
-      card.className = `cand ${v ? 'v-' + v : 'undecided'} ${s.refOk ? '' : 'disabled'}`;
-      card._buttons.forEach((b) => { const on = b.dataset.value === v; b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); });
+    tiles.forEach((t) => {
+      const f = s.images[t.key] || {};
+      t.wrap.classList.toggle('out', !!f.exclude);
+      t.wrap.classList.toggle('bad', !!f.bad_pose);
+      t.wrap.classList.toggle('flagged', !!(f.exclude || f.bad_pose));
+      t.state.textContent = [f.exclude ? FLAG_TEXT[f.exclude] : null, f.bad_pose ? 'bad pose' : null].filter(Boolean).join(' + ');
     });
-    refOkBtn.setAttribute('aria-pressed', String(!s.refOk)); refOkBtn.classList.toggle('active', !s.refOk);
-    if (noneBtn) { noneBtn.setAttribute('aria-pressed', String(s.none)); noneBtn.classList.toggle('active', s.none); }
-    refCard && refCard.classList.toggle('bad', !s.refOk);
-    const undecided = candidates.filter((c) => !s.values[String(c.id)]).length;
-    const sames = Object.entries(s.values).filter(([, v]) => v === 'same').map(([k]) => k);
-    const clash = conflict();
-    status.className = `cand-status ${s.refOk && (undecided || clash || (singleChoice && sames.length > 1)) ? 'warn' : 'ok'}`;
-    status.textContent = !s.refOk ? `Reference ${refId} marked unusable - candidates are not needed.`
-      : clash ? `${clash.ids.join(' and ')} cannot both be ${refId}: ${clash.why}.`
-        : undecided ? `${candidates.length - undecided}/${candidates.length} decided - ${undecided} still need Same / Different / Unsure.`
-          : singleChoice && sames.length > 1 ? `Only one candidate can be the same person (now ${sames.join(', ')}).`
-            : s.none ? `${refId} is none of these.` : sames.length ? `${refId} = ${sames.join(' = ')}${sames.length > 1 ? ' (one person, several tracks)' : ''}` : 'All decided.';
+    candidates.forEach((c, i) => {
+      const id = String(c.id), card = cardEls[i], live = alive(id), v = live ? s.values[id] : null;
+      card.className = `cand ${v ? 'v-' + v : live ? 'undecided' : 'void'}`;
+      card._buttons.forEach((b) => { const on = b.dataset.value === v; b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); b.disabled = !live; });
+      card._note.textContent = live ? '' : kept(id).length ? `nothing left of ${refId} to compare with` : 'no image left - no answer needed';
+    });
+    verdictBtns.forEach((b) => { const on = b.dataset.value === s.verdict; b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); b.disabled = !refAlive(); });
+    if (betterRow) {
+      betterRow.hidden = !(ids.length && alive(ids[0]) && s.values[ids[0]] === 'same');
+      betterBtns.forEach((b) => { const on = b.dataset.value === (s.better || 'equal'); b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); });
+    }
+    if (refCard) refCard.classList.toggle('bad', !refAlive());
+    const { warn, text } = summary();
+    status.className = `cand-status ${warn ? 'warn' : 'ok'}`;
+    status.textContent = warn || text;
   }
 
   const refCard = ref ? h('div', { class: 'ref-card' },
     h('div', { class: 'cand-head' }, h('span', { class: 'ref-badge' }, refId), h('strong', {}, 'Reference'), h('span', { class: 'muted cap' }, ref.caption || '')),
-    panelRow(ctx, ref.panels, { lo: sizes.lo, hi: sizes.hi }),
-    h('div', { class: 'cand-controls' }, refOkBtn, problemSelect(refId), noneBtn)) : null;
-  const el = h('section', { class: `ref-ui ${ref ? '' : 'no-ref'}`, style: { '--cols': Math.min(candidates.length, 3) } },
-    refCard, h('div', { class: 'cand-grid' }, cardEls), status);
+    verdictBtns.length ? h('div', { class: 'cand-controls verdict' }, h('div', { class: 'seg', role: 'group', 'aria-label': 'Is this a real person?' }, verdictBtns)) : null,
+    images(ref.panels, refId),
+    (p.context_panels || []).length ? h('div', { class: 'context-block' }, h('div', { class: 'muted small' }, 'For comparison - not part of the answer'), panelRow(ctx, p.context_panels, { lo: sizes.lo, hi: sizes.hi })) : null) : null;
+  if (betterRow && cardEls.length) cardEls[0].append(betterRow);  // right under the answer it belongs to
+  const el = h('section', { class: `ref-ui ${ref ? '' : 'no-ref'} ${ids.length ? '' : 'no-cand'}`, style: { '--cols': Math.min(candidates.length, 3) } },
+    refCard, ids.length ? h('div', { class: 'cand-grid' }, cardEls) : null);
   refresh();
 
-  const cycle = (i) => {
-    const id = String(candidates[i].id), at = CYCLE.indexOf(s.values[id]);
-    s.values[id] = CYCLE[(at + 1) % CYCLE.length] || 'same';
-    if (singleChoice && s.values[id] === 'same') { /* the validator names the conflict; never silently overwrite another answer */ }
-    if (s.none && s.values[id] === 'same') s.none = false;
+  const cycle = (i) => { const id = ids[i]; if (!alive(id)) return; s.values[id] = CYCLE[(CYCLE.indexOf(s.values[id]) + 1) % CYCLE.length] || 'same'; refresh(); };
+  const only = (i) => { // Shift+digit: this one is the person, every other undecided candidate is not
+    const id = ids[i];
+    if (!alive(id)) return;
+    s.values[id] = 'same';
+    for (const other of ids) if (other !== id && alive(other) && (!s.values[other] || (!multiple && s.values[other] === 'same'))) s.values[other] = 'different';
     refresh();
   };
-  const only = (i) => { // Shift+digit: this one is the same person, every undecided other is different
-    const id = String(candidates[i].id);
-    s.values[id] = 'same'; s.none = false;
-    for (const other of Object.keys(s.values)) if (other !== id && !s.values[other]) s.values[other] = 'different';
-    if (singleChoice) for (const other of Object.keys(s.values)) if (other !== id && s.values[other] === 'same') s.values[other] = 'different';
-    refresh();
-  };
+  const flagHelp = [['⚑ or X / M / N', 'on an image: take it out (someone else / two people in one pose / not a person)'], ['P', 'on an image: report a bad pose (the image stays)']];
   return {
     el,
-    hints: [['1-9', singleChoice ? 'cycle same / different / unsure' : 'cycle same / different / unsure (several can be same)'], ['Shift+1-9', 'this one, rest different'], ['U', 'unsure for the rest'], ...(allowNone ? [['N', 'none of these']] : []), ['R', 'reference unusable']],
-    help: [['1 ... 6', 'Cycle that candidate: same, different, unsure'], ['Shift + 1 ... 6', 'Mark that candidate the same person; undecided others become different'], ['U', 'Mark every undecided candidate "unsure"'],
-      ...(allowNone ? [['N', 'The reference is none of the candidates (undecided ones become different)']] : []), ['R', 'Reference is unusable (mixed pose, not a person...)']],
+    outcome: status,  // what the answer will do: shown in the footer, where it stays visible
+    hints: mode === 'person' ? [['1', 'real person'], ['2', 'not a person'], ['U', 'unsure'], ['X M N P', 'flag the image under the pointer']]
+      : [['1-9', multiple ? 'same / different / unsure (several can be same)' : 'same / different / unsure'], ['Shift+1-9', 'this one, the rest different'], ['U', 'unsure for the rest'], ['X M N P', 'flag the image under the pointer']],
+    help: mode === 'person' ? [['1', 'A real person'], ['2', 'Not a person'], ['U', 'Unsure'], ...flagHelp]
+      : [['1 ... 6', `Cycle that candidate: ${LABEL.same.toLowerCase()}, ${LABEL.different.toLowerCase()}, unsure`], ['Shift + 1 ... 6', 'That candidate is the person; undecided others become different'], ['U', 'Mark every undecided candidate "unsure"'], ...flagHelp],
     onKey(e) {
-      const m = /^Digit([1-9])$/.exec(e.code);
-      if (m) { const i = Number(m[1]) - 1; if (i < candidates.length && s.refOk) { e.shiftKey ? only(i) : cycle(i); } return true; }
       const k = e.key.toLowerCase();
-      if (k === 'r') { s.refOk = !s.refOk; refresh(); return true; }
-      if (k === 'n' && allowNone) { setNone(!s.none); return true; }
-      if (k === 'u') { for (const id of Object.keys(s.values)) if (!s.values[id]) s.values[id] = 'unsure'; refresh(); return true; }
+      if (hovered && 'xmnp'.includes(k) && k.length === 1) {
+        if (k === 'p') toggleBad(hovered.key);
+        else {
+          const flag = { x: 'other_person', m: 'mixed', n: 'not_person' }[k];
+          if (!(flag === 'other_person' && (groups[hovered.gid] || []).length < 2)) setFlag(hovered.key, flag);
+        }
+        closeMenu();
+        return true;
+      }
+      const m = /^Digit([1-9])$/.exec(e.code);
+      if (m && mode === 'person') { const v = { 1: 'person', 2: 'not_person' }[m[1]]; if (v && refAlive()) { s.verdict = v; refresh(); } return true; }
+      if (m) { const i = Number(m[1]) - 1; if (i < ids.length) { e.shiftKey ? only(i) : cycle(i); } return true; }
+      if (k === 'u') {
+        if (mode === 'person') { if (refAlive()) s.verdict = 'unsure'; } else for (const id of ids) if (alive(id) && !s.values[id]) s.values[id] = 'unsure';
+        refresh();
+        return true;
+      }
       return false;
     },
     check() {
-      if (!s.refOk) return null;
-      const undecided = candidates.filter((c) => !s.values[String(c.id)]).map((c) => c.id);
-      if (undecided.length) return `Decide ${undecided.join(', ')} first (Same / Different / Unsure - Unsure is fine).`;
-      const sames = Object.values(s.values).filter((v) => v === 'same').length;
-      if (singleChoice && sames > 1) return 'Only one candidate can be the same person.';
-      const clash = conflict();
-      if (clash) return `${clash.ids.join(' and ')} cannot both be the same person: ${clash.why}.`;
-      return null;
+      if ((ctx.answerModel || 1) < 2) return 'This web server runs an older version of the engine and would lose the image flags. Restart it (data-engine serve), reload this page, then answer.';
+      return summary().warn;
     },
-    answer: () => ({ reference_ok: s.refOk, candidates: s.refOk ? { ...s.values } : {}, none_of_these: s.refOk && s.none, problems: { ...s.problems } }),
+    answer() {
+      const flagged = {};
+      for (const [key, f] of Object.entries(s.images)) if (f.exclude || f.bad_pose) flagged[key] = { exclude: f.exclude || null, bad_pose: !!f.bad_pose };
+      const out = { images: flagged, candidates: Object.fromEntries(ids.map((id) => [id, alive(id) ? s.values[id] : null])) };
+      if (mode === 'person') out.verdict = refAlive() ? s.verdict : null;
+      if (mode === 'duplicate') out.better = ids.length && s.values[ids[0]] === 'same' ? (s.better || 'equal') : null;
+      return out;
+    },
     restore(a) {
-      s.refOk = a.reference_ok !== false; s.none = !!a.none_of_these; s.problems = { ...(a.problems || {}) };
-      for (const [k, v] of Object.entries(a.candidates || {})) if (k in s.values) s.values[k] = v;
+      for (const [id, v] of Object.entries(a.candidates || {})) if (id in s.values) s.values[id] = v;
+      if ('reference_ok' in a || 'none_of_these' in a || 'problems' in a) {
+        // an answer given before image flags existed
+        if (a.reference_ok === false) {
+          const flag = (a.problems || {})[refId] === 'mixed_pose' ? 'mixed' : 'not_person';
+          if (mode === 'person') s.verdict = 'not_person'; else (groups[refId] || []).forEach((key) => { entry(key).exclude = flag; });
+        } else if (a.none_of_these) {
+          if (mode === 'person') s.verdict = 'person'; else ids.forEach((id) => { if (!s.values[id]) s.values[id] = 'different'; });
+        }
+      } else {
+        for (const [key, f] of Object.entries(a.images || {})) if (tiles.some((t) => t.key === key)) s.images[key] = { exclude: f.exclude || null, bad_pose: !!f.bad_pose };
+        if (a.verdict) s.verdict = a.verdict;
+        if (a.better) s.better = a.better;
+      }
       refresh();
     },
   };

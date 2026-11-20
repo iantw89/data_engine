@@ -20,8 +20,108 @@ def _add(workspace: Workspace, kind: str, a: list, b: list | None, task: dict, r
                                                **detail})
 
 
+CLOSED_AS = {"reidentify": "no_predecessor", "swap_check": "neither_candidate", "cross_view_match": "none_of_candidates"}
+
+
+def _groups(workspace: Workspace, task: dict, round_number: int) -> tuple[int, bool]:
+    """Answer model 2 (taxonomy.IMAGE_FLAGS): flags on single images, then a verdict on what remains.
+
+    * someone else      different(image, rest of its group)
+    * mixed             not_person(image, problem=mixed_pose), this detection only
+    * not a person      not_person(image): this detection - its whole tracklet when every image of its group is flagged
+    * bad pose          bad_pose(image); does not change the verdict
+    Verdicts bind the images that were not taken out. The question is closed (returns decided) when a
+    candidate is the same person, when nothing is left of the reference, or when every candidate that
+    could be judged is a different person and the engine holds no further candidates back.
+    """
+    from ..web.validate import answer_mode, group_keys
+
+    payload, answer = task["payload"], task["answer"]
+    images = answer.get("images") or {}
+    groups = group_keys(payload)
+    reference_id = str((payload.get("reference") or {}).get("id", "A"))
+
+    def excluded(key: str) -> str | None:
+        return (images.get(key) or {}).get("exclude")
+
+    kept = {gid: [key for key in keys if not excluded(key)] for gid, keys in groups.items()}
+    # The reference answer can cover more detections than the crops shown (every piece of a chain).
+    reference = [key for key in (payload.get("reference_keys") or groups.get(reference_id, [])) if not excluded(key)]
+    created = 0
+    for gid, keys in groups.items():
+        all_not_person = bool(keys) and all(excluded(key) == "not_person" for key in keys)
+        rest = reference if gid == reference_id else kept[gid]
+        for key in keys:
+            flag = excluded(key)
+            if flag == "other_person" and rest:
+                _add(workspace, "different", [key], rest, task, round_number, image_flag="other_person", group=gid)
+                created += 1
+            elif flag == "mixed":
+                _add(workspace, "not_person", [key], None, task, round_number, problem="mixed_pose", scope="detection")
+                created += 1
+            elif flag == "not_person":
+                _add(workspace, "not_person", [key], None, task, round_number, problem="not_person",
+                     scope="tracklet" if all_not_person else "detection")
+                created += 1
+            if (images.get(key) or {}).get("bad_pose"):
+                _add(workspace, "bad_pose", [key], None, task, round_number)
+                created += 1
+    mode = answer_mode(payload)
+    if not reference:
+        return created, True  # nothing is left of the reference: the flags are the whole answer
+    if mode == "person":
+        verdict = answer.get("verdict")
+        if verdict == "not_person":
+            _add(workspace, "not_person", reference, None, task, round_number, problem="not_person")
+            return created + 1, True
+        if verdict == "person":
+            _add(workspace, "undeterminable", reference, None, task, round_number, reason="single_view_person")
+            return created + 1, True
+        return created, False
+    candidates = {str(c["id"]): c for c in payload.get("candidates", [])}
+    values = answer.get("candidates") or {}
+    decided, judged = False, []
+    for candidate_id, candidate in candidates.items():
+        keys, verdict = kept.get(candidate_id) or [], values.get(candidate_id)
+        if not keys:
+            decided = decided or mode == "duplicate"  # one of the two poses is gone: nothing left to own
+            continue
+        judged.append(verdict)
+        if mode == "duplicate":
+            if verdict == "same":
+                better = answer.get("better")
+                _add(workspace, "duplicate", reference, keys, task, round_number,
+                     better={reference_id: "a", candidate_id: "b"}.get(str(better)))
+                created, decided = created + 1, True
+            elif verdict == "different":
+                _add(workspace, "different", reference, keys, task, round_number)
+                created, decided = created + 1, True
+        elif verdict == "same":
+            _add(workspace, "same", reference, keys, task, round_number)
+            created, decided = created + 1, True
+        elif verdict == "different" and task["type"] == "swap_check" and candidate.get("continuation"):
+            # The track did not stay on this person: cut each camera's tracklet at the later detection
+            # (a 'split' also keeps the two sides apart) so the solver can re-link the pieces.
+            for key in keys:
+                _add(workspace, "split", reference, [key], task, round_number, reason="identity swap confirmed")
+                created += 1
+            decided = True
+        elif verdict == "different":
+            _add(workspace, "different", reference, keys, task, round_number)
+            created += 1
+    if mode == "match" and not decided and judged and all(verdict == "different" for verdict in judged) \
+            and not payload.get("more_candidates"):
+        # None of the candidates, and the engine has no others: the question is closed as it stands.
+        _add(workspace, "undeterminable", reference, None, task, round_number,
+             reason=CLOSED_AS.get(task["type"], "none_of_candidates"))
+        created, decided = created + 1, True
+    return created, decided
+
+
 def _reference_candidates(workspace: Workspace, task: dict, round_number: int) -> tuple[int, bool]:
     payload, answer = task["payload"], task["answer"]
+    if not any(key in answer for key in ("reference_ok", "none_of_these", "problems")):
+        return _groups(workspace, task, round_number)
     reference = list(payload.get("reference_keys") or [])
     created, decided = 0, False
     problems = answer.get("problems") or {}
@@ -76,7 +176,12 @@ def _strip(workspace: Workspace, task: dict, round_number: int) -> tuple[int, bo
     unclear = set(answer.get("unclear") or [])
     clear = [key for index, key in enumerate(keys) if index not in unclear]
     if answer.get("verdict") == "continuous" and len(clear) >= 2:
-        _add(workspace, "same", [clear[0]], clear[1:], task, round_number)
+        new = _add(workspace, "same", [clear[0]], clear[1:], task, round_number)
+        # A later explicit answer supersedes an earlier one it contradicts: a 'someone else' flag between two
+        # of these crops opened this question, and the person now says they are one person throughout.
+        for old in workspace.db.constraints("different"):
+            if old["source"] == "human" and old["a"] and old["b"] and set(old["a"]) | set(old["b"]) <= set(clear):
+                workspace.db.supersede_constraint(old["id"], new)
         return 1, True
     if answer.get("verdict") == "break" and answer.get("first_different"):
         index = int(answer["first_different"])

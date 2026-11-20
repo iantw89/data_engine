@@ -129,14 +129,16 @@ def make_tasks(workspace: Workspace, round_number: int, rng: random.Random) -> l
                 cands.append(found[0])
         labels = "BCDEF"
         add("cross_view_match", f"demo/cross/{n}", {**common(
-            "reference_candidates", "Which crops show the same person as A?", "At this instant, which candidates show the same person as reference A?",
+            "reference_candidates", "Who is A?", "Which tracked person, if any, is the person in reference A?",
             "Two candidates fit the reference's geometry almost equally well (margin below the accept gate).",
             {"reprojection p80 px": round(rng.uniform(4, 11), 1), "runner-up margin": round(rng.uniform(0.01, 0.04), 3), "shared frames": rng.randrange(8, 40)},
             ref["frame"] / FPS),
             "reference": {"id": "A", "caption": f"{ref['camera']} f{ref['frame']}", "panels": [panel(ref, "A", "green")]},
             "candidates": [{"id": labels[i], "caption": f"{c['camera']} f{c['frame']}", "panels": [panel(c, labels[i], COLORS[i % 4])], "track": 100 + i}
                            for i, c in enumerate(cands)],
-            "allow_none": True, "single_choice": True, "problem_kinds": ["mixed_pose", "not_person", "wrong_box", "identity_switch"]},
+            "answer_model": 2, "mode": "match", "multiple": False, "single_choice": True, "more_candidates": 0,
+            "texts": {"same": "{ref} is {ids}: this piece joins that person's track.",
+                      "none_closed": "{ref} is none of the tracked people shown: it stays a single-camera track of its own."}},
             priority=9 - n)
 
     # re-identification across a gap
@@ -148,37 +150,42 @@ def make_tasks(workspace: Workspace, round_number: int, rng: random.Random) -> l
             if found:
                 cands.append(found[0])
         add("reidentify", f"demo/reid/{n}", {**common(
-            "reference_candidates", "Who is A?", "Which earlier person is reference A (seen again later)? Choose one, or 'none of these'.",
+            "reference_candidates", "Who is A?", "Which of these earlier tracks show the same person as reference A? More than one can be right.",
             "A track ended inside the room and a new one started 12 s later; several people could continue it.",
             {"gap seconds": 12.0, "endpoint distance m": round(rng.uniform(1.0, 6.0), 1), "ReID margin": round(rng.uniform(0.01, 0.07), 3)}, ref["frame"] / FPS),
             "reference": {"id": "A", "caption": f"later: {ref['camera']} f{ref['frame']}", "panels": [panel(ref, "A")]},
             "candidates": [{"id": "BCD"[i], "caption": f"earlier: {c['camera']} f{c['frame']}", "panels": [panel(c, "BCD"[i], COLORS[i])], "track": 20 + i} for i, c in enumerate(cands)],
-            "allow_none": True, "single_choice": False}, priority=6 - n)
+            "answer_model": 2, "mode": "match", "multiple": True, "single_choice": False, "more_candidates": 2,
+            "texts": {"same": "{ref} is the same person as {ids}: the tracks are joined.",
+                      "none_more": "{ref} is none of these. {n} more earlier people could have reached this spot; the engine will ask about them next."}},
+            priority=6 - n)
 
     # detection triage
     for n in range(2):
         found = pick(need=2, min_score=0.4, min_joints=6)
         subject, others = found[-1], found[:-1]
         add("detection_triage", f"demo/triage/{n}", {**common(
-            "reference_candidates", "Is this a real person? Which tracked person?", "Is this a real person? If so, which tracked person is it?",
+            "reference_candidates", "Is this a real person?", "Is this a real person? (Seen by one camera only, and matching no tracked person.)",
             "A tracklet of confident detections belongs to no 3D track (seen by one camera only).",
             {"tracklet frames": rng.randrange(12, 90), "mean score": round(subject["score"], 2)}, subject["frame"] / FPS),
             "reference": {"id": "A", "caption": f"{subject['camera']} f{subject['frame']}", "panels": [panel(subject, "A", "orange")]},
-            "candidates": [{"id": "BC"[i], "caption": f"track {30 + i}", "panels": [panel(o, "BC"[i], COLORS[i])], "track": 30 + i} for i, o in enumerate(others[:2])],
-            "allow_none": True, "single_choice": False}, priority=4 - n)
+            "candidates": [], "answer_model": 2, "mode": "person",
+            "texts": {"person": "A real person seen by this camera only: kept as a single-camera track, without 3D.",
+                      "not_person": "Not a person: these detections are taken out of every track."}}, priority=4 - n)
 
     # pose ownership
     for n in range(2):
         found = pick(need=2, min_score=0.5)
         a, b = found[0], found[1]
         add("pose_ownership", f"demo/pose/{n}", {**common(
-            "reference_candidates", "Which pose belongs to the person?", "Two poses in one camera claim the same person. Which one is that person's pose?",
+            "reference_candidates", "One person or two?", "Two poses in one camera at the same place. One person detected twice, or two people?",
             "Two detections in one frame overlap and their poses are near-identical on 9 joints.",
             {"box IoU": round(iou(a["box"], b["box"]), 2), "common joints": 9}, a["frame"] / FPS),
-            "reference": {"id": "A", "caption": f"{a['camera']} f{a['frame']} (region)", "panels": [frame_panel(a["camera"], a["frame"], "A", "green", box=a["box"])]},
-            "candidates": [{"id": "B", "caption": "pose 1", "panels": [panel(a, "B", "cyan", context=False)], "track": None},
-                           {"id": "C", "caption": "pose 2", "panels": [panel(b, "C", "yellow", context=False)], "track": None}],
-            "allow_none": False, "single_choice": True, "problem_kinds": ["mixed_pose", "duplicate", "wrong_box"]}, priority=3 - n)
+            "reference": {"id": "A", "caption": "pose A", "panels": [panel(a, "A", "green")]},
+            "candidates": [{"id": "B", "caption": "pose B", "panels": [panel(b, "B", "magenta")], "track": None}],
+            "answer_model": 2, "mode": "duplicate", "single_choice": True,
+            "texts": {"same": "One person with two poses: the better pose is used, the other is kept as its duplicate.",
+                      "different": "Two people: the two poses are kept apart."}}, priority=3 - n)
 
     # visibility check (decision)
     options = [{"value": "visible", "label": "Visible", "hint": "I can see them here", "hotkey": "1"},

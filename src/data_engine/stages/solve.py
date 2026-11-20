@@ -230,7 +230,7 @@ def load_constraints(context: Context, scene: Scene) -> tuple[Constraints, dict]
         return result
 
     constraints = Constraints()
-    used = {"same": 0, "different": 0, "duplicate": 0, "not_person": 0, "split": 0, "undeterminable": 0}
+    used = {"same": 0, "different": 0, "duplicate": 0, "not_person": 0, "split": 0, "undeterminable": 0, "bad_pose": 0}
     resolved_keys: set[str] = set()
     for row in context.db.constraints():
         kind = row["kind"]
@@ -242,6 +242,13 @@ def load_constraints(context: Context, scene: Scene) -> tuple[Constraints, dict]
         elif kind == "duplicate" and a and b:
             constraints.duplicate.append((a, b))
             constraints.same.append((a, b))
+            # One person, two poses: the person may have said which pose is the better one.
+            better = row["detail"].get("better")
+            if better in ("a", "b"):
+                constraints.demoted.extend(b if better == "a" else a)
+        elif kind == "not_person" and a and row["detail"].get("scope") == "detection":
+            # One image was flagged (mixed pose, or not a person next to good crops of the same track).
+            constraints.not_person.extend(a)
         elif kind == "not_person" and a:
             # The human judged the piece from sample crops: reject the whole tracklet of each sample.
             for camera_index, sample in a:
@@ -249,6 +256,8 @@ def load_constraints(context: Context, scene: Scene) -> tuple[Constraints, dict]
                 tracklet = int(camera.tracklet[sample])
                 members = np.flatnonzero(camera.tracklet == tracklet) if tracklet >= 0 else [sample]
                 constraints.not_person.extend((camera_index, int(member)) for member in members)
+        elif kind == "bad_pose" and a:
+            constraints.bad_pose.extend(a)
         elif kind == "split" and b:
             # Cut the tracklet of the first "after" detection at that detection's window.
             camera_index, first = b[0]
@@ -307,6 +316,75 @@ def measured_apart(first: tuple[np.ndarray, np.ndarray], second: tuple[np.ndarra
     if distance <= apart_m:
         return None
     return {"seconds": round(len(common) / 10.0, 1), "distance_m": round(distance, 2)}
+
+
+def apply_image_answers(scene: Scene, constraints: Constraints) -> None:
+    """What reviewers said about single detections, applied to the scene the solver works on.
+
+    * bad pose: the keypoints are wrong, so they give no rays - the detection keeps its place in its
+      tracklet and its identity, but takes no part in triangulation or in cross-camera geometry;
+    * the worse pose of a duplicate never wins the camera's slot of that person and instant.
+    """
+    for camera_index, row in constraints.bad_pose:
+        camera = scene.cameras[camera_index]
+        if camera.joint_ok is not None:
+            camera.joint_ok[row] = False
+            camera.rays[row] = np.nan
+    for camera in scene.cameras:
+        camera.demoted = None
+    for camera_index, row in constraints.demoted:
+        camera = scene.cameras[camera_index]
+        if camera.demoted is None:
+            camera.demoted = np.zeros(len(camera.kept), dtype=bool)
+        camera.demoted[row] = True
+
+
+def human_unknowns(solved: Solved, constraints: Constraints) -> dict[str, list[dict]]:
+    """Questions that follow from what reviewers flagged on single images.
+
+    tracklet_purity   a person said two detections are different people, and both lie in one piece of a
+                      single-camera tracklet: the tracklet changes person somewhere between them. Where is a
+                      continuity question; its answer cuts the tracklet.
+    pose_quality      a person reported a pose as wrong: open until it is corrected.
+    """
+    scene, labels = solved.scene, solved.labels
+    purity, seen = [], set()
+    for first, second in constraints.different:
+        for camera_a, row_a in first:
+            for camera_b, row_b in second:
+                if camera_a != camera_b or row_a == row_b:
+                    continue
+                camera = scene.cameras[camera_a]
+                atom = int(labels.atom[camera_a][row_a])
+                if atom < 0 or atom != int(labels.atom[camera_b][row_b]) or (camera_a, atom) in seen:
+                    continue
+                t_a, t_b = int(camera.t[row_a]), int(camera.t[row_b])
+                if t_a < 0 or t_b < 0 or abs(t_a - t_b) < WINDOW:
+                    continue  # a cut works on 2 s windows: these two cannot be separated by one
+                seen.add((camera_a, atom))
+                rows = np.flatnonzero(labels.atom[camera_a] == atom)
+                rows = rows[(camera.t[rows] >= min(t_a, t_b)) & (camera.t[rows] <= max(t_a, t_b))]
+                rows = rows[np.argsort(camera.t[rows], kind="stable")]
+                picks = rows[np.unique(np.linspace(0, len(rows) - 1, min(10, len(rows))).round().astype(int))]
+                keys = [camera.detections.key(int(row)) for row in picks]
+                purity.append({
+                    "subject": f"tracklet_purity:{keys[0]}|{keys[-1]}", "severity": float(len(rows)),
+                    "detail": {"camera": camera.camera, "t": int((t_a + t_b) // 2), "span_t": [min(t_a, t_b), max(t_a, t_b)],
+                               "detections": int(len(rows)), "keys": keys,
+                               "why": "a reviewer marked the first and the last of these crops as different people, "
+                                      "and both belong to one single-camera track: the track changes person "
+                                      "somewhere in between",
+                               "resolve_by": "a human clicks the first crop that shows the other person"}})
+    quality = []
+    for camera_index, row in sorted(set(constraints.bad_pose)):
+        camera = scene.cameras[camera_index]
+        key = camera.detections.key(int(row))
+        quality.append({
+            "subject": f"pose_quality:{key}", "severity": 1.0,
+            "detail": {"camera": camera.camera, "key": key, "t": int(camera.t[row]),
+                       "why": "a reviewer reported this pose as wrong; its keypoints are left out of 3D",
+                       "resolve_by": "pose correction (the CVAT hand-off is not built yet: the pose stays reported)"}})
+    return {"tracklet_purity": purity, "pose_quality": quality}
 
 
 def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[dict]]:
@@ -383,13 +461,14 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str]) -> dict[str, list[
             candidates = [{"component": int(label), "identity": int(identity[label]), **info,
                            "keys": component_keys_at(scene, labels, label, middle)}
                           for label, info in sorted(options.items(), key=lambda kv: -kv[1].get("samples", kv[1].get("frames_matching", 0)))]
-            candidates = [c for c in candidates if c["keys"]][:4]
+            candidates = [c for c in candidates if c["keys"]]
+            held_back, candidates = max(0, len(candidates) - 4), candidates[:4]
             if candidates:
                 unknowns["association"].append({
                     "subject": f"association:{subject_key}", "severity": float(len(rows)),
                     "detail": {"camera": camera.camera, "detections": int(len(rows)), "t": middle,
                                "span_t": [int(camera.t[rows[0]]), int(camera.t[rows[-1]])],
-                               "reference_keys": keys, "candidates": candidates,
+                               "reference_keys": keys, "candidates": candidates, "more_candidates": held_back,
                                "resolve_by": "a human picks which candidate is the same person, or none"}})
                 continue
         if len(rows) >= MIN_TASK_DETECTIONS and f"policy:review_individually:{camera.camera}" not in resolved_keys:
@@ -638,6 +717,7 @@ def run(context: Context) -> StageResult:
     step = 2 if long_recording else 1
     from ..solve import alignment_check
 
+    apply_image_answers(scene, constraints)
     units, unit_stats = unit_scene(scene, RECIPE, constraints)
     key = association_key(context, step)
     state = load_state(context, key)
@@ -659,6 +739,7 @@ def run(context: Context) -> StageResult:
         "association_reused": state is not None,
         "recovered": {"positions_sha256": recovered["positions_sha256"], "count": recovered["count"]} if recovered else None})
     unknowns = extract_unknowns(solved, info["resolved_keys"])
+    unknowns.update(human_unknowns(solved, constraints))
     (workspace.round_dir(context.round) / "alignment_check.json").write_text(json.dumps(checked, indent=1), encoding="utf-8")
     unknowns["alignment"] = []
     decided = {c["a"][0] for c in context.db.constraints("alignment") if c["a"]}

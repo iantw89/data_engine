@@ -31,6 +31,7 @@ class CameraScene:
     order: np.ndarray  # kept rows with t >= 0, sorted by t
     rays: np.ndarray = field(default=None, repr=False)  # (M,17,3) float32 unit world rays (NaN if unusable)
     joint_ok: np.ndarray = field(default=None, repr=False)  # (M,17) bool: peak >= gate and ray valid
+    demoted: np.ndarray = field(default=None, repr=False)  # (M,) bool: a person judged the other pose of a duplicate better
 
     @property
     def height_cvat(self) -> np.ndarray:

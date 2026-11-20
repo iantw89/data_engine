@@ -50,7 +50,106 @@ def _strip(payload: dict, answer: dict, problems: list[str]) -> dict:
             "unclear": sorted(set(unclear)), "notes": _notes(answer, problems)}
 
 
+IMAGE_EXCLUSIONS = ("other_person", "mixed", "not_person")
+MODE_BY_TYPE_HINT = {"person": "detection_triage", "duplicate": "pose_ownership"}
+
+
+def group_keys(payload: dict) -> dict[str, list[str]]:
+    """Group id -> detection keys of the images shown in it (reference first)."""
+    def keys(panels):
+        return [panel["highlight"][0] for panel in panels or [] if panel.get("highlight")]
+    groups = {}
+    reference = payload.get("reference")
+    if reference:
+        groups[str(reference.get("id", "A"))] = keys(reference.get("panels"))
+    for candidate in payload.get("candidates") or []:
+        groups[str(candidate["id"])] = keys(candidate.get("panels")) or list(candidate.get("keys") or [])
+    return groups
+
+
+def answer_mode(payload: dict) -> str:
+    if payload.get("mode"):
+        return payload["mode"]
+    if not payload.get("candidates"):
+        return "person"
+    return "match"
+
+
+def _groups(payload: dict, answer: dict, problems: list[str]) -> dict:
+    """Answer model 2: flags on single images, then a verdict on what remains (taxonomy.IMAGE_FLAGS)."""
+    groups = group_keys(payload)
+    reference_id = str((payload.get("reference") or {}).get("id", "A"))
+    group_of = {key: gid for gid, keys in groups.items() for key in keys}
+    images = answer.get("images") or {}
+    if not isinstance(images, dict):
+        problems.append("images must be an object {detection key: {exclude, bad_pose}}")
+        images = {}
+    cleaned_images = {}
+    for key, flags in images.items():
+        if key not in group_of:
+            problems.append(f"'{key}' is not an image of this task")
+            continue
+        flags = flags if isinstance(flags, dict) else {}
+        exclude, bad_pose = flags.get("exclude"), flags.get("bad_pose", False)
+        if exclude is not None and exclude not in IMAGE_EXCLUSIONS:
+            problems.append(f"image flag must be one of {', '.join(IMAGE_EXCLUSIONS)} (got {exclude!r})")
+            exclude = None
+        if not isinstance(bad_pose, bool):
+            problems.append("bad_pose must be true or false")
+            bad_pose = False
+        if exclude or bad_pose:
+            cleaned_images[key] = {"exclude": exclude, "bad_pose": bool(bad_pose) and exclude in (None, "other_person")}
+    kept = {gid: [key for key in keys if not cleaned_images.get(key, {}).get("exclude")] for gid, keys in groups.items()}
+    for key, flags in cleaned_images.items():
+        if flags["exclude"] == "other_person" and not kept[group_of[key]]:
+            problems.append(f"'someone else' needs one image of group {group_of[key]} left to be the person the "
+                            "others differ from; flag the others, or use 'not a person' / 'two people in one pose'")
+            break
+    mode = answer_mode(payload)
+    reference_alive = bool(kept.get(reference_id)) if reference_id in groups else True
+    candidates = [gid for gid in groups if gid != reference_id]
+    values = answer.get("candidates") or {}
+    if not isinstance(values, dict):
+        problems.append("candidates must be an object {candidate id: same|different|unsure}")
+        values = {}
+    cleaned_values = {}
+    for cid, value in values.items():
+        if str(cid) not in candidates:
+            problems.append(f"unknown candidate '{cid}'")
+    for cid in candidates:
+        value = values.get(cid)
+        if reference_alive and kept[cid]:
+            if value not in REFERENCE_VALUES:
+                problems.append(f"candidate {cid} needs an answer: same, different or unsure")
+            cleaned_values[cid] = value
+        else:
+            cleaned_values[cid] = None  # nothing left to compare: no answer is needed, and none is recorded
+    same = [cid for cid, value in cleaned_values.items() if value == "same"]
+    if len(same) > 1 and not payload.get("multiple", not payload.get("single_choice", True)):
+        problems.append(f"only one candidate can be 'same' (got {', '.join(same)})")
+    for pair in payload.get("cannot_both") or []:
+        if all(str(cid) in same for cid in pair["ids"]):
+            problems.append(f"{' and '.join(map(str, pair['ids']))} cannot both be 'same': {pair['why']}")
+    cleaned = {"images": cleaned_images, "candidates": cleaned_values, "notes": _notes(answer, problems)}
+    if mode == "person":
+        verdict = answer.get("verdict")
+        if reference_alive and verdict not in ("person", "not_person", "unsure"):
+            problems.append("verdict must be person, not_person or unsure")
+        cleaned["verdict"] = verdict if reference_alive else None
+    if mode == "duplicate":
+        better = answer.get("better")
+        if better is not None and str(better) not in (*groups, "equal"):
+            problems.append(f"better must be one of {', '.join([*groups, 'equal'])}")
+            better = None
+        cleaned["better"] = str(better) if better is not None and same else None
+    return cleaned
+
+
 def _reference_candidates(payload: dict, answer: dict, problems: list[str]) -> dict:
+    # Answers of model 1 (reference_ok / none_of_these / problems) are still understood: tasks answered
+    # before the change keep their meaning.
+    if not any(key in answer for key in ("reference_ok", "none_of_these", "problems")):
+        return _groups(payload, answer, problems)
     candidates = {str(c["id"]): c for c in payload.get("candidates") or []}
     reference_id = str((payload.get("reference") or {}).get("id", "A"))
     reference_ok = answer.get("reference_ok", True)

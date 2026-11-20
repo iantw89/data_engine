@@ -63,6 +63,8 @@ def member_table(scene: Scene, row_label: list[np.ndarray]):
     for camera in scene.cameras:
         mask = cams == camera.index
         score[mask] = camera.detections.boxes[rows[mask], 4]
+        if camera.demoted is not None:  # a human preference between two poses of one person beats the score
+            score[mask] -= camera.demoted[rows[mask]].astype(np.float32)
     slot = inverse.astype(np.int64) * len(scene.cameras) + cams
     order = np.lexsort((-score, slot))
     first = np.concatenate(([True], slot[order][1:] != slot[order][:-1]))

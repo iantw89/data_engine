@@ -22,6 +22,8 @@ class Constraints:
     different: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = field(default_factory=list)
     duplicate: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = field(default_factory=list)
     not_person: list[tuple[int, int]] = field(default_factory=list)  # rows a human rejected
+    bad_pose: list[tuple[int, int]] = field(default_factory=list)  # rows whose keypoints a human reported as wrong
+    demoted: list[tuple[int, int]] = field(default_factory=list)  # of two poses of one person, the worse one
     cuts: dict[int, list[int]] = field(default_factory=dict)  # tracklet -> window cuts (human splits)
     # Track ids from an independent tracker, per camera per raw row (-1 = none). Used to cut 2D
     # tracklets where that tracker changes person and to propose links (see ``with_external_units``).

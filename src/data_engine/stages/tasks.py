@@ -44,6 +44,20 @@ def base_payload(task_type: str, title: str, why: str, evidence: dict, seconds: 
             "time_seconds": seconds}
 
 
+def answers(payload: dict, mode: str, *, multiple: bool = False, more_candidates: int = 0, **texts: str) -> None:
+    """What the person can answer, and what each answer will do (shown in the task's status line).
+
+    mode       "match": is each candidate group the same person as the reference group;
+               "person": is the reference a real person (no candidates);
+               "duplicate": are the two poses one person (then: which pose is better) or two people.
+    multiple   several candidates may be the same person
+    more_candidates   candidates the engine holds back: "none of these" then does not close the question
+    Every image can be flagged (taxonomy.IMAGE_FLAGS); the answer applies to the images that remain.
+    """
+    payload.update({"answer_model": 2, "mode": mode, "multiple": multiple, "single_choice": not multiple,
+                    "allow_none": False, "more_candidates": int(more_candidates), "texts": texts})
+
+
 def association_task(context: Context, unknown: dict) -> tuple[str, dict]:
     detail = unknown["detail"]
     seconds, clock = time_text(context, detail.get("t"))
@@ -65,8 +79,11 @@ def association_task(context: Context, unknown: dict) -> tuple[str, dict]:
             "panels": [panel(context, key, label=letter, color=COLORS[index % len(COLORS)])
                        for key in candidate["keys"]],
             "keys": candidate["keys"], "component": candidate["component"]})
-    payload.update({"allow_none": True, "single_choice": True, "reference_keys": detail["reference_keys"],
-                    "problem_kinds": ["mixed_pose", "not_person", "wrong_box", "identity_switch"]})
+    payload["reference_keys"] = detail["reference_keys"]
+    answers(payload, "match", more_candidates=detail.get("more_candidates", 0),
+            same="{ref} is {ids}: this piece joins that person's track.",
+            none_closed="{ref} is none of the tracked people shown: it stays a single-camera track of its own.",
+            none_more="{ref} is none of these. The engine has {n} more candidate(s) and will ask about them next.")
     return "cross_view_match", payload
 
 
@@ -110,10 +127,11 @@ def unassigned_task(context: Context, unknown: dict) -> tuple[str, dict]:
         {"detections in this piece": detail["detections"]}, seconds)
     payload["reference"] = {"id": "A", "caption": f"{detail['camera']} - seen by this camera only",
                             "panels": [panel(context, key, label="A") for key in detail["reference_keys"]]}
-    payload.update({"candidates": [], "allow_none": True, "single_choice": True,
-                    # the answer applies to every piece of the chain, not only the crops shown
-                    "reference_keys": detail.get("member_keys") or detail["reference_keys"],
-                    "none_label": "A real person (keep as a single-camera track)"})
+    # the answer applies to every piece of the chain, not only the crops shown
+    payload.update({"candidates": [], "reference_keys": detail.get("member_keys") or detail["reference_keys"]})
+    answers(payload, "person",
+            person="A real person seen by this camera only: kept as a single-camera track, without 3D.",
+            not_person="Not a person: these detections are taken out of every track (they stay in the raw store).")
     if detail.get("pieces", 1) > 1:
         payload["evidence"]["consecutive pieces at the same place"] = detail["pieces"]
     return "detection_triage", payload
@@ -163,7 +181,13 @@ def identity_task(context: Context, unknown: dict) -> tuple[str, dict]:
         {"ids": [letter_of[a], letter_of[b]],
          "why": f"they are tracked at the same time for {pair['seconds']} s, {pair['distance_m']} m apart: two people"}
         for pair in detail.get("cannot_both", []) for a, b in [pair["components"]] if a in letter_of and b in letter_of]
-    payload.update({"allow_none": True, "single_choice": False, "reference_keys": detail["reference_keys"]})
+    payload["reference_keys"] = detail["reference_keys"]
+    answers(payload, "match", multiple=True,
+            more_candidates=max(0, int(detail.get("feasible_candidates", 0)) - len(payload["candidates"])),
+            same="{ref} is the same person as {ids}: the tracks are joined.",
+            none_closed="{ref} is none of the earlier people who could have been here: it stays a separate person.",
+            none_more="{ref} is none of these. {n} more earlier people could have reached this spot; the engine "
+                      "will ask about them next.")
     return "reidentify", payload
 
 
@@ -183,17 +207,21 @@ def swap_task(context: Context, unknown: dict) -> tuple[str, dict]:
                             "panels": [panel(context, key, label="A") for key in detail["reference_keys"]]}
     payload["candidates"] = [{
         "id": "B", "track": a, "caption": f"labelled person {a} just after (no swap)", "keys": detail["after_a_keys"],
-        "continuation": True,
+        "continuation": True, "if_same": f"No swap: track {a} stays on this person.",
         "panels": [panel(context, key, label="B", color=COLORS[0]) for key in detail["after_a_keys"]]}]
     if detail.get("after_b_keys"):
         payload["candidates"].append({
             "id": "C", "track": b, "caption": f"labelled person {b} just after (a swap if this is A)",
             "keys": detail["after_b_keys"],
+            "if_same": f"A swap: this person continues under the label {b}; track {a} is cut at this moment.",
             "panels": [panel(context, key, label="C", color=COLORS[1]) for key in detail["after_b_keys"]]})
     if detail.get("before_b_keys"):
         payload["context_panels"] = [panel(context, key, label=f"person {b} before", color=COLORS[2])
                                      for key in detail["before_b_keys"]]
-    payload.update({"allow_none": True, "single_choice": True, "reference_keys": detail["reference_keys"]})
+    payload["reference_keys"] = detail["reference_keys"]
+    answers(payload, "match",
+            same="{ref} is {ids}.",
+            none_closed=f"{{ref}} is neither: track {a} did not stay on this person and is cut at this moment.")
     return "swap_check", payload
 
 
@@ -208,9 +236,22 @@ def ownership_task(context: Context, unknown: dict) -> tuple[str, dict]:
     payload["reference"] = {"id": "A", "caption": "pose A", "panels": [panel(context, first, label="A")]}
     payload["candidates"] = [{"id": "B", "caption": "pose B", "keys": [second], "track": None,
                               "panels": [panel(context, second, label="B", color="magenta")]}]
-    payload.update({"allow_none": False, "single_choice": True, "reference_keys": [first],
-                    "problem_kinds": ["mixed_pose", "duplicate", "wrong_box"]})
+    payload["reference_keys"] = [first]
+    answers(payload, "duplicate",
+            same="One person with two poses: the better pose is used, the other is kept as its duplicate.",
+            different="Two people: the two poses are kept apart.")
     return "pose_ownership", payload
+
+
+def purity_task(context: Context, unknown: dict) -> tuple[str, dict]:
+    """A reviewer said two crops of one single-camera tracklet show different people: where does it change?"""
+    detail = unknown["detail"]
+    seconds, clock = time_text(context, detail.get("t"))
+    payload = base_payload("continuity", f"Where does this track change person? {detail['camera']} at {clock}",
+                           detail["why"], {"detections in between": detail["detections"]}, seconds)
+    payload["panels"] = [panel(context, key, label=str(index + 1)) for index, key in enumerate(detail["keys"])]
+    payload["reference_keys"] = detail["keys"]
+    return "continuity", payload
 
 
 def flat_facts(detail: dict) -> dict:
@@ -267,7 +308,7 @@ def alignment_task(context: Context, unknown: dict) -> tuple[str, dict]:
 
 BUILDERS = {"association": association_task, "unassigned": unassigned_task, "identity_link": identity_task,
             "pose_ownership": ownership_task, "calibration": calibration_task, "alignment": alignment_task,
-            "identity_swap": swap_task}
+            "identity_swap": swap_task, "tracklet_purity": purity_task}
 
 
 def evidence_signature(payload: dict) -> str:

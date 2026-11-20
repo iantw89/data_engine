@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from ..config import Site, load_site
 from ..engine import STAGES, Engine
 from ..render import error_image, render_panel
-from ..taxonomy import KINDS, TASK_TYPES, UI_KINDS
+from ..taxonomy import ANSWER_MODEL, IMAGE_FLAGS, KINDS, TASK_TYPES, UI_KINDS
 from ..workspace import Workspace, list_workspaces
 from .validate import AnswerError, validate_answer
 
@@ -244,7 +244,9 @@ def create_app(site: Site | None = None) -> FastAPI:
     @app.get("/api/taxonomy")
     def taxonomy() -> dict:
         return {"kinds": [asdict(k) for k in KINDS.values()], "task_types": [asdict(t) for t in TASK_TYPES.values()],
-                "ui_kinds": list(UI_KINDS)}
+                "ui_kinds": list(UI_KINDS), "answer_model": ANSWER_MODEL,
+                "image_flags": {name: {"label": label, "meaning": meaning, "produces": produces}
+                                for name, (label, meaning, produces) in IMAGE_FLAGS.items()}}
 
     # ------------------------------------------------------------------ tasks
     @app.get("/api/datasets/{dataset_id}/tasks")

@@ -41,7 +41,7 @@ from its previous result: seconds to minutes).
 | `align` | once, again when calibration geometry changes | `alignment.json` (label payload), `sync_table.npz`, report | `alignment` |
 | `tracklets` | once | post-filter + BoT-SORT + over-split, per camera | - |
 | `autofit` | once; again as a lap when `recover` produced enough detections it has not seen | `evidence/autofit/labels.npz`: Autofit raw track id per detection (CPU; 13 min for the felix hour, 2.5 min for golden's 10 min); input: the kept detections plus `evidence/autofit/extra.npz` (recovered poses) | - |
-| `solve` | every round; again as an identity lap when `recover` measured positions that make more tracks linkable (association reused from `solve_state/`) | `solution.npz`, `tracks3d.npz`, `solve.json`, `alignment_check.json`, `swap_check.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage`, `alignment`, `identity_swap` |
+| `solve` | every round; again as an identity lap when `recover` measured positions that make more tracks linkable (association reused from `solve_state/`) | `solution.npz`, `tracks3d.npz`, `solve.json`, `alignment_check.json`, `swap_check.json` | `association`, `identity_link`, `unassigned`, `pose_ownership`, `tracklet_purity`, `coverage`, `alignment`, `identity_swap`, `pose_quality` |
 | `recover` | every round, after `solve` | `tracks3d_recovered.npz` (positions triangulated from poses read at each track's expected place), `recover_rejected.npz`, `recover.json` (incl. the decisions about an Autofit lap and an identity lap); crop poses cached in `recovered/`. After an identity lap it keeps its previous positions and looks again only around the people whose tracks were joined | - |
 | `tasks` | every round | human tasks | - |
 | `publish` | on request | label-set drafts / published sets | - |
@@ -71,22 +71,22 @@ recipe, input identities, outputs and code identity.
 | `stream_layout` | Files cannot be ordered/trimmed into one verified sequence | main-channel rebuild, verified overlap trim | operator decision |
 | `calibration` | View moved since calibration, or check inconclusive | rotation-only mount fit, residual audit | calibration review |
 | `alignment` | A camera's offset is unresolved, unstable or stale | audio + pose-motion lag over the whole recording | alignment review |
-| `tracklet_purity` | A tracklet may hold two people | gap/jump cuts, consensus switch detection | continuity |
+| `tracklet_purity` | A tracklet holds two people: a reviewer marked two of its crops as different people | gap/jump cuts, consensus switch detection (before any question) | continuity |
 | `association` | Which simultaneous tracklets are the same person is ambiguous | pairwise geometry with margin, pooled N-view support, elimination, projection | cross-view match |
 | `identity_link` | A track starts inside the recording without a unique predecessor | unique motion continuity | re-identification |
 | `identity_swap` | Two tracks came within reach (or exchanged places) and nothing independent of the 3D tracker confirms who is who afterwards | step-by-step 3D continuity, heading, body proportions, 2D tracklets in separated views, (appearance) | swap check |
 | `unassigned` | A piece of confident detections belongs to no track | projection onto 3D tracks | detection triage / policy decision |
 | `pose_ownership` | Two poses in one camera claim one person | pose suppression, 3D co-location | pose ownership |
 | `coverage` | A tracked person projects into a view without a detection | guided re-detection (`recover` stage) fills what triangulates; the rest is counted, not yet asked | visibility check (no generator yet) |
-| `pose_quality` | Keypoints disagree with the multi-view pose | leave-one-out view rejection | pose correction (CVAT) |
+| `pose_quality` | A reviewer reported a pose as wrong ("bad pose" flag); its keypoints are left out of 3D | - | pose correction (CVAT; hand-off not built, the unknown stays open) |
 | `audit` | Random sample awaiting spot check | - | audit |
 
 ### Human task types (`taxonomy.TASK_TYPES`)
 
 Four UI kinds render all types: **decision** (pick an option), **strip** (a time-ordered row
-of crops; click the first different one), **reference + candidates** (same / different /
-unsure per candidate, "none of these", "reference unusable"), **frame picker**. Pose
-correction is carried out in CVAT because it needs a skeleton editor.
+of crops; click the first different one), **groups of images** (a reference group and
+candidate groups; below), **frame picker**. Pose correction is carried out in CVAT because
+it needs a skeleton editor.
 
 | Task type | Question | Answer becomes |
 |---|---|---|
@@ -94,16 +94,54 @@ correction is carried out in CVAT because it needs a skeleton editor.
 | `calibration_review` | Which calibration should this camera use? | `calibration` constraint → calibration stage |
 | `alignment_review` | Which frame shows the same instant? | `alignment` constraint |
 | `continuity` | Do all crops show one person? | `same` or `split` (+ `different`) |
-| `cross_view_match` | Which candidates are reference A? | `same` / `different` / `not_person` |
-| `reidentify` | Which earlier person is A? | `same` / `different`, or "not tracked before" |
-| `detection_triage` | Is this a person? Which one? | `not_person`, `same`, or single-view person |
-| `pose_ownership` | Is pose B the same person as A? | `duplicate` or `different` |
+| `cross_view_match` | Which tracked person, if any, is the person in A? (one) | `same` / `different`; none and no further candidate: single-camera track |
+| `reidentify` | Which earlier tracks are A's person? (several possible) | `same` / `different`; none and no further candidate: separate person |
+| `swap_check` | Which candidate (after) is A (before)? (one, or neither) | no swap: `same`; swap: `same` + `split`; neither: `split` |
+| `detection_triage` | Is this a real person? | `not_person`, or single-view person |
+| `pose_ownership` | One person detected twice, or two people? | `duplicate` (with the better pose) or `different` |
 | `visibility_check` | Is the projected person visible here? | `undeterminable` (occluded / out of view) or a pose task |
 | `pose_correction` | Fix the skeleton (CVAT) | corrected keypoints, training data |
 | `audit` | Is this label correct? | `different` / `not_person`; precision estimate |
 
 Tasks are generated one per unknown, largest label volume first, with a per-round budget:
-the next round usually resolves many remaining unknowns by itself.
+the next round usually resolves many remaining unknowns by itself. Open tasks are rebuilt
+from the current solve at the end of every round; answered ones are never touched.
+
+**Groups of images** (`cross_view_match`, `reidentify`, `swap_check`, `detection_triage`,
+`pose_ownership`; answer model 2, `taxonomy.IMAGE_FLAGS`, `tasks/apply.py: _groups`). Each
+group is a set of crops the engine believes to be one person. The person answers in two
+layers, and the screen says in words what the answer will do before it is sent.
+
+1. *Any single image can be flagged.* Three flags take the image out of its group, and the
+   question is then answered with the images that remain; the fourth leaves it in.
+
+   | Flag | Means | Becomes | Follow-up |
+   |---|---|---|---|
+   | Someone else | a clean detection of another person: the grouping is wrong here | `different(image, rest of its group)` | the solve regroups; if image and rest lie in one single-camera tracklet, a `tracklet_purity` unknown and a `continuity` task ask where the tracklet changes person |
+   | Two people in one pose | the skeleton takes joints from two people | `not_person(image, mixed_pose)`, that detection only | - |
+   | Not a person | reflection, poster, equipment | `not_person(image)`: that detection, or its tracklet when every image of the group is flagged | - |
+   | Bad pose | the right person, keypoints wrong | `bad_pose(image)`: its keypoints give no rays (no part in 3D), the detection keeps its identity | a `pose_quality` unknown, open until pose correction exists |
+
+2. *A verdict on what remains.* Per candidate: same, different or unsure
+   (`pose_ownership`: one person / two people / unsure, and for one person which pose is
+   better; `detection_triage`: real person / not a person / unsure). A candidate with no
+   image left needs no answer. With no image left of the reference the flags are the whole
+   answer.
+
+There is no "reference unusable" and no "none of these". The first is what flagging the
+reference's images says, image by image and with a reason. The second is what "different"
+for every candidate says; what follows from it is the engine's business: if it holds
+further candidates back (`more_candidates`), the question stays open and they are asked
+next; if not, the question is closed as it stands (the piece stays a single-camera track,
+the person stays a separate identity, the track is cut at the swap moment). "Unsure" for
+any candidate keeps the question open and still records every "different".
+
+Several candidates can be the same person in `reidentify` (a track that broke more than
+once); two candidates measured at the same instants in different places exclude each other
+(`cannot_both`). The other types take one.
+
+Not yet: flags on the images of the strip and decision screens; the CVAT hand-off that
+would close `pose_quality`.
 
 ## 4. Solve stage
 
@@ -393,6 +431,17 @@ the next round usually resolves many remaining unknowns by itself.
   0.5%: it keeps golden's lap (0.7%) and felix lap 1 and drops felix lap 2. Positions
   barely move in any lap (felix 408,991 -> 408,748 in total); the lap buys consolidation.
   Table in `experiments/coverage/REPORT.md` section 9.
+* **2026-11-19 - answers of the group tasks redesigned (answer model 2).** Before: per
+  candidate same / different / unsure, a "reference unusable" switch, "none of these", and a
+  problem menu per group taken over from the exploratory CVAT tasks. Now: flags on single
+  images (someone else, two people in one pose, not a person, bad pose) and a verdict on
+  what remains; closing a question when no candidate fits is derived from the answers and
+  from whether the engine has more candidates, not asked. Reasons: a wrong image in a
+  group does not make the group unusable; "none of these" and "every candidate is
+  different" were two ways to say one thing with different effects; a mixed pose and a bad
+  pose are different facts with different consequences. Re-identification takes several
+  "same" answers. Pose ownership asks which pose is better. Answers given under model 1
+  keep their meaning (`apply._reference_candidates`).
 * **2026-11-19 - identity after the recovery (identity lap); links through recovered
   positions are proposals.** The recovery moves track ends (felix: 78 ends and 115 starts,
   median 0.6 s, at most 67 s), which made the linking rule accept 8 more links on the felix
