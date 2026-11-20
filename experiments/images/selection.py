@@ -285,7 +285,15 @@ def report() -> None:
         flags = {(e["exclude"], e["bad_pose"]) for e in es}
         if len(es) > 1 and any(f[0] or f[1] for f in flags):
             again[("clear" if es[0]["clear"] else "unclear", "same flag each time" if len(flags) == 1 else "flag changed")] += 1
+    # (The reviewer: a flag dropped at a later showing is fatigue from flagging one image again and again.)
     print("images shown in two or more tasks and flagged at least once:", dict(again))
+    first = {}
+    for e in sorted(images, key=lambda e: answered[e["task"]]):
+        first.setdefault(e["key"], e)
+    once = list(first.values())
+    for name, part in (("clear", [e for e in once if e["clear"]]), ("unclear", [e for e in once if not e["clear"]])):
+        flagged = sum(1 for e in part if e["exclude"] or e["bad_pose"])
+        print(f"first showing only, {name}: {len(part)} images, flagged {flagged} ({flagged / len(part):.1%})")
     order = sorted(tasks, key=lambda task: task["answered"])
     unclear_count = collections.Counter(e["task"] for e in unclear)
     flag_count = collections.Counter(e["task"] for e in images if e["exclude"] or e["bad_pose"])

@@ -54,9 +54,15 @@ question's rule may choose in; the median shift is 4 frames (0.4 s), 90% within 
 | bad pose | 11 (3.8%) | 29 (6.8%) | 0.10 |
 
 * **85% of the unclear images were not flagged.** They cost attention and reported nothing.
-* **Flags on unclear images were not reproducible.** Of the images shown in two or more tasks
-  and flagged at least once, the flag changed between showings for 8 of 12 unclear images
-  and 1 of 4 clear ones. Twice "someone else" became "unsure" once that flag existed.
+  The same holds on each image's first showing alone (614 distinct images: 15.0% of the
+  unclear and 7.5% of the clear ones flagged), so it is not an effect of repetition.
+* **Flags changed when an image came back - because of fatigue, not because the image was
+  hard.** Of the images shown in two or more tasks and flagged at least once, the flag
+  differed between showings for 8 of 12 unclear images and 1 of 4 clear ones. The reviewer's
+  explanation: flagging the same image over and over is tiring, and at some point the task
+  just gets finished. This is therefore no evidence about how reliable a judgement on an
+  unclear image is, and it is not used as an argument here. It is an argument for carrying
+  flags between tasks (`tasks/carry.py`): 106 of the 720 showings were repeats.
 * **The four "unsure" verdicts on a candidate were all on groups without a clear image**
   (4 of 79 such groups, 0 of 126 groups with one; p = 0.02). Two of the four would have had
   clear images under the rule.
