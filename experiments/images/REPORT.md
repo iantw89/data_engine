@@ -70,6 +70,25 @@ question's rule may choose in; the median shift is 4 frames (0.4 s), 90% within 
   an unclear image by itself adds nothing measurable (-3%, 95% interval -11% to +6%, 81
   tasks). Unclear images cost time through the flags they draw.
 
+**Flags in this batch are undercounts.** The reviewer tired of flagging single-image
+problems part-way through and stopped marking all of them; the data shows it (first
+showings, tasks in answering order; the task types change along the way, so this is not a
+clean trend):
+
+| Tasks (in order) | Types | Images flagged mixed / not a person / unsure / bad pose | "Someone else" |
+|---|---|---|---|
+| 1-21 | cross-view | 16 of 105 (15%) | 1 (1%) |
+| 22-42 | cross-view | 11 of 123 (9%) | 1 (1%) |
+| 43-63 | re-identification | 15 of 210 (7%) | 9 (4%) |
+| 64-84 | re-identification, swap | 7 of 176 (4%) | 12 (7%) |
+
+In the first quarter 24% of the unclear and 11% of the clear images were flagged. Read
+every single-image rate in this report as a lower bound, possibly two to three times too
+low: "85% of unclear images not flagged" is "about three quarters or more", and the
+prevalence estimates in section 4 are floors. The "someone else" flags are less affected:
+they rose as the task type changed. From the next answers on the reviewer marks every
+problem; `selection.py report` keeps the two batches apart (`FLAGS_EXHAUSTIVE_AFTER`).
+
 ## 4. What the exchange would have hidden
 
 **Wrong groupings ("someone else", 31 flags).** A wrong grouping is a property of the piece,
@@ -85,9 +104,10 @@ clear frame came from another piece; it is replaced by the same-piece rule.
 
 **Problems of one detection (56 flags: mixed pose, not a person, unsure, bad pose).** 22
 would not have been shown. Each such flag changes one detection. Weighted to all tracked
-detections the reviewer's own rates give about 12,000 mixed poses, 65,000 bad poses and
-5,000 non-persons among 1.38 million; the flags found 7, 40 and 5. Questions about tracks
-find these by chance, at well under 0.1%; they need their own pass once tracks are settled.
+detections the reviewer's own rates give at least 12,000 mixed poses, 65,000 bad poses and
+5,000 non-persons among 1.38 million (floors, see above); the flags found 7, 40 and 5. Even
+marked exhaustively, questions about tracks reach these by chance, at well under 0.1%;
+they need their own pass once tracks are settled.
 
 ## 5. On the engine's own questions (`engine`)
 
@@ -112,4 +132,7 @@ moves: pieces nobody could associate rarely have a clear view.
 * "Fuzzy" images: sharpness (Laplacian variance of the crop) did not separate flagged from
   unflagged images and is not part of the rule; small boxes are (96 px).
 * The control questions are what will answer the first two points: compare flag rates and
-  "unsure" verdicts between `image_choice` "clear" and "nearest" in the task payloads.
+  "unsure" verdicts between `image_choice` "clear" and "nearest" in the task payloads, on
+  answers given after this batch only (flags marked exhaustively).
+* Neither arm measures how common single-image problems are in the tracks: both show frames
+  chosen at track ends and crossings. That needs a random sample of detections.

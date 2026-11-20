@@ -539,8 +539,10 @@ would close `pose_quality`.
   the nearest.** The reviewer found many images hard (slivers, cut or overlapped poses) and
   asked whether easier images would hide the problems being caught. Measured on the 720
   images of 84 answered tasks (`experiments/images/REPORT.md`): 62% of the unclear images had
-  a clear view of the same piece 0.4 s away; 85% of unclear images drew no flag (also on
-  each image's first showing); of 31 "someone else" flags, 20
+  a clear view of the same piece 0.4 s away; three quarters or more of the unclear images
+  drew no flag (the reviewer tired of flagging part-way through, so single-image flags of
+  this batch are undercounts; exhaustive from the next answers on); of 31 "someone else"
+  flags, 20
   were on images the rule leaves alone and 10 of the other 11 could be checked: the exchanged
   frame leaves the track with the flagged one every time;
   the single-detection flags that would be lost reach under 0.1% of such detections anyway.

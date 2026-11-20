@@ -31,6 +31,9 @@ OUT = Path(__file__).parent
 FELIX = "felix_20251223173052_20251223183103"
 CLEAR = RECIPE["link_ranking"]
 TOLERANCE = {"reidentify": 40, "cross_view_match": 15, "swap_check": 40}  # frames around the image a choice exists in
+# Answers up to here (2026-11-19 22:11, task 404) undercount single-image flags: the reviewer tired of marking
+# every mixed pose, sliver and bad pose part-way through. Later answers mark every problem.
+FLAGS_EXHAUSTIVE_AFTER = 1795155100.0
 
 
 def table(with_sharpness: bool, dry_run: Path | None) -> None:
@@ -239,6 +242,28 @@ def report() -> None:
     n_unclear = len(images) - n_clear
     print(f"images shown {len(images)} in {len(tasks)} answered tasks; clear {n_clear / len(images):.0%} "
           f"(all tracked detections: {population['clear'] / population['n']:.0%})")
+    # The two batches of answers, and the two ways the images were chosen, kept apart.
+    choice = {}
+    try:
+        db = sqlite3.connect(f"file:{Workspace(FELIX).path('engine.sqlite3')}?mode=ro", uri=True)
+        for task_id, payload in db.execute("select id, payload from tasks where answer is not null"):
+            choice[task_id] = (json.loads(payload).get("unknown") or {}).get("image_choice") or "nearest"
+    except sqlite3.Error:
+        pass
+    for label, part in (("answers with undercounted flags", [e for e in images if answered[e["task"]] <= FLAGS_EXHAUSTIVE_AFTER]),
+                        ("exhaustive answers, nearest frames (control)",
+                         [e for e in images if answered[e["task"]] > FLAGS_EXHAUSTIVE_AFTER and choice.get(e["task"], "nearest") == "nearest"]),
+                        ("exhaustive answers, clearer frames",
+                         [e for e in images if answered[e["task"]] > FLAGS_EXHAUSTIVE_AFTER and choice.get(e["task"]) == "clear"])):
+        if part:
+            single = sum(1 for e in part if e["bad_pose"] or e["exclude"] in ("mixed", "not_person", "unsure"))
+            other = sum(1 for e in part if e["exclude"] == "other_person")
+            unsure = sum(1 for e in part if e["verdict"] == "unsure")
+            print(f"  {label}: {len(part)} images, clear {np.mean([e['clear'] for e in part]):.0%}, single-image flags "
+                  f"{single} ({single / len(part):.1%}), someone else {other} ({other / len(part):.1%}), in groups judged "
+                  f"unsure {unsure}")
+        else:
+            print(f"  {label}: none yet")
 
     def has(e, flag):
         return e["bad_pose"] if flag == "bad_pose" else e["exclude"] == flag
