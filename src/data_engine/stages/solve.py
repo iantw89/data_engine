@@ -27,7 +27,7 @@ import numpy as np
 from ..config import RECIPE
 from ..engine import Context, StageResult
 from ..solve import coverage as coverage_module
-from ..solve import link_ranking, recover
+from ..solve import link_ranking, recover, view_choice
 from ..solve.pipeline import Associated, Constraints, Solved, associate_and_refine, coverage_metrics, identify, unit_scene
 from ..solve.scene import Scene, load_scene
 from ..store import parse_det_key
@@ -137,7 +137,8 @@ def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: C
         tr_root = np.concatenate([tr_root, recovered["root"][use].astype(tr_root.dtype)])
         tr_xyz = np.concatenate([tr_xyz, recovered["xyz"][use].astype(tr_xyz.dtype)])
     result = swap_check.check(scene, row_identity, tr_identity, tr_t, tr_root, tr_xyz, RECIPE["swap_check"],
-                              same_rows=constraints.same, embed=embed)
+                              same_rows=constraints.same, embed=embed,
+                              images=(RECIPE["task_images"], RECIPE["link_ranking"]))
     result["summary"]["recovered_positions_used"] = added
     (context.workspace.round_dir(context.round) / "swap_check.json").write_text(
         json.dumps(result, indent=1), encoding="utf-8")
@@ -145,7 +146,8 @@ def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: C
     for entry in result["entries"]:
         if entry["status"] == "verified" or not entry.get("reference_keys") or not entry.get("after_a_keys"):
             continue
-        if resolved_keys & set(entry["reference_keys"]):
+        anchor = entry.get("anchor_keys") or entry["reference_keys"]
+        if resolved_keys & (set(entry["reference_keys"]) | set(anchor)):
             continue  # a person already said this moment cannot be judged
         start, end = entry["t"]
         cues = entry["cues"]
@@ -164,7 +166,7 @@ def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: C
             "" if entry["swap_cues"] or entry["stay_cues"] else "no independent cue could decide"]))
         # The subject is the identity's reference detection before the moment. One identity can meet two
         # others within the same seconds: those are separate questions, told apart by the other party.
-        subject = f"identity_swap:{entry['reference_keys'][0]}"
+        subject = f"identity_swap:{anchor[0]}"
         if subject in subjects:
             other = (entry.get("before_b_keys") or entry.get("after_b_keys") or [f"identity {entry['b']}"])[0]
             subject = f"{subject}|{other}"
@@ -182,6 +184,7 @@ def swap_unknowns(context: Context, scene: Scene, solved: Solved, constraints: C
                        "swap_cues": entry["swap_cues"], "stay_cues": entry["stay_cues"],
                        "reference_keys": entry["reference_keys"], "after_a_keys": entry["after_a_keys"],
                        "after_b_keys": entry["after_b_keys"], "before_b_keys": entry["before_b_keys"],
+                       "image_choice": entry.get("image_choice", "nearest"),
                        "why": f"{why} ({said})",
                        "resolve_by": "a person compares each one before and after the moment"}})
     return {"unknowns": unknowns, "summary": result["summary"]}
@@ -277,13 +280,23 @@ def load_constraints(context: Context, scene: Scene) -> tuple[Constraints, dict]
     return constraints, {"used": used, "resolved_keys": resolved_keys}
 
 
-def representative_keys(scene: Scene, camera_index: int, rows: np.ndarray, count: int = 3) -> list[str]:
-    """Evenly spaced detections of a piece, as detection keys."""
+def representative_keys(scene: Scene, camera_index: int, rows: np.ndarray, count: int = 3, *,
+                        clear: dict | None = None, reach: int = 15) -> list[str]:
+    """Evenly spaced detections of a piece, as detection keys. With ``clear`` (the clear-view rule), each is
+    exchanged for the nearest clear view of the piece within ``reach`` frames, where there is one."""
     camera = scene.cameras[camera_index]
     rows = rows[camera.t[rows] >= 0]
     if not len(rows):
         return []
     picks = rows[np.unique(np.linspace(0, len(rows) - 1, min(count, len(rows))).round().astype(int))]
+    if clear is not None:
+        size = image_sizes(scene)[camera_index]
+        shown = []
+        for pick in picks:
+            pool = rows[np.abs(camera.t[rows] - camera.t[pick]) <= reach]
+            best = view_choice.clearer(camera, int(pick), pool, size, scene.joint_peak, clear)
+            shown.append(best if best not in shown else int(pick))
+        picks = shown
     return [camera.detections.key(int(r)) for r in picks]
 
 
@@ -299,10 +312,12 @@ def component_keys_at(scene: Scene, labels: recover.Labels, label: int, t: int, 
 
     ``avoid``: detections a person could not judge ("unsure": too little visible); another detection of the
     camera within the tolerance is taken instead where there is one. ``clear`` (the clear-view rule of
-    ``RECIPE["link_ranking"]``): prefer detections that show the whole person, not overlapped by anyone -
-    within a camera the nearest clear one, and cameras with a clear view before the others."""
+    ``RECIPE["link_ranking"]``): the detection of each camera is exchanged for the nearest clear view of the
+    same piece of that camera's tracklet within the tolerance (``solve/view_choice.py``). Which cameras are
+    shown, and which piece of each, does not depend on it."""
     options = []
     sizes = image_sizes(scene) if clear is not None else None
+    atoms = getattr(labels, "atom", None)
     for camera in scene.cameras:
         if camera.index == exclude_camera:
             continue
@@ -313,16 +328,14 @@ def component_keys_at(scene: Scene, labels: recover.Labels, label: int, t: int, 
         if avoid:
             judged = np.array([camera.detections.key(int(row)) not in avoid for row in rows])
             rows = rows[judged] if judged.any() else rows
-        is_clear = False
-        if clear is not None:
-            good = link_ranking.clear_view(
-                link_ranking.view_quality(camera, rows, sizes[camera.index], scene.joint_peak, clear["border_px"]), clear)
-            if good.any():
-                rows, is_clear = rows[good], True
         nearest = rows[np.argmin(np.abs(camera.t[rows] - t))]
         box = camera.detections.boxes[nearest]
-        options.append((is_clear, float((box[2] - box[0]) * (box[3] - box[1])), camera.detections.key(int(nearest))))
-    return [key for *_, key in sorted(options, reverse=True)[:count]]
+        shown = int(nearest)
+        if clear is not None:
+            piece = rows if atoms is None else rows[atoms[camera.index][rows] == atoms[camera.index][nearest]]
+            shown = view_choice.clearer(camera, shown, piece, sizes[camera.index], scene.joint_peak, clear, t=t)
+        options.append((float((box[2] - box[0]) * (box[3] - box[1])), camera.detections.key(shown)))
+    return [key for _, key in sorted(options, reverse=True)[:count]]
 
 
 def rank_link_candidates(solved: Solved, embed=None, log=print) -> dict[int, list[dict]]:
@@ -545,7 +558,10 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str], *, ranked: dict[in
     detections a person left out as "unsure"; other images are shown where there are any."""
     scene, labels, association = solved.scene, solved.labels, solved.association
     ranked = ranked or {}
-    clear = RECIPE["link_ranking"]
+
+    def clear_for(anchor: str) -> dict | None:
+        """The clear-view rule for the images of the question anchored on this detection (None: a control)."""
+        return view_choice.rule(RECIPE["task_images"], RECIPE["link_ranking"], anchor)
     cams = recover.camera_counts(scene, labels)
     multi = {label for label, cameras in cams.items() if len(cameras) >= 2}
     identity = solved.identity_of_label
@@ -608,15 +624,19 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str], *, ranked: dict[in
             continue
         if (labels.duplicate_of[camera_index][rows] >= 0).mean() > 0.5:
             continue  # a second detection of an already tracked person: nothing to ask
+        # ``keys``: the detections the question is anchored on (its closure is recognised by them);
+        # ``shown``: the clearer frames of the same piece a person is shown and answers about.
         keys = representative_keys(scene, camera_index, rows)
-        if not keys or resolved_keys & set(keys):
+        subject_key = camera.detections.key(int(rows[0]))
+        clear = clear_for(subject_key)
+        shown = representative_keys(scene, camera_index, rows, clear=clear) if clear else keys
+        if not keys or resolved_keys & (set(keys) | set(shown)):
             continue
         middle = int(camera.t[rows[len(rows) // 2]])
-        subject_key = camera.detections.key(int(rows[0]))
         options = hypotheses.get(atom, {})
         if options:
             candidates = [{"component": int(label), "identity": int(identity[label]), **info,
-                           "keys": component_keys_at(scene, labels, label, middle)}
+                           "keys": component_keys_at(scene, labels, label, middle, clear=clear)}
                           for label, info in sorted(options.items(), key=lambda kv: -kv[1].get("samples", kv[1].get("frames_matching", 0)))]
             candidates = [c for c in candidates if c["keys"]]
             held_back, candidates = max(0, len(candidates) - 4), candidates[:4]
@@ -625,7 +645,8 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str], *, ranked: dict[in
                     "subject": f"association:{subject_key}", "severity": float(len(rows)),
                     "detail": {"camera": camera.camera, "detections": int(len(rows)), "t": middle,
                                "span_t": [int(camera.t[rows[0]]), int(camera.t[rows[-1]])],
-                               "reference_keys": keys, "candidates": candidates, "more_candidates": held_back,
+                               "reference_keys": shown, "candidates": candidates, "more_candidates": held_back,
+                               "image_choice": "clear" if clear else "nearest",
                                "resolve_by": "a human picks which candidate is the same person, or none"}})
                 continue
         if len(rows) >= MIN_TASK_DETECTIONS and f"policy:review_individually:{camera.camera}" not in resolved_keys:
@@ -640,7 +661,7 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str], *, ranked: dict[in
                 group["examples"].append((int(len(rows)), keys[len(keys) // 2]))
                 continue
         loose.setdefault(camera_index, []).append({
-            "rows": rows, "keys": keys, "t0": int(camera.t[rows[0]]), "t1": int(camera.t[rows[-1]]),
+            "rows": rows, "keys": keys, "shown": shown, "t0": int(camera.t[rows[0]]), "t1": int(camera.t[rows[-1]]),
             "first_box": camera.detections.boxes[rows[0], :4], "last_box": camera.detections.boxes[rows[-1], :4]})
     # Consecutive single-camera pieces of someone who stays in place (a tracker id change or a
     # cut, the box reappearing where it was within 5 s) are one question, not one per piece.
@@ -666,7 +687,7 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str], *, ranked: dict[in
                 "subject": f"unassigned:{camera.detections.key(int(chain[0]['rows'][0]))}", "severity": float(total),
                 "detail": {"camera": camera.camera, "detections": total, "pieces": len(chain),
                            "t": int((chain[0]["t0"] + chain[-1]["t1"]) // 2), "span_t": [chain[0]["t0"], chain[-1]["t1"]],
-                           "reference_keys": [piece["keys"][len(piece["keys"]) // 2] for piece in
+                           "reference_keys": [piece["shown"][len(piece["shown"]) // 2] for piece in
                                               sorted(largest, key=lambda piece: piece["t0"])],
                            # one key per piece: an answer covers the whole chain
                            "member_keys": [piece["keys"][len(piece["keys"]) // 2] for piece in chain],
@@ -721,16 +742,21 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str], *, ranked: dict[in
         if end["end"] != "start":
             continue
         label = end["component"]
-        keys = component_keys_at(scene, labels, label, end["t"] + 5, count=3, tolerance=40)
-        if not keys or resolved_keys & set(keys):
+        # ``anchor``: what the question is recognised by; ``keys``: what is shown and answered about.
+        anchor = component_keys_at(scene, labels, label, end["t"] + 5, count=3, tolerance=40)
+        if not anchor:
             continue
-        if avoid & set(keys):
-            keys = component_keys_at(scene, labels, label, end["t"] + 5, count=3, tolerance=40, avoid=avoid)
+        clear = clear_for(anchor[0])
+        keys = anchor
+        if clear or avoid & set(anchor):
+            keys = component_keys_at(scene, labels, label, end["t"] + 5, count=3, tolerance=40, avoid=avoid, clear=clear)
+        if resolved_keys & (set(anchor) | set(keys)):
+            continue
         size = identity_size.get(int(identity[label]), 0)
         if size < MIN_IDENTITY_DETECTIONS and "policy:review_short_identities" not in resolved_keys:
             brief["count"] += 1
             brief["detections"] += size
-            brief["examples"].append((size, keys[0]))
+            brief["examples"].append((size, anchor[0]))
             continue
         candidates = []
         # Likeliest first (motion, and appearance where both tracks have clear views); the four best are shown.
@@ -776,8 +802,9 @@ def extract_unknowns(solved: Solved, resolved_keys: set[str], *, ranked: dict[in
                 if apart is not None:
                     cannot_both.append({"components": [first["component"], second["component"]], **apart})
         unknowns["identity_link"].append({
-            "subject": f"identity_link:{keys[0]}", "severity": float(summaries[label].detections),
+            "subject": f"identity_link:{anchor[0]}", "severity": float(summaries[label].detections),
             "detail": {"component": int(label), "identity": int(identity[label]), "t": int(end["t"]),
+                       "image_choice": "clear" if clear else "nearest",
                        "reference_keys": keys, "candidates": candidates, "cannot_both": cannot_both,
                        "feasible_candidates": len(end["candidates"]),
                        "why": "this person appears inside the recording; "

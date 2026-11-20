@@ -157,8 +157,21 @@ log-likelihood ratios (same person against a different person):
 
 The card of each candidate says what its place rests on ("appearance alike (0.71, same
 camera)", "appearance not compared (no clear view of both)"). The ranking joins, excludes
-and closes nothing; a link proposed after the coverage recovery still comes first. The
-images shown for a candidate are clear views where the track has any.
+and closes nothing; a link proposed after the coverage recovery still comes first.
+
+**Which frame of a track a question shows** (`solve/view_choice.py`,
+`RECIPE["task_images"]`, `experiments/images/REPORT.md`). A group shows one detection per
+camera, picked where the question is: a track's start or end, the middle of a piece, just
+before or after a crossing. Those are the moments with the worst views; 41% of the images
+shown were clear views although 68% of all tracked detections are. The detection is
+therefore exchanged for the nearest clear view of the *same piece of the same camera's
+tracklet* within the time the rule may choose in (0.4 s away in the median). Cameras and
+pieces stay what the question chose, so a wrong grouping is still shown; single-detection
+problems (a mixed pose, a sliver) are shown less often, which is intended: questions about
+tracks find those by chance only. A question is still recognised by the nearest frames
+(its subject and its closure), so the change re-asks nothing. One question in five keeps
+the nearest frames (`control_share`, fixed per question; `image_choice` in the task
+payload), so that answers keep measuring what the clearer frames hide.
 
 **What a person said about an image is used at once and again later.** One track is a
 candidate in many questions and every question shows the same few images of it. A flag is
@@ -522,6 +535,19 @@ would close `pose_quality`.
   images left out as "unsure" are not shown again where the track has others: the
   reviewer was flagging the same image of a candidate track in question after question
   (9 of 58 flags on felix), because answers take effect only at the next round.
+* **2026-11-20 - questions show the clearest frame of the same piece; a control share keeps
+  the nearest.** The reviewer found many images hard (slivers, cut or overlapped poses) and
+  asked whether easier images would hide the problems being caught. Measured on the 720
+  images of 84 answered tasks (`experiments/images/REPORT.md`): 62% of the unclear images had
+  a clear view of the same piece 0.4 s away; 85% of unclear images drew no flag; flags on
+  unclear images changed between showings for 8 of 12 images; of 31 "someone else" flags, 20
+  were on images the rule leaves alone and 10 of the other 11 could be checked: the exchanged
+  frame leaves the track with the flagged one every time;
+  the single-detection flags that would be lost reach under 0.1% of such detections anyway.
+  Adopted in the narrowest form (same camera, same piece) for re-identification, cross-view,
+  triage and swap questions, with 20% of the questions as a control. The broader choice
+  made for re-identification candidates the day before (any piece of the camera, cameras
+  with clear views first) is withdrawn: it would have hidden at least 2 of the 31.
 * **2026-11-20 - neighbours of a flagged image; human cuts land on the right piece.** A
   "someone else" flag takes the image's piece out of its track; the rest of the
   single-camera tracklet around it could stay. It is now asked about (continuity question,

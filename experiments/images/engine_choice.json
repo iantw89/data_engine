@@ -1,0 +1,83 @@
+{
+ "identity_link / nearest": {
+  "questions": 202,
+  "same subjects as before": true,
+  "control questions": 201,
+  "images": 2315,
+  "clear": 0.384,
+  "groups without a clear image": 0.375,
+  "images changed": 0
+ },
+ "identity_link / adopted": {
+  "questions": 202,
+  "same subjects as before": true,
+  "control questions": 46,
+  "images": 2315,
+  "clear": 0.664,
+  "groups without a clear image": 0.156,
+  "images changed": 648
+ },
+ "identity_link / clear, no control": {
+  "questions": 202,
+  "same subjects as before": true,
+  "control questions": 0,
+  "images": 2315,
+  "clear": 0.74,
+  "groups without a clear image": 0.095,
+  "images changed": 823
+ },
+ "association / nearest": {
+  "questions": 108,
+  "same subjects as before": true,
+  "control questions": 108,
+  "images": 639,
+  "clear": 0.448,
+  "groups without a clear image": 0.323,
+  "images changed": 0
+ },
+ "association / adopted": {
+  "questions": 108,
+  "same subjects as before": true,
+  "control questions": 28,
+  "images": 639,
+  "clear": 0.645,
+  "groups without a clear image": 0.199,
+  "images changed": 126
+ },
+ "association / clear, no control": {
+  "questions": 108,
+  "same subjects as before": true,
+  "control questions": 0,
+  "images": 639,
+  "clear": 0.729,
+  "groups without a clear image": 0.135,
+  "images changed": 180
+ },
+ "unassigned / nearest": {
+  "questions": 180,
+  "same subjects as before": true,
+  "control questions": 0,
+  "images": 441,
+  "clear": 0.172,
+  "groups without a clear image": 0.653,
+  "images changed": 0
+ },
+ "unassigned / adopted": {
+  "questions": 180,
+  "same subjects as before": true,
+  "control questions": 0,
+  "images": 441,
+  "clear": 0.227,
+  "groups without a clear image": 0.549,
+  "images changed": 24
+ },
+ "unassigned / clear, no control": {
+  "questions": 180,
+  "same subjects as before": true,
+  "control questions": 0,
+  "images": 441,
+  "clear": 0.234,
+  "groups without a clear image": 0.543,
+  "images changed": 27
+ }
+}

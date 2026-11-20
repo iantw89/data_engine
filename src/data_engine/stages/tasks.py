@@ -377,7 +377,9 @@ def run(context: Context) -> StageResult:
         if task_type != task["type"]:
             continue
         payload["unknown"] = {"id": unknown["id"], "kind": unknown["kind"], "subject": unknown["subject"],
-                              "meaning": KINDS[unknown["kind"]].meaning}
+                              "meaning": KINDS[unknown["kind"]].meaning,
+                              **({"image_choice": unknown["detail"]["image_choice"]}
+                                 if (unknown.get("detail") or {}).get("image_choice") else {})}
         if json.dumps(payload, sort_keys=True) != json.dumps(task["payload"], sort_keys=True):
             db.update_task(task["id"], payload, priority=unknown["severity"])
             refreshed += 1
@@ -402,7 +404,9 @@ def run(context: Context) -> StageResult:
             skipped_budget += 1
             continue
         payload["unknown"] = {"id": unknown["id"], "kind": unknown["kind"], "subject": unknown["subject"],
-                              "meaning": KINDS[unknown["kind"]].meaning}
+                              "meaning": KINDS[unknown["kind"]].meaning,
+                              **({"image_choice": unknown["detail"]["image_choice"]}
+                                 if (unknown.get("detail") or {}).get("image_choice") else {})}
         task_id = db.add_task(task_type, unknown["subject"], payload, priority=unknown["severity"],
                               round_number=context.round, unknown_ids=[unknown["id"]])
         if task_id is not None:

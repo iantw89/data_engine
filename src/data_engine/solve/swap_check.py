@@ -471,9 +471,12 @@ def _human_verified(index: Index, who: int, s: int, e: int, same_rows: list[tupl
 
 
 def _keys(index: Index, who: int, lo: int, hi: int, *, nearest_to: int, count: int = 3,
-          prefer: list[int] | None = None) -> list[str]:
+          prefer: list[int] | None = None, clear: dict | None = None, reach: int = 40) -> list[str]:
     """Up to ``count`` detections of an identity in [lo, hi], one per camera, nearest to ``nearest_to``;
-    cameras in ``prefer`` first, then larger boxes."""
+    cameras in ``prefer`` first, then larger boxes. With ``clear`` (the clear-view rule) each is exchanged for
+    the nearest clear view of the same single-camera tracklet within ``reach`` frames (``view_choice``)."""
+    from . import view_choice
+
     cams, rows, times = index.rows(who, lo, hi)
     options = []
     for camera in index.scene.cameras:
@@ -483,7 +486,14 @@ def _keys(index: Index, who: int, lo: int, hi: int, *, nearest_to: int, count: i
         pick = mine[np.argmin(np.abs(times[mine] - nearest_to))]
         box = camera.detections.boxes[rows[pick]]
         rank = prefer.index(camera.index) if prefer and camera.index in prefer else 99
-        options.append((rank, -float((box[2] - box[0]) * (box[3] - box[1])), camera.detections.key(int(rows[pick]))))
+        shown = int(rows[pick])
+        if clear is not None:
+            near = mine[np.abs(times[mine] - times[pick]) <= reach]
+            pool = rows[near][camera.tracklet[rows[near]] == camera.tracklet[shown]]
+            dataset = index.scene.workspace.dataset.cameras[camera.camera]
+            shown = view_choice.clearer(camera, shown, pool, (int(dataset.width), int(dataset.height)),
+                                        index.scene.joint_peak, clear, t=nearest_to)
+        options.append((rank, -float((box[2] - box[0]) * (box[3] - box[1])), camera.detections.key(shown)))
     return [key for _, _, key in sorted(options)[:count]]
 
 
@@ -542,7 +552,8 @@ def appearance_rows(index: Index, wanted: list[dict], *, per_window: int = 6, mi
 
 def check(scene: Scene, row_identity: list[np.ndarray], tr_identity: np.ndarray, tr_t: np.ndarray,
           tr_root: np.ndarray, tr_xyz: np.ndarray, recipe: dict, *, embeddings=None,
-          same_rows: list[tuple[list, list]] | None = None, embed=None, embed_all: bool = False) -> dict:
+          same_rows: list[tuple[list, list]] | None = None, embed=None, embed_all: bool = False,
+          images: tuple[dict, dict] | None = None) -> dict:
     """Find and test every moment at which two tracks could have exchanged people.
 
     ``scene`` must carry the single-camera tracker's own tracklets (not pieces cut by the 3D tracker).
@@ -574,10 +585,18 @@ def check(scene: Scene, row_identity: list[np.ndarray], tr_identity: np.ndarray,
         if entry["status"] != "verified":
             # Reviewer evidence: the reference is identity a just before; candidates are a and b just after.
             prefer = [index.scene.camera_index(c["camera"]) for c in entry["cues"]["contradicting_tracklets"]]
-            entry["reference_keys"] = _keys(index, a, s - window, s - 1, nearest_to=s - 1, prefer=prefer)
-            entry["after_a_keys"] = _keys(index, a, e + 1, e + window, nearest_to=e + 1, prefer=prefer)
-            entry["after_b_keys"] = _keys(index, b, e + 1, e + window, nearest_to=e + 1, prefer=prefer)
-            entry["before_b_keys"] = _keys(index, b, s - window, s - 1, nearest_to=s - 1, prefer=prefer)
+            # The question is recognised by the frames nearest to the moment (``anchor_keys``); what is shown
+            # are clearer frames of the same tracklets (``images``: the choice recipe and the clear-view rule).
+            anchor = _keys(index, a, s - window, s - 1, nearest_to=s - 1, prefer=prefer)
+            clear = None
+            if images is not None and anchor:
+                from . import view_choice
+                clear = view_choice.rule(images[0], images[1], anchor[0])
+            entry["anchor_keys"], entry["image_choice"] = anchor, "clear" if clear else "nearest"
+            entry["reference_keys"] = _keys(index, a, s - window, s - 1, nearest_to=s - 1, prefer=prefer, clear=clear)
+            entry["after_a_keys"] = _keys(index, a, e + 1, e + window, nearest_to=e + 1, prefer=prefer, clear=clear)
+            entry["after_b_keys"] = _keys(index, b, e + 1, e + window, nearest_to=e + 1, prefer=prefer, clear=clear)
+            entry["before_b_keys"] = _keys(index, b, s - window, s - 1, nearest_to=s - 1, prefer=prefer, clear=clear)
         entries.append(entry)
     statuses = [entry["status"] for entry in entries]
     kinds = [entry["kind"] for entry in entries]

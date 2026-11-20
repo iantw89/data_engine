@@ -177,6 +177,15 @@ RECIPE: dict[str, Any] = {
         # joined (the machinery is tested); that needs an independent check of each link first.
         "enabled": True, "apply": False, "max_laps_per_round": 6,
     },
+    "task_images": {
+        # NEW 2026-11-20 (solve/view_choice.py, experiments/images/REPORT.md): which frame of a piece of track
+        # a question shows. With prefer_clear, the detection the question's own rule picks (nearest to a
+        # track's end, a crossing, ...) is exchanged for the nearest clear view (link_ranking's rule) of the
+        # SAME piece of the SAME camera's tracklet, within the time the rule may choose in. Cameras and
+        # pieces are unchanged. control_share of the questions keep the nearest frames, so that answers keep
+        # measuring what the clearer frames hide. No label depends on it.
+        "prefer_clear": True, "control_share": 0.2,
+    },
     "link_ranking": {
         # NEW 2026-11-19 (solve/link_ranking.py, experiments/links/REPORT.md): the order in which the earlier
         # tracks that could be a newly appearing person are shown in a re-identification question. Nothing
