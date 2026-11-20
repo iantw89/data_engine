@@ -50,7 +50,7 @@ def _strip(payload: dict, answer: dict, problems: list[str]) -> dict:
             "unclear": sorted(set(unclear)), "notes": _notes(answer, problems)}
 
 
-IMAGE_EXCLUSIONS = ("other_person", "mixed", "not_person")
+IMAGE_EXCLUSIONS = ("other_person", "mixed", "not_person", "unsure")
 MODE_BY_TYPE_HINT = {"person": "detection_triage", "duplicate": "pose_ownership"}
 
 
@@ -73,6 +73,29 @@ def answer_mode(payload: dict) -> str:
     if not payload.get("candidates"):
         return "person"
     return "match"
+
+
+def other_before(payload: dict) -> dict | None:
+    """Swap check: the other track just before the moment ({"track", "keys"}), shown for comparison. When the
+    reference is both candidates, the answer also says whether that track showed this person before."""
+    candidates = payload.get("candidates") or []
+    if not any(candidate.get("continuation") for candidate in candidates):
+        return None
+    given = payload.get("other_before") or {}
+    keys = list(given.get("keys") or []) or [panel["highlight"][0] for panel in payload.get("context_panels") or []
+                                               if panel.get("highlight")]
+    others = [candidate for candidate in candidates if not candidate.get("continuation")]
+    if not keys or not others:
+        return None
+    return {"track": given.get("track", others[0].get("track")), "keys": keys, "id": str(others[0]["id"])}
+
+
+def several_allowed(payload: dict) -> bool:
+    """Several candidates can be the reference's person: a track that broke more than once (re-identification),
+    or two tracks on one person (swap check; payloads built before that was allowed do not say so)."""
+    if any(candidate.get("continuation") for candidate in payload.get("candidates") or []):
+        return True
+    return bool(payload.get("multiple", not payload.get("single_choice", True)))
 
 
 def _groups(payload: dict, answer: dict, problems: list[str]) -> dict:
@@ -98,7 +121,8 @@ def _groups(payload: dict, answer: dict, problems: list[str]) -> dict:
             problems.append("bad_pose must be true or false")
             bad_pose = False
         if exclude or bad_pose:
-            cleaned_images[key] = {"exclude": exclude, "bad_pose": bool(bad_pose) and exclude in (None, "other_person")}
+            cleaned_images[key] = {"exclude": exclude,
+                                   "bad_pose": bool(bad_pose) and exclude in (None, "other_person", "unsure")}
     kept = {gid: [key for key in keys if not cleaned_images.get(key, {}).get("exclude")] for gid, keys in groups.items()}
     for key, flags in cleaned_images.items():
         if flags["exclude"] == "other_person" and not kept[group_of[key]]:
@@ -125,12 +149,20 @@ def _groups(payload: dict, answer: dict, problems: list[str]) -> dict:
         else:
             cleaned_values[cid] = None  # nothing left to compare: no answer is needed, and none is recorded
     same = [cid for cid, value in cleaned_values.items() if value == "same"]
-    if len(same) > 1 and not payload.get("multiple", not payload.get("single_choice", True)):
+    if len(same) > 1 and not several_allowed(payload):
         problems.append(f"only one candidate can be 'same' (got {', '.join(same)})")
     for pair in payload.get("cannot_both") or []:
         if all(str(cid) in same for cid in pair["ids"]):
             problems.append(f"{' and '.join(map(str, pair['ids']))} cannot both be 'same': {pair['why']}")
     cleaned = {"images": cleaned_images, "candidates": cleaned_values, "notes": _notes(answer, problems)}
+    other = other_before(payload)
+    if other is not None:
+        # Both tracks show the reference's person after the moment: was the other track this person before too?
+        before = answer.get("other_before")
+        if len(same) > 1 and before not in REFERENCE_VALUES:
+            problems.append(f"{' and '.join(same)} are both the reference: say whether track {other['track']} showed "
+                            "this person before the moment as well (other_before: same, different or unsure)")
+        cleaned["other_before"] = before if len(same) > 1 else None
     if mode == "person":
         verdict = answer.get("verdict")
         if reference_alive and verdict not in ("person", "not_person", "unsure"):

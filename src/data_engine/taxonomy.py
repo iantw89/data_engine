@@ -132,10 +132,15 @@ IMAGE_FLAGS = {
               "not_person(image, problem=mixed_pose, this detection only)"),
     "not_person": ("Not a person", "A reflection, a poster, equipment.",
                    "not_person(image): this detection, or its whole tracklet when every image of the group is flagged"),
+    "unsure": ("Unsure", "Too little of the person is visible to tell whether the image belongs to its group.",
+               "nothing: the image is left out of the answer and stays where the engine put it; a group with "
+               "no other image left counts as 'unsure'"),
     "bad_pose": ("Bad pose", "The right person, but the keypoints are wrong enough to report.",
                  "bad_pose(image): its keypoints are left out of 3D and it is listed for pose correction"),
 }
-ANSWER_MODEL = 2  # version of the 'reference_candidates' answer (1: reference_ok / none_of_these / problems)
+# Version of the 'reference_candidates' answer the server understands
+# (1: reference_ok / none_of_these / problems; 2: flags on single images; 3: 'unsure' image flag, swap check 'both').
+ANSWER_MODEL = 3
 
 # --------------------------------------------------------------------------- task types
 
@@ -201,11 +206,14 @@ TASK_TYPES: dict[str, TaskType] = {task.name: task for task in [
         "Positive/negative fragment pairs are ReID training pairs for this camera set and calibrate the appearance margin."),
     TaskType(
         "swap_check", "Identity swap check",
-        "Two people came close. Which of the candidates (after) is reference A (before)? Neither is a valid answer.",
+        "Two people came close. Which of the candidates (after) is reference A (before)? Neither and both are "
+        "valid answers.",
         "reference_candidates",
         {"images": "{detection key: {'exclude': ..., 'bad_pose': bool}}",
-         "candidates": "{candidate id: 'same' | 'different' | 'unsure'} - at most one 'same'; both 'different' = "
-                       "neither", "notes": "str"},
+         "candidates": "{candidate id: 'same' | 'different' | 'unsure'} - both 'different' = neither; both 'same' = "
+                       "the two tracks show one person after the moment",
+         "other_before": "'same' | 'different' | 'unsure' - only when both are 'same': did the other track show "
+                         "this person before the moment as well", "notes": "str"},
         ("same", "different", "split", "not_person", "bad_pose", "undeterminable"),
         "Confirmed swaps and confirmed non-swaps calibrate the swap cues (body, heading, appearance) and are "
         "hard cases for the 3D tracker's association."),

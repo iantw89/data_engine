@@ -202,7 +202,8 @@ def swap_task(context: Context, unknown: dict) -> tuple[str, dict]:
                            {"closest distance (m)": detail.get("min_distance_m"), **{
                                key.replace("_", " "): value for key, value in detail["cues"].items() if value is not None}},
                            seconds)
-    payload["question"] = f"Reference A is person {a} just before. Which candidate shows the same person just after?"
+    payload["question"] = (f"Reference A is person {a} just before. Which candidate shows the same person just "
+                           "after? Both, if both show this person; neither, if neither does.")
     payload["reference"] = {"id": "A", "caption": f"person {a}, just before",
                             "panels": [panel(context, key, label="A") for key in detail["reference_keys"]]}
     payload["candidates"] = [{
@@ -218,8 +219,10 @@ def swap_task(context: Context, unknown: dict) -> tuple[str, dict]:
     if detail.get("before_b_keys"):
         payload["context_panels"] = [panel(context, key, label=f"person {b} before", color=COLORS[2])
                                      for key in detail["before_b_keys"]]
+        # Asked only when A is both candidates: did track b show this person before the moment as well?
+        payload["other_before"] = {"track": b, "keys": detail["before_b_keys"]}
     payload["reference_keys"] = detail["reference_keys"]
-    answers(payload, "match",
+    answers(payload, "match", multiple=True,
             same="{ref} is {ids}.",
             none_closed=f"{{ref}} is neither: track {a} did not stay on this person and is cut at this moment.")
     return "swap_check", payload
@@ -324,7 +327,8 @@ def run(context: Context) -> StageResult:
     unsure = set()
     for task in db.tasks(status="applied"):
         answer = task["answer"] or {}
-        values = list((answer.get("candidates") or {}).values()) + [answer.get("choice")]
+        values = list((answer.get("candidates") or {}).values()) + [answer.get("choice"), answer.get("verdict")]
+        values += [flags.get("exclude") for flags in (answer.get("images") or {}).values() if isinstance(flags, dict)]
         if ("unsure" in values or "keep_open" in values) and "same" not in values:
             unsure.add((task["subject"], evidence_signature(task["payload"])))
     created: dict[str, int] = {}

@@ -96,7 +96,7 @@ it needs a skeleton editor.
 | `continuity` | Do all crops show one person? | `same` or `split` (+ `different`) |
 | `cross_view_match` | Which tracked person, if any, is the person in A? (one) | `same` / `different`; none and no further candidate: single-camera track |
 | `reidentify` | Which earlier tracks are A's person? (several possible) | `same` / `different`; none and no further candidate: separate person |
-| `swap_check` | Which candidate (after) is A (before)? (one, or neither) | no swap: `same`; swap: `same` + `split`; neither: `split` |
+| `swap_check` | Which candidate (after) is A (before)? (one, neither, or both) | no swap: `same`; swap: `same` + `split`; neither: `split`; both: `same` twice, then for the other track before the moment `same` (one person tracked twice) or `split` (it moved onto this person) |
 | `detection_triage` | Is this a real person? | `not_person`, or single-view person |
 | `pose_ownership` | One person detected twice, or two people? | `duplicate` (with the better pose) or `different` |
 | `visibility_check` | Is the projected person visible here? | `undeterminable` (occluded / out of view) or a pose task |
@@ -112,14 +112,15 @@ from the current solve at the end of every round; answered ones are never touche
 group is a set of crops the engine believes to be one person. The person answers in two
 layers, and the screen says in words what the answer will do before it is sent.
 
-1. *Any single image can be flagged.* Three flags take the image out of its group, and the
-   question is then answered with the images that remain; the fourth leaves it in.
+1. *Any single image can be flagged.* Four flags take the image out of its group, and the
+   question is then answered with the images that remain; the fifth leaves it in.
 
    | Flag | Means | Becomes | Follow-up |
    |---|---|---|---|
    | Someone else | a clean detection of another person: the grouping is wrong here | `different(image, rest of its group)` | the solve regroups; if image and rest lie in one single-camera tracklet, a `tracklet_purity` unknown and a `continuity` task ask where the tracklet changes person |
    | Two people in one pose | the skeleton takes joints from two people | `not_person(image, mixed_pose)`, that detection only | - |
    | Not a person | reflection, poster, equipment | `not_person(image)`: that detection, or its tracklet when every image of the group is flagged | - |
+   | Unsure | too little of the person is visible to tell whether the image belongs | nothing: the answer does not cover the image, and it stays where the engine put it | a group with no other image left counts as "unsure": the question stays open and is not asked again with the same images |
    | Bad pose | the right person, keypoints wrong | `bad_pose(image)`: its keypoints give no rays (no part in 3D), the detection keeps its identity | a `pose_quality` unknown, open until pose correction exists |
 
 2. *A verdict on what remains.* Per candidate: same, different or unsure
@@ -138,7 +139,14 @@ any candidate keeps the question open and still records every "different".
 
 Several candidates can be the same person in `reidentify` (a track that broke more than
 once); two candidates measured at the same instants in different places exclude each other
-(`cannot_both`). The other types take one.
+(`cannot_both`). `cross_view_match` takes one.
+
+`swap_check` takes both: after the moment the two tracks then show one person. The reference
+is joined to both, and one more answer is asked for on the same screen, about the images of
+the other track just before the moment (shown for comparison in every swap check): the same
+person (one person tracked twice: joined), someone else (the other track moved onto this
+person: it is cut at the moment, `split`), or unsure (nothing recorded about its earlier
+part). Without such images the follow-up is not asked.
 
 Not yet: flags on the images of the strip and decision screens; the CVAT hand-off that
 would close `pose_quality`.
@@ -442,6 +450,13 @@ would close `pose_quality`.
   pose are different facts with different consequences. Re-identification takes several
   "same" answers. Pose ownership asks which pose is better. Answers given under model 1
   keep their meaning (`apply._reference_candidates`).
+* **2026-11-19 - image flag "unsure"; a swap check can be answered "both".** A sliver of a
+  person can be impossible to assign; "unsure" on the image leaves it out of the answer and
+  records nothing (unknown is not negative, and not positive either). In a swap check both
+  candidates can show the reference's person (two tracks on one person); the single-choice
+  rule forced a false "different". "Both" asks one follow-up about the other track before the
+  moment, because joining it without that answer would assume its earlier part is the same
+  person. Also fixed: a triage answered "unsure" was asked again with the same images.
 * **2026-11-19 - identity after the recovery (identity lap); links through recovered
   positions are proposals.** The recovery moves track ends (felix: 78 ends and 115 starts,
   median 0.6 s, at most 67 s), which made the linking rule accept 8 more links on the felix

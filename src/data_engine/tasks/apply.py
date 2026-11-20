@@ -29,12 +29,13 @@ def _groups(workspace: Workspace, task: dict, round_number: int) -> tuple[int, b
     * someone else      different(image, rest of its group)
     * mixed             not_person(image, problem=mixed_pose), this detection only
     * not a person      not_person(image): this detection - its whole tracklet when every image of its group is flagged
+    * unsure            nothing: the image is left out of the answer (too little visible to tell)
     * bad pose          bad_pose(image); does not change the verdict
     Verdicts bind the images that were not taken out. The question is closed (returns decided) when a
     candidate is the same person, when nothing is left of the reference, or when every candidate that
     could be judged is a different person and the engine holds no further candidates back.
     """
-    from ..web.validate import answer_mode, group_keys
+    from ..web.validate import answer_mode, group_keys, other_before
 
     payload, answer = task["payload"], task["answer"]
     images = answer.get("images") or {}
@@ -67,8 +68,15 @@ def _groups(workspace: Workspace, task: dict, round_number: int) -> tuple[int, b
                 _add(workspace, "bad_pose", [key], None, task, round_number)
                 created += 1
     mode = answer_mode(payload)
+
+    def unsure_only(gid: str) -> bool:
+        """No image of the group is left to judge, and at least one was left out as 'unsure'."""
+        return not kept.get(gid) and any(excluded(key) == "unsure" for key in groups.get(gid, []))
+
     if not reference:
-        return created, True  # nothing is left of the reference: the flags are the whole answer
+        # Nothing is left of the reference: the flags are the whole answer - unless an image was only left
+        # out as unsure, which says nothing about it: the question stays open.
+        return created, not unsure_only(reference_id)
     if mode == "person":
         verdict = answer.get("verdict")
         if verdict == "not_person":
@@ -80,9 +88,12 @@ def _groups(workspace: Workspace, task: dict, round_number: int) -> tuple[int, b
         return created, False
     candidates = {str(c["id"]): c for c in payload.get("candidates", [])}
     values = answer.get("candidates") or {}
-    decided, judged = False, []
+    decided, judged, same_as_reference = False, [], []
     for candidate_id, candidate in candidates.items():
         keys, verdict = kept.get(candidate_id) or [], values.get(candidate_id)
+        if not keys and unsure_only(candidate_id):
+            judged.append("unsure")  # its images could not be judged: that is not "different"
+            continue
         if not keys:
             decided = decided or mode == "duplicate"  # one of the two poses is gone: nothing left to own
             continue
@@ -99,6 +110,7 @@ def _groups(workspace: Workspace, task: dict, round_number: int) -> tuple[int, b
         elif verdict == "same":
             _add(workspace, "same", reference, keys, task, round_number)
             created, decided = created + 1, True
+            same_as_reference.append(candidate_id)
         elif verdict == "different" and task["type"] == "swap_check" and candidate.get("continuation"):
             # The track did not stay on this person: cut each camera's tracklet at the later detection
             # (a 'split' also keeps the two sides apart) so the solver can re-link the pieces.
@@ -108,6 +120,21 @@ def _groups(workspace: Workspace, task: dict, round_number: int) -> tuple[int, b
             decided = True
         elif verdict == "different":
             _add(workspace, "different", reference, keys, task, round_number)
+            created += 1
+    other = other_before(payload) if task["type"] == "swap_check" else None
+    if other is not None and len(same_as_reference) > 1:
+        # The reference is both candidates: after the moment the two tracks show one person. What the other
+        # track showed before decides whether it is that person tracked twice, or a track that changed person.
+        before = answer.get("other_before")
+        if before == "same":
+            _add(workspace, "same", reference, other["keys"], task, round_number, reason="one person tracked twice")
+            created += 1
+        elif before == "different":
+            for key in kept.get(other["id"]) or []:
+                _add(workspace, "split", other["keys"], [key], task, round_number,
+                     reason="the other track moved onto the reference's person")
+                created += 1
+            _add(workspace, "different", reference, other["keys"], task, round_number)
             created += 1
     if mode == "match" and not decided and judged and all(verdict == "different" for verdict in judged) \
             and not payload.get("more_candidates"):

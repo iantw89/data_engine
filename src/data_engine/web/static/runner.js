@@ -451,14 +451,17 @@ function buildStrip(ctx, task, sizes) {
 }
 
 // ---------------------------------------------------------------- groups of images: reference + candidates
-// Any image can be flagged. Three flags take the image out of its group - the answer then applies to the
+// Any image can be flagged. Four flags take the image out of its group - the answer then applies to the
 // images that remain - and 'bad pose' leaves it in and reports the keypoints (taxonomy.IMAGE_FLAGS).
+// 'Unsure' records nothing about the image: too little is visible to tell whether it belongs.
 const IMAGE_FLAGS = [
   ['other_person', 'X', 'Someone else', 'not the person the rest of this group shows'],
   ['mixed', 'M', 'Two people in one pose', 'the skeleton takes joints from two people'],
   ['not_person', 'N', 'Not a person', 'reflection, poster, equipment'],
+  ['unsure', 'Q', 'Unsure', 'too little visible to tell - nothing is recorded about it'],
 ];
-const FLAG_TEXT = { other_person: 'someone else', mixed: 'two people in one pose', not_person: 'not a person' };
+const FLAG_KEYS = { x: 'other_person', m: 'mixed', n: 'not_person', q: 'unsure' };
+const FLAG_TEXT = { other_person: 'someone else', mixed: 'two people in one pose', not_person: 'not a person', unsure: 'unsure' };
 let closeFlagMenu = null;
 document.addEventListener('click', () => { if (closeFlagMenu) closeFlagMenu(); });
 
@@ -470,7 +473,9 @@ function buildReference(ctx, task, sizes) {
   // What is asked: 'match' (is each candidate the reference's person), 'person' (is the reference a real
   // person), 'duplicate' (two poses: one person or two). Older payloads do not say; the task type does.
   const mode = p.mode || (task.type === 'detection_triage' || !candidates.length ? 'person' : task.type === 'pose_ownership' ? 'duplicate' : 'match');
-  const multiple = p.multiple !== undefined ? !!p.multiple : task.type === 'reidentify';
+  // A swap check always takes several: both candidates can show the reference's person (two tracks on one person).
+  const isSwap = task.type === 'swap_check' || candidates.some((c) => c.continuation);
+  const multiple = isSwap || (p.multiple !== undefined ? !!p.multiple : task.type === 'reidentify');
   const cannotBoth = p.cannot_both || [];
   const texts = p.texts || {};
   const keyOf = (panel) => (panel.highlight && panel.highlight[0]) || null;
@@ -478,9 +483,18 @@ function buildReference(ctx, task, sizes) {
   if (ref) groups[refId] = (ref.panels || []).map(keyOf).filter(Boolean);
   candidates.forEach((c) => { groups[String(c.id)] = (c.panels || []).map(keyOf).filter(Boolean); });
   const ids = candidates.map((c) => String(c.id));
-  const s = { images: {}, values: Object.fromEntries(ids.map((id) => [id, null])), verdict: null, better: null };
+  const s = { images: {}, values: Object.fromEntries(ids.map((id) => [id, null])), verdict: null, better: null, otherBefore: null };
   const flagOf = (key) => (s.images[key] || {}).exclude || null;
   const kept = (gid) => (groups[gid] || []).filter((key) => !flagOf(key));
+  // No image of the group is left to judge and at least one was left out as unsure: that group counts as "unsure".
+  const unsureOnly = (gid) => !kept(gid).length && (groups[gid] || []).some((key) => flagOf(key) === 'unsure');
+  // Swap check: the track that should continue the reference (stay), the other track (other), and the other
+  // track just before the moment - asked about only when the reference is both candidates.
+  const stay = isSwap ? candidates.find((c) => c.continuation) || null : null;
+  const other = isSwap ? candidates.find((c) => !c.continuation) || null : null;
+  const beforeKeys = ((p.other_before || {}).keys || (p.context_panels || []).map(keyOf).filter(Boolean));
+  const otherBefore = isSwap && other && beforeKeys.length ? { track: (p.other_before || {}).track ?? other.track } : null;
+  const bothSame = () => isSwap && ids.filter((id) => kept(id).length && kept(refId).length && s.values[id] === 'same').length > 1;
   const refAlive = () => !ref || kept(refId).length > 0;
   const alive = (id) => refAlive() && kept(id).length > 0;
   const conflict = () => cannotBoth.find((pair) => pair.ids.every((id) => alive(String(id)) && s.values[String(id)] === 'same')) || null;
@@ -512,7 +526,7 @@ function buildReference(ctx, task, sizes) {
     const item = (label, hint, on, act, k) => h('button', { type: 'button', class: `flag-item ${on ? 'on' : ''}`, role: 'menuitemcheckbox', 'aria-checked': String(!!on),
       onclick: (e) => { e.stopPropagation(); act(); closeMenu(); } }, h('span', { class: 'flag-label' }, label), h('span', { class: 'flag-hint' }, hint), h('kbd', {}, k));
     menu = h('div', { class: 'flag-menu', role: 'menu', dataset: { key }, onclick: (e) => e.stopPropagation() },
-      h('div', { class: 'flag-head' }, 'Take this image out - it shows'),
+      h('div', { class: 'flag-head' }, 'Take this image out of its group'),
       IMAGE_FLAGS.filter(([flag]) => !(flag === 'other_person' && alone)).map(([flag, k, label, hint]) => item(label, hint, cur.exclude === flag, () => setFlag(key, flag), k)),
       h('div', { class: 'flag-head' }, 'Or keep it, and report'),
       item('Bad pose', 'right person, keypoints wrong', !!cur.bad_pose, () => toggleBad(key), 'P'));
@@ -523,7 +537,7 @@ function buildReference(ctx, task, sizes) {
     const fig = panelFigure(ctx, panel, { lo: sizes.lo, hi: sizes.hi });
     if (!key) return fig;
     const state = h('div', { class: 'img-state' });
-    const flagBtn = h('button', { type: 'button', class: 'flag-btn', title: 'Flag this image: someone else (X), two people in one pose (M), not a person (N), bad pose (P)', 'aria-label': 'Flag this image', 'aria-haspopup': 'menu',
+    const flagBtn = h('button', { type: 'button', class: 'flag-btn', title: 'Flag this image: someone else (X), two people in one pose (M), not a person (N), unsure (Q), bad pose (P)', 'aria-label': 'Flag this image', 'aria-haspopup': 'menu',
       onclick: (e) => { e.stopPropagation(); openMenu(key, gid, wrap); } }, '⚑');
     const wrap = h('div', { class: 'img-tile', dataset: { key } }, fig, flagBtn, state);
     wrap.addEventListener('mouseenter', () => { hovered = { key, gid }; });
@@ -555,7 +569,31 @@ function buildReference(ctx, task, sizes) {
     h('button', { type: 'button', class: 'choice better', 'aria-pressed': 'false', dataset: { value: v }, onclick: () => { s.better = v; refresh(); } }, label));
   const betterRow = betterBtns.length ? h('div', { class: 'better-row' }, h('span', {}, 'They are one person. Which pose should be used?'),
     h('div', { class: 'seg', role: 'group', 'aria-label': 'Which pose is better' }, betterBtns)) : null;
+  const beforeBtns = !otherBefore ? [] : [['same', 'Same person', 'same'], ['different', 'Someone else', 'different'], ['unsure', 'Unsure', 'unsure']].map(([v, label, cls]) =>
+    h('button', { type: 'button', class: `choice ${cls}`, 'aria-pressed': 'false', dataset: { value: v }, onclick: () => { s.otherBefore = s.otherBefore === v ? null : v; refresh(); } }, label));
+  const beforeRow = beforeBtns.length ? h('div', { class: 'better-row' }, h('span', {}, `${refId} is both candidates. Did track ${otherBefore.track} show this person before the moment too (these images)?`),
+    h('div', { class: 'seg', role: 'group', 'aria-label': `Did track ${otherBefore.track} show this person before the moment` }, beforeBtns)) : null;
   const status = h('div', { class: 'cand-status', 'aria-live': 'polite' });
+
+  // Swap check: what the two answers do together. Returns [text, what is still missing].
+  function swapOutcome(live) {
+    const a = stay ? stay.track : '?', b = other ? other.track : '?';
+    const vStay = stay && live.includes(String(stay.id)) ? s.values[String(stay.id)] : null;
+    const vOther = other && live.includes(String(other.id)) ? s.values[String(other.id)] : null;
+    if (vStay === 'same' && vOther === 'same') {
+      const head = `${refId} is both: no swap, track ${a} stays on this person, and track ${b} shows the same person after this moment.`;
+      if (!otherBefore) return [`${head} Track ${b} is joined to this person.`, null];
+      if (!s.otherBefore) return [null, `${refId} is both candidates: did track ${b} show this person before the moment too? Answer under the comparison images - Unsure is a valid answer.`];
+      if (s.otherBefore === 'same') return [`${head} It did before as well: one person tracked twice, and the two tracks are joined.`, null];
+      if (s.otherBefore === 'different') return [`${head} Before, track ${b} showed someone else: it is cut at this moment and only its later part is joined to this person.`, null];
+      return [`${head} Nothing is recorded about track ${b} before this moment.`, null];
+    }
+    if (vStay === 'same') return [`No swap: track ${a} stays on this person.`, null];
+    const cut = `track ${a} did not stay on this person and is cut at this moment`;
+    if (vOther === 'same') return [vStay === 'different' ? `A swap: this person continues under the label ${b}; ${cut}.` : `${refId} continues under the label ${b} after this moment. Track ${a} is not cut, because its candidate was not judged different.`, null];
+    if (vStay === 'different') return [vOther === 'different' || !other ? `${refId} is neither: ${cut}.` : `${cut[0].toUpperCase()}${cut.slice(1)}. Nothing is recorded about track ${b}.`, null];
+    return ['The question stays open; every "different" is still recorded.', null];
+  }
 
   const fill = (text, who, n) => String(text || '').replace('{ref}', refId).replace('{ids}', who || '').replace('{n}', n === undefined ? '' : n);
   // What this answer will do, in words; `warn` is what still has to be answered before it can be sent.
@@ -563,7 +601,7 @@ function buildReference(ctx, task, sizes) {
     const said = [];
     let warn = null;
     for (const t of tiles) if (flagOf(t.key) === 'other_person' && !kept(t.gid).length) warn = `"Someone else" needs one image of ${t.gid} left as the person the others differ from. Leave one unflagged, or use "not a person" / "two people in one pose".`;
-    if (!warn && !refAlive()) said.push(`No image of ${refId} is left: the flags are the whole answer.`);
+    if (!warn && !refAlive()) said.push(unsureOnly(refId) ? `No image of ${refId} is left to judge, and at least one is unsure: the question stays open.` : `No image of ${refId} is left: the flags are the whole answer.`);
     else if (!warn && mode === 'person') {
       if (s.verdict === 'person') said.push(texts.person || 'A real person.');
       else if (s.verdict === 'not_person') said.push(texts.not_person || 'Not a person.');
@@ -577,14 +615,19 @@ function buildReference(ctx, task, sizes) {
       if (clash) warn = `${clash.ids.join(' and ')} cannot both be ${refId}: ${clash.why}.`;
       else if (!multiple && sames.length > 1) warn = `Only one of these can be ${refId} (now ${sames.join(', ')}).`;
       else if (undecided.length) warn = `${undecided.join(', ')} still need${undecided.length === 1 ? 's' : ''} an answer - Unsure is a valid one.`;
-      else if (!live.length) said.push('No candidate has an image left to compare: the flags are the whole answer.');
-      else if (mode === 'duplicate') {
+      else if (!live.length) said.push(ids.some(unsureOnly) ? 'No candidate has an image left to judge, and at least one is unsure: the question stays open.' : 'No candidate has an image left to compare: the flags are the whole answer.');
+      else if (isSwap) {
+        const [text, missing] = swapOutcome(live);
+        if (missing) warn = missing; else said.push(text);
+      } else if (mode === 'duplicate') {
         const v = s.values[live[0]];
         if (v === 'same') said.push(`${texts.same || 'One person with two poses.'}${s.better && s.better !== 'equal' ? ` Pose ${s.better} is the one used.` : ''}`);
         else said.push(v === 'different' ? (texts.different || 'Two people.') : 'Unsure: nothing is recorded, and the question stays open.');
       } else if (sames.length) {
         const special = sames.map((id) => candidates.find((c) => String(c.id) === id).if_same).filter(Boolean);
         said.push(special.length ? special.join(' ') : fill(texts.same || '{ref} is {ids}.', sames.join(' and ')));
+      } else if (live.every((id) => s.values[id] === 'different') && ids.some(unsureOnly)) {
+        said.push('A candidate whose images are all unsure keeps the question open; every "different" is still recorded.');
       } else if (live.every((id) => s.values[id] === 'different')) {
         said.push(p.more_candidates ? fill(texts.none_more || '{ref} is none of these.', '', p.more_candidates) : fill(texts.none_closed || '{ref} is none of these.'));
       } else said.push('With "unsure" among the answers the question stays open; every "different" is still recorded.');
@@ -610,12 +653,16 @@ function buildReference(ctx, task, sizes) {
       const id = String(c.id), card = cardEls[i], live = alive(id), v = live ? s.values[id] : null;
       card.className = `cand ${v ? 'v-' + v : live ? 'undecided' : 'void'}`;
       card._buttons.forEach((b) => { const on = b.dataset.value === v; b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); b.disabled = !live; });
-      card._note.textContent = live ? '' : kept(id).length ? `nothing left of ${refId} to compare with` : 'no image left - no answer needed';
+      card._note.textContent = live ? '' : kept(id).length ? `nothing left of ${refId} to compare with` : unsureOnly(id) ? 'every image unsure - counts as unsure' : 'no image left - no answer needed';
     });
     verdictBtns.forEach((b) => { const on = b.dataset.value === s.verdict; b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); b.disabled = !refAlive(); });
     if (betterRow) {
       betterRow.hidden = !(ids.length && alive(ids[0]) && s.values[ids[0]] === 'same');
       betterBtns.forEach((b) => { const on = b.dataset.value === (s.better || 'equal'); b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); });
+    }
+    if (beforeRow) {
+      beforeRow.hidden = !bothSame();
+      beforeBtns.forEach((b) => { const on = b.dataset.value === s.otherBefore; b.setAttribute('aria-pressed', String(on)); b.classList.toggle('on', on); });
     }
     if (refCard) refCard.classList.toggle('bad', !refAlive());
     const { warn, text } = summary();
@@ -627,7 +674,7 @@ function buildReference(ctx, task, sizes) {
     h('div', { class: 'cand-head' }, h('span', { class: 'ref-badge' }, refId), h('strong', {}, 'Reference'), h('span', { class: 'muted cap' }, ref.caption || '')),
     verdictBtns.length ? h('div', { class: 'cand-controls verdict' }, h('div', { class: 'seg', role: 'group', 'aria-label': 'Is this a real person?' }, verdictBtns)) : null,
     images(ref.panels, refId),
-    (p.context_panels || []).length ? h('div', { class: 'context-block' }, h('div', { class: 'muted small' }, 'For comparison - not part of the answer'), panelRow(ctx, p.context_panels, { lo: sizes.lo, hi: sizes.hi })) : null) : null;
+    (p.context_panels || []).length ? h('div', { class: 'context-block' }, h('div', { class: 'muted small' }, beforeRow ? `For comparison - asked about only when ${refId} is both candidates` : 'For comparison - not part of the answer'), panelRow(ctx, p.context_panels, { lo: sizes.lo, hi: sizes.hi }), beforeRow) : null) : null;
   if (betterRow && cardEls.length) cardEls[0].append(betterRow);  // right under the answer it belongs to
   const el = h('section', { class: `ref-ui ${ref ? '' : 'no-ref'} ${ids.length ? '' : 'no-cand'}`, style: { '--cols': Math.min(candidates.length, 3) } },
     refCard, ids.length ? h('div', { class: 'cand-grid' }, cardEls) : null);
@@ -641,20 +688,20 @@ function buildReference(ctx, task, sizes) {
     for (const other of ids) if (other !== id && alive(other) && (!s.values[other] || (!multiple && s.values[other] === 'same'))) s.values[other] = 'different';
     refresh();
   };
-  const flagHelp = [['⚑ or X / M / N', 'on an image: take it out (someone else / two people in one pose / not a person)'], ['P', 'on an image: report a bad pose (the image stays)']];
+  const flagHelp = [['⚑ or X / M / N / Q', 'on an image: take it out (someone else / two people in one pose / not a person / unsure)'], ['P', 'on an image: report a bad pose (the image stays)']];
   return {
     el,
     outcome: status,  // what the answer will do: shown in the footer, where it stays visible
-    hints: mode === 'person' ? [['1', 'real person'], ['2', 'not a person'], ['U', 'unsure'], ['X M N P', 'flag the image under the pointer']]
-      : [['1-9', multiple ? 'same / different / unsure (several can be same)' : 'same / different / unsure'], ['Shift+1-9', 'this one, the rest different'], ['U', 'unsure for the rest'], ['X M N P', 'flag the image under the pointer']],
+    hints: mode === 'person' ? [['1', 'real person'], ['2', 'not a person'], ['U', 'unsure'], ['X M N Q P', 'flag the image under the pointer']]
+      : [['1-9', multiple ? 'same / different / unsure (several can be same)' : 'same / different / unsure'], ['Shift+1-9', 'this one, the rest different'], ['U', 'unsure for the rest'], ['X M N Q P', 'flag the image under the pointer']],
     help: mode === 'person' ? [['1', 'A real person'], ['2', 'Not a person'], ['U', 'Unsure'], ...flagHelp]
       : [['1 ... 6', `Cycle that candidate: ${LABEL.same.toLowerCase()}, ${LABEL.different.toLowerCase()}, unsure`], ['Shift + 1 ... 6', 'That candidate is the person; undecided others become different'], ['U', 'Mark every undecided candidate "unsure"'], ...flagHelp],
     onKey(e) {
       const k = e.key.toLowerCase();
-      if (hovered && 'xmnp'.includes(k) && k.length === 1) {
+      if (hovered && 'xmnqp'.includes(k) && k.length === 1) {
         if (k === 'p') toggleBad(hovered.key);
         else {
-          const flag = { x: 'other_person', m: 'mixed', n: 'not_person' }[k];
+          const flag = FLAG_KEYS[k];
           if (!(flag === 'other_person' && (groups[hovered.gid] || []).length < 2)) setFlag(hovered.key, flag);
         }
         closeMenu();
@@ -671,7 +718,7 @@ function buildReference(ctx, task, sizes) {
       return false;
     },
     check() {
-      if ((ctx.answerModel || 1) < 2) return 'This web server runs an older version of the engine and would lose the image flags. Restart it (data-engine serve), reload this page, then answer.';
+      if ((ctx.answerModel || 1) < 3) return 'This web server runs an older version of the engine than this page and would refuse or lose parts of the answer. Restart it (data-engine serve), reload this page, then answer.';
       return summary().warn;
     },
     answer() {
@@ -680,6 +727,7 @@ function buildReference(ctx, task, sizes) {
       const out = { images: flagged, candidates: Object.fromEntries(ids.map((id) => [id, alive(id) ? s.values[id] : null])) };
       if (mode === 'person') out.verdict = refAlive() ? s.verdict : null;
       if (mode === 'duplicate') out.better = ids.length && s.values[ids[0]] === 'same' ? (s.better || 'equal') : null;
+      if (otherBefore) out.other_before = bothSame() ? s.otherBefore : null;
       return out;
     },
     restore(a) {
@@ -696,6 +744,7 @@ function buildReference(ctx, task, sizes) {
         for (const [key, f] of Object.entries(a.images || {})) if (tiles.some((t) => t.key === key)) s.images[key] = { exclude: f.exclude || null, bad_pose: !!f.bad_pose };
         if (a.verdict) s.verdict = a.verdict;
         if (a.better) s.better = a.better;
+        if (a.other_before) s.otherBefore = a.other_before;
       }
       refresh();
     },

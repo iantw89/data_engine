@@ -521,3 +521,21 @@ def test_open_tasks_follow_the_current_solve_and_answered_ones_do_not(workspace,
     report([one])
     assert stage_tasks.run(context).metrics["refreshed"] == 0
     assert len(db.task(task["id"])["payload"]["candidates"]) == 2, "an answered task keeps what the person saw"
+
+
+@pytest.mark.parametrize("answer", [
+    {"images": {"1/10/0": {"exclude": "unsure"}, "2/12/1": {"exclude": "unsure"}}, "candidates": {"B": None}},
+    {"images": {}, "candidates": {"B": "unsure"}},
+])
+def test_a_question_left_open_as_unsure_is_not_asked_again_with_the_same_images(workspace, context, answer):
+    db = workspace.db
+    db.report_unknowns("solve", "identity_link", [{"subject": "identity_link:0/10/0", "severity": 500.0, "detail": {
+        "identity": 3, "t": 300, "reference_keys": REF, "feasible_candidates": 1, "why": "w",
+        "candidates": [{"component": 4, "identity": 1, "gap_s": 3.0, "distance_m": 1.0, "keys": CAND_B}]}}], 1)
+    stage_tasks.run(context)
+    task = db.tasks(status="open")[0]
+    db.answer_task(task["id"], answer, "ian")
+    assert apply_task_answer(workspace, db.task(task["id"]), 2) == {"constraints": 0, "decided": False}
+    db.set_task_status(task["id"], "applied", applied_round=2)
+    result = stage_tasks.run(context)
+    assert result.metrics["created_total"] == 0 and result.metrics["not_repeated_after_unsure"] == 1

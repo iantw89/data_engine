@@ -101,6 +101,7 @@ def test_payloads_say_what_can_be_answered(context):
     assert duplicate["mode"] == "duplicate" and len(duplicate["candidates"]) == 1
     _, after = swap(context)
     assert after["mode"] == "match" and "No swap" in after["candidates"][0]["if_same"] and "cut" in after["texts"]["none_closed"]
+    assert after["multiple"] and after["other_before"] == {"track": 9, "keys": ["5/9/0"]}, "A can be both candidates"
     assert all("allow_none" in p and p["allow_none"] is False for p in (match, reid, person, duplicate, after))
 
 
@@ -154,6 +155,38 @@ def test_a_candidate_without_images_needs_no_answer(workspace, context):
         validate_answer(payload["ui"], payload, {"images": {"9/9/9": {"exclude": "mixed"}}, "candidates": {"B": "same", "C": "same"}})
 
 
+def test_an_unsure_image_is_left_out_and_nothing_is_recorded_about_it(workspace, context):
+    # A sliver of someone in the reference and in a candidate: the answer binds the other images only.
+    answer = {"images": {REF[1]: {"exclude": "unsure"}, CAND_B[0]: {"exclude": "unsure", "bad_pose": True}},
+              "candidates": {"B": "same", "C": "different"}}
+    result, rows = applied(workspace, reidentify(context), answer)
+    rest = [REF[0], REF[2]]
+    assert result["decided"]
+    assert kinds(rows) == [("bad_pose", [CAND_B[0]], []), ("same", rest, [CAND_B[1]]), ("different", rest, CAND_C)]
+
+
+def test_a_candidate_with_only_unsure_images_counts_as_unsure(workspace, context):
+    task_type, payload = cross_view(context)
+    answer = {"images": {CAND_C[0]: {"exclude": "unsure"}}, "candidates": {"B": "different"}}
+    assert validate_answer(payload["ui"], payload, answer)["candidates"] == {"B": "different", "C": None}
+    result, rows = applied(workspace, (task_type, payload), answer)
+    assert result == {"constraints": 1, "decided": False}, "C could not be judged: 'none of these' is not established"
+    assert kinds(rows) == [("different", REF, CAND_B)]
+
+
+def test_a_reference_with_only_unsure_images_leaves_the_question_open(workspace, context):
+    answer = {"images": {key: {"exclude": "unsure"} for key in REF}, "candidates": {}}
+    result, rows = applied(workspace, cross_view(context), answer, subject="all")
+    assert result == {"constraints": 0, "decided": False} and rows == []
+    # ... but a reference flagged away for a reason, with one image merely unsure, is not closed either
+    mixed = {"images": {REF[0]: {"exclude": "not_person"}, REF[1]: {"exclude": "mixed"}, REF[2]: {"exclude": "unsure"}},
+             "candidates": {}}
+    result, rows = applied(workspace, cross_view(context), mixed, subject="mixed")
+    assert result["decided"] is False and [kind for kind, *_ in rows] == ["not_person", "not_person"]
+    result, _ = applied(workspace, triage(context), {"images": {key: {"exclude": "unsure"} for key in REF}}, subject="t")
+    assert result == {"constraints": 0, "decided": False}
+
+
 # --------------------------------------------------------------------------- none of the candidates
 
 
@@ -187,9 +220,54 @@ def test_swap_answers(workspace, context):
     result, rows = applied(workspace, swap(context), {"candidates": {"B": "different", "C": "different"}}, subject="neither")
     assert result["decided"], "neither: the track is cut here"
     assert kinds(rows)[2:] == [("split", REF, [CAND_B[0]]), ("split", REF, [CAND_B[1]]), ("different", REF, CAND_C)]
+
+
+def test_swap_check_the_reference_can_be_both_candidates(workspace, context):
+    """After the moment both tracks show the reference's person. What the other track showed before decides
+    whether it is one person tracked twice or a track that moved onto this person."""
     task_type, payload = swap(context)
+    both = {"candidates": {"B": "same", "C": "same"}}
+    with pytest.raises(AnswerError, match="track 9 showed this person before"):
+        validate_answer(payload["ui"], payload, both)
+    before = ["5/9/0"]
+
+    result, rows = applied(workspace, swap(context), {**both, "other_before": "same"}, subject="twice")
+    assert result["decided"]
+    assert kinds(rows) == [("same", REF, CAND_B), ("same", REF, CAND_C), ("same", REF, before)]
+
+    result, rows = applied(workspace, swap(context), {**both, "other_before": "different"}, subject="moved")
+    assert kinds(rows)[3:] == [("same", REF, CAND_B), ("same", REF, CAND_C), ("split", before, CAND_C),
+                               ("different", REF, before)], "the other track is cut at the moment"
+
+    result, rows = applied(workspace, swap(context), {**both, "other_before": "unsure"}, subject="unsure")
+    assert result["decided"] and kinds(rows)[7:] == [("same", REF, CAND_B), ("same", REF, CAND_C)]
+
+    # the follow-up is only part of the answer when the reference is both
+    cleaned = validate_answer(payload["ui"], payload, {"candidates": {"B": "same", "C": "different"}, "other_before": "same"})
+    assert cleaned["other_before"] is None
+
+
+def test_swap_check_both_on_a_task_built_before_it_was_allowed(workspace, context):
+    task_type, payload = swap(context)
+    payload.update(multiple=False, single_choice=True)
+    payload.pop("other_before")  # older payloads carry the other track's images only as comparison panels
+    answer = {"candidates": {"B": "same", "C": "same"}, "other_before": "different"}
+    result, rows = applied(workspace, (task_type, payload), answer)
+    assert result["decided"] and ("split", ["5/9/0"], CAND_C) in kinds(rows)
+    # other task types still take one
+    task_type, payload = cross_view(context)
     with pytest.raises(AnswerError, match="only one"):
         validate_answer(payload["ui"], payload, {"candidates": {"B": "same", "C": "same"}})
+
+
+def test_swap_check_without_the_other_track_before_needs_no_follow_up(workspace, context):
+    unknown = {"detail": {"moment": "crossing", "identity": 7, "other": 9, "t": 100, "min_distance_m": 0.4, "why": "w",
+                          "cues": {}, "reference_keys": REF, "after_a_keys": CAND_B, "after_b_keys": CAND_C,
+                          "before_b_keys": []}}
+    built = stage_tasks.swap_task(context, unknown)
+    assert "other_before" not in built[1]
+    result, rows = applied(workspace, built, {"candidates": {"B": "same", "C": "same"}})
+    assert result["decided"] and kinds(rows) == [("same", REF, CAND_B), ("same", REF, CAND_C)]
 
 
 # --------------------------------------------------------------------------- triage: is it a person
