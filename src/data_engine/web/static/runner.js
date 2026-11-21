@@ -382,72 +382,154 @@ const BUILDERS = {
 };
 
 // ---------------------------------------------------------------- strip
+// A time-ordered strip of crops of one single-camera tracklet. The answer marks every crop at which a
+// different person starts (several are possible), and for a change after the first, optionally who it is: an
+// earlier person again, or nobody seen before. Single crops can be taken out: unclear, not a person, two
+// people in one pose. (validate.strip_segments mirrors segments() below.)
+const STRIP_MARKS = { unclear: ['X', 'unclear', 'Unclear'], not_person: ['N', 'not a person', 'Not a person'], mixed: ['M', 'two people in one pose', 'Two people in one pose'] };
+const PERSON_COLORS = ['', 'var(--diff)', '#e0b34a', '#6fb3ff', '#c58bff', '#5fd3c4', '#ff9d6f', '#9be06f'];
+
 function buildStrip(ctx, task, sizes) {
   const panels = task.payload.panels || [];
   const n = panels.length;
-  const s = { first: null, unclear: new Set(), unsureAll: false, markUnclear: false, cursor: 1 };
+  const s = { switches: new Set(), who: {}, marks: {}, unsureAll: false, mode: 'switch', cursor: Math.min(1, n - 1) };
+  function segments() {
+    const bounds = [0, ...[...s.switches].sort((a, b) => a - b), n];
+    const out = [];
+    let following = 2;
+    for (let k = 0; k + 1 < bounds.length; k++) {
+      const start = bounds[k];
+      const earlier = [...new Set(out.map((g) => g.person))];
+      const options = k >= 2 ? earlier.filter((person) => person !== out[k - 1].person) : [];
+      const said = s.who[start];
+      let person, how;
+      if (k === 0) { person = 1; how = 'first'; }
+      else if (typeof said === 'number' && options.includes(said)) { person = said; how = 'back'; }
+      else { person = following++; how = said === 'new' && k >= 2 ? 'new' : 'switch'; }
+      out.push({ start, stop: bounds[k + 1], person, said: how, options });
+    }
+    return out;
+  }
   const cards = panels.map((panel, i) => {
     const badge = h('span', { class: 'num-badge' }, i + 1);
     const state = h('span', { class: 'crop-state' });
+    const who = h('div', { class: 'crop-who', style: { display: 'flex', gap: '4px', justifyContent: 'center', flexWrap: 'wrap', padding: '0 2px 3px' }, onclick: (e) => e.stopPropagation() });
     const card = h('div', { class: 'crop', role: 'button', tabindex: '0', 'aria-label': `Crop ${i + 1}`,
       onclick: (e) => { if (e.target.closest('.fig-btn')) return; clickCrop(i, e.shiftKey); },
       onkeydown: (e) => { if (e.key === ' ') { e.preventDefault(); clickCrop(i, e.shiftKey); } } },
-      panelFigure(ctx, { ...panel, label: panel.label || '' }, { lo: sizes.lo, hi: sizes.hi, clickZoom: false }), badge, state);
-    card._state = state;
+      panelFigure(ctx, { ...panel, label: panel.label || '' }, { lo: sizes.lo, hi: sizes.hi, clickZoom: false }), badge, state, who);
+    card._state = state; card._who = who;
     return card;
   });
   const status = h('div', { class: 'strip-status', 'aria-live': 'polite' });
-  const markBtn = h('button', { type: 'button', class: 'btn small', 'aria-pressed': 'false', onclick: () => setMark(!s.markUnclear) }, 'Click marks unclear (X)');
-  const resetBtn = h('button', { type: 'button', class: 'btn', onclick: () => { s.first = null; s.unsureAll = false; refresh(); } }, 'All the same person ', kbd('0'));
-  const unsureBtn = h('button', { type: 'button', class: 'btn', 'aria-pressed': 'false', onclick: () => { s.unsureAll = !s.unsureAll; if (s.unsureAll) s.first = null; refresh(); } }, 'Unsure about this strip ', kbd('U'));
+  const modes = [['switch', 'a different person starts here', 'B'], ...Object.entries(STRIP_MARKS).map(([kind, [key, , label]]) => [kind, label.toLowerCase(), key])];
+  const modeBtns = modes.map(([mode, label, key]) => h('button', { type: 'button', class: 'btn small', 'aria-pressed': 'false', dataset: { mode },
+    onclick: () => { s.mode = mode; refresh(); } }, label, ' ', kbd(key)));
+  const modeRow = h('div', { class: 'seg', role: 'group', 'aria-label': 'What a click on a crop marks' }, h('span', { class: 'muted small', style: { alignSelf: 'center', marginRight: '6px' } }, 'A click marks:'), modeBtns);
+  const resetBtn = h('button', { type: 'button', class: 'btn', onclick: () => { s.switches.clear(); s.who = {}; s.unsureAll = false; refresh(); } }, 'All the same person ', kbd('0'));
+  const unsureBtn = h('button', { type: 'button', class: 'btn', 'aria-pressed': 'false', onclick: () => toggleUnsure() }, 'Unsure about this strip ', kbd('U'));
 
-  function setMark(v) { s.markUnclear = v; markBtn.setAttribute('aria-pressed', String(v)); markBtn.classList.toggle('active', v); }
+  function toggleUnsure() { s.unsureAll = !s.unsureAll; if (s.unsureAll) { s.switches.clear(); s.who = {}; } refresh(); }
+  function toggleSwitch(i) {
+    if (i === 0) { toast('Crop 1 is the reference; mark each crop at which a different person starts', 'info'); return; }
+    if (s.switches.has(i)) { s.switches.delete(i); delete s.who[i]; } else s.switches.add(i);
+    s.unsureAll = false;
+  }
+  function toggleMark(i, kind) { if (s.marks[i] === kind) delete s.marks[i]; else s.marks[i] = kind; }
   function clickCrop(i, shift) {
     s.cursor = i;
-    if (s.markUnclear || shift) { s.unclear.has(i) ? s.unclear.delete(i) : s.unclear.add(i); }
-    else if (i === 0) { toast('Crop 1 is the reference; click the first crop that shows a different person', 'info'); }
-    else { s.first = s.first === i ? null : i; s.unsureAll = false; }
+    if (shift) toggleMark(i, 'unclear'); else if (s.mode === 'switch') toggleSwitch(i); else toggleMark(i, s.mode);
     refresh();
   }
+  // Who the person is that starts at a change after the first: cycles not said -> an earlier person -> new.
+  function cycleWho(i) {
+    const seg = segments().find((g) => i >= g.start && i < g.stop);
+    if (!seg || !seg.options.length) { toast('Only a change after the first one can be an earlier person again', 'info', 1800); return; }
+    const choices = [undefined, ...seg.options, 'new'];
+    const next = choices[(choices.indexOf(s.who[seg.start]) + 1) % choices.length];
+    if (next === undefined) delete s.who[seg.start]; else s.who[seg.start] = next;
+  }
+  const personText = (g) => `person ${g.person}${g.said === 'back' ? ' again' : g.said === 'new' ? ', not seen before' : ''}`;
   function refresh() {
+    const segs = segments();
     cards.forEach((card, i) => {
-      const diff = s.first !== null && i >= s.first;
-      card.classList.toggle('diff', diff); card.classList.toggle('first-diff', s.first === i);
-      card.classList.toggle('unclear', s.unclear.has(i)); card.classList.toggle('cursor', s.cursor === i);
-      card._state.textContent = s.unclear.has(i) ? 'unclear' : s.first === i ? 'first different' : diff ? 'different' : i === 0 ? 'reference' : 'same';
-      card.setAttribute('aria-pressed', String(s.first === i));
+      const seg = segs.find((g) => i >= g.start && i < g.stop);
+      const mark = s.marks[i], starts = seg.start === i && seg.said !== 'first';
+      const color = PERSON_COLORS[(seg.person - 1) % PERSON_COLORS.length];
+      card.classList.toggle('unclear', !!mark); card.classList.toggle('cursor', s.cursor === i);
+      card.style.borderColor = mark || s.cursor === i ? '' : color;
+      card.style.boxShadow = starts ? `0 0 0 3px ${color || 'var(--line2)'}` : '';
+      card._state.style.color = mark ? '' : color;
+      card._state.textContent = mark ? STRIP_MARKS[mark][1] : !s.switches.size ? (i === 0 ? 'reference' : 'same') : starts ? `${personText(seg)} - starts here` : personText(seg);
+      card.setAttribute('aria-pressed', String(s.switches.has(i)));
+      const choices = starts && seg.options.length ? [...seg.options.map((person) => [person, `person ${person} again`]), ['new', 'not seen before'], [undefined, 'not said']] : [];
+      setChildren(card._who, choices.map(([value, label]) => h('button', { type: 'button', class: `btn small ${s.who[i] === value ? 'active' : ''}`, 'aria-pressed': String(s.who[i] === value),
+        onclick: (e) => { e.stopPropagation(); if (value === undefined) delete s.who[i]; else s.who[i] = value; refresh(); } }, label)));
     });
+    modeBtns.forEach((b) => { const on = b.dataset.mode === s.mode; b.setAttribute('aria-pressed', String(on)); b.classList.toggle('active', on); });
     unsureBtn.setAttribute('aria-pressed', String(s.unsureAll)); unsureBtn.classList.toggle('active', s.unsureAll);
-    const unclearText = s.unclear.size ? ` ${s.unclear.size} crop(s) marked unclear.` : '';
-    status.className = `strip-status ${s.unsureAll ? 'unsure' : s.first !== null ? 'break' : 'same'}`;
-    status.textContent = (s.unsureAll ? 'Answer: unsure about this strip.' : s.first !== null ? `Answer: break - crop ${s.first + 1} is the first different person.` : 'Answer: all crops show the same person.') + unclearText;
+    const counts = {};
+    Object.values(s.marks).forEach((kind) => { counts[kind] = (counts[kind] || 0) + 1; });
+    const marked = Object.entries(counts).map(([kind, c]) => `${c} ${STRIP_MARKS[kind][1]}`).join(', ');
+    const people = new Set(segs.map((g) => g.person)).size;
+    const unsaid = segs.some((g) => g.options.length && g.said === 'switch');
+    status.className = `strip-status ${s.unsureAll ? 'unsure' : s.switches.size ? 'break' : 'same'}`;
+    status.textContent = (s.unsureAll ? 'Answer: unsure about this strip.'
+      : !s.switches.size ? 'Answer: all crops show the same person.'
+        : `Answer: ${s.switches.size} change${s.switches.size > 1 ? 's' : ''} of person, ${people} ${unsaid ? 'or fewer ' : ''}people - ` + segs.map((g) => `crop${g.stop - g.start > 1 ? `s ${g.start + 1}-${g.stop}` : ` ${g.start + 1}`}: ${personText(g)}`).join('; ') + '.'
+          + (unsaid ? ' Where a later change is an earlier person again, say so on that crop (W); otherwise only the change itself is recorded.' : ''))
+      + (marked ? ` Taken out: ${marked}.` : '');
   }
   const el = h('section', { class: 'strip-ui' },
     h('div', { class: 'strip-grid', style: { '--min': n <= 4 ? '260px' : n <= 8 ? '190px' : '140px' } }, cards),
-    h('div', { class: 'strip-controls' }, status, resetBtn, unsureBtn, markBtn));
+    h('div', { class: 'strip-controls' }, status, resetBtn, unsureBtn),
+    h('div', { class: 'strip-controls' }, modeRow));
   refresh();
+  const indices = (kind) => Object.keys(s.marks).filter((i) => s.marks[i] === kind).map(Number).sort((a, b) => a - b);
   return {
     el,
-    hints: [['2-9', 'first different crop'], ['0', 'all same'], ['U', 'unsure'], ['←→', 'move'], ['B', 'break here'], ['X', 'unclear'], ['Shift+click', 'unclear']],
-    help: [['2 ... 9', 'Mark that crop as the first showing a different person'], ['← → / B', 'Move the cursor / mark a break at the cursor'], ['X', 'Toggle "unclear" on the cursor crop'], ['0', 'Reset: all the same person'], ['U', 'Unsure about the whole strip'], ['Shift+click', 'Toggle unclear on a crop']],
+    hints: [['2-9', 'a different person starts at that crop (several can)'], ['0', 'all same'], ['U', 'unsure'], ['←→', 'move'], ['B', 'change here'], ['W', 'who it is'], ['X N M', 'unclear / not a person / two people in one pose'], ['Shift+click', 'unclear']],
+    help: [['2 ... 9', 'Mark (or unmark) that crop as the first of a different person; mark every change in the strip'], ['← → / B', 'Move the cursor / mark a change at the cursor'],
+      ['W', 'For a change after the first: who starts there - an earlier person again, someone not seen before, or not said'],
+      ['X / N / M', 'Take the cursor crop out: unclear / not a person / two people in one pose'], ['0', 'Reset: all the same person'], ['U', 'Unsure about the whole strip'], ['Shift+click', 'Toggle unclear on a crop']],
     onKey(e) {
       if (/^[0-9]$/.test(e.key) && !e.shiftKey) {
-        if (e.key === '0') { s.first = null; s.unsureAll = false; refresh(); return true; }
+        if (e.key === '0') { s.switches.clear(); s.who = {}; s.unsureAll = false; refresh(); return true; }
         const i = Number(e.key) - 1;
-        if (i === 0) { toast('Crop 1 is the reference', 'info', 1200); return true; }
-        if (i < n) { s.first = s.first === i ? null : i; s.unsureAll = false; s.cursor = i; refresh(); }
+        if (i < n) { toggleSwitch(i); s.cursor = i; refresh(); }
         return true;
       }
       const k = e.key.toLowerCase();
       if (e.key === 'ArrowRight') { s.cursor = Math.min(n - 1, s.cursor + 1); refresh(); return true; }
       if (e.key === 'ArrowLeft') { s.cursor = Math.max(0, s.cursor - 1); refresh(); return true; }
-      if (k === 'b') { clickCrop(s.cursor, false); return true; }
-      if (k === 'x') { s.unclear.has(s.cursor) ? s.unclear.delete(s.cursor) : s.unclear.add(s.cursor); refresh(); return true; }
-      if (k === 'u') { s.unsureAll = !s.unsureAll; if (s.unsureAll) s.first = null; refresh(); return true; }
+      if (k === 'b') { toggleSwitch(s.cursor); refresh(); return true; }
+      if (k === 'w') { cycleWho(s.cursor); refresh(); return true; }
+      const kind = { x: 'unclear', n: 'not_person', m: 'mixed' }[k];
+      if (kind) { toggleMark(s.cursor, kind); refresh(); return true; }
+      if (k === 'u') { toggleUnsure(); return true; }
       return false;
     },
-    answer: () => ({ verdict: s.first !== null ? 'break' : s.unsureAll ? 'unclear' : 'continuous', first_different: s.first, unclear: [...s.unclear].sort((a, b) => a - b) }),
-    restore(a) { s.first = a.verdict === 'break' ? a.first_different : null; s.unsureAll = a.verdict === 'unclear'; s.unclear = new Set(a.unclear || []); refresh(); },
+    check() {
+      // A server from before several changes and the new marks existed would refuse them or lose them.
+      const needs = s.switches.size > 1 || Object.values(s.marks).some((kind) => kind !== 'unclear');
+      if (needs && (ctx.answerModel || 1) < 5) return 'This web server runs an older version of the engine than this page and would refuse or lose parts of the answer. Restart it (data-engine serve), reload this page, then answer.';
+      return null;
+    },
+    answer() {
+      const switches = [...s.switches].sort((a, b) => a - b);
+      const who = {};
+      segments().forEach((g) => { if (g.said === 'back') who[g.start] = g.person; else if (g.said === 'new') who[g.start] = 'new'; });
+      return { verdict: switches.length ? 'break' : s.unsureAll ? 'unclear' : 'continuous', switches, first_different: switches.length ? switches[0] : null, who,
+        unclear: indices('unclear'), not_person: indices('not_person'), mixed: indices('mixed') };
+    },
+    restore(a) {
+      const switches = a.verdict !== 'break' ? [] : a.switches || (a.first_different !== null && a.first_different !== undefined ? [a.first_different] : []);
+      s.switches = new Set(switches); s.who = {};
+      for (const [i, value] of Object.entries(a.who || {})) s.who[Number(i)] = value;
+      s.unsureAll = a.verdict === 'unclear'; s.marks = {};
+      for (const kind of Object.keys(STRIP_MARKS)) (a[kind] || []).forEach((i) => { s.marks[i] = kind; });
+      refresh();
+    },
   };
 }
 

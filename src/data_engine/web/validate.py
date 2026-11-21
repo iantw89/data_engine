@@ -31,23 +31,93 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+STRIP_MARKS = ("unclear", "not_person", "mixed")  # a crop taken out of the strip, and why
+
+
+def strip_switches(answer: dict) -> list[int]:
+    """Crop indices at which a different person starts. Answers given before several switches could be marked
+    carry one, as ``first_different``."""
+    if answer.get("verdict") != "break":
+        return []
+    switches = answer.get("switches")
+    if switches is None:
+        first = answer.get("first_different")
+        switches = [first] if _is_int(first) else []
+    return sorted({int(i) for i in switches if _is_int(i)})
+
+
+def strip_segments(count: int, answer: dict) -> list[dict]:
+    """The runs of crops between switches and the person each shows:
+    ``{"start", "stop", "person", "said", "options"}``. The first run is person 1. A run after a switch is
+    another person than the run before it. ``who`` can say more for a run from the third on: an earlier
+    person's number (``said`` "back": the same person again) or "new" (none of the people seen before in the
+    strip); without it (``said`` "switch") only the difference to the run before is stated. ``options``: the
+    earlier people it could be."""
+    who = answer.get("who") or {}
+    bounds = [0, *strip_switches(answer), count]
+    segments, following = [], 2
+    for k, (start, stop) in enumerate(zip(bounds, bounds[1:])):
+        earlier = list(dict.fromkeys(segment["person"] for segment in segments))
+        options = [person for person in earlier if person != segments[-1]["person"]] if k >= 2 else []
+        said = who.get(str(start), who.get(start))
+        if k == 0:
+            person, how = 1, "first"
+        elif _is_int(said) and said in options:
+            person, how = int(said), "back"
+        else:
+            person, how, following = following, "new" if said == "new" and k >= 2 else "switch", following + 1
+        segments.append({"start": start, "stop": stop, "person": person, "said": how, "options": options})
+    return segments
+
+
 def _strip(payload: dict, answer: dict, problems: list[str]) -> dict:
     count = len(payload.get("panels") or [])
     verdict = answer.get("verdict")
     if verdict not in VERDICTS:
         problems.append(f"verdict must be one of {', '.join(VERDICTS)}")
+    given = answer.get("switches")
+    if given is not None and (not isinstance(given, list) or not all(_is_int(i) for i in given)):
+        problems.append("switches must be a list of crop indices")
+        given = []
     first = answer.get("first_different")
+    switches = strip_switches({**answer, "switches": given})
     if verdict == "break":
-        if not _is_int(first) or not 1 <= first < count:
-            problems.append(f"a break needs first_different between 1 and {count - 1} (index of the first crop of a different person)")
-    elif first is not None:
-        problems.append("first_different must be null unless the verdict is 'break'")
-    unclear = answer.get("unclear", [])
-    if not isinstance(unclear, list) or not all(_is_int(i) and 0 <= i < count for i in unclear):
-        problems.append(f"unclear must be a list of crop indices in 0..{count - 1}")
-        unclear = []
-    return {"verdict": verdict, "first_different": first if verdict == "break" else None,
-            "unclear": sorted(set(unclear)), "notes": _notes(answer, problems)}
+        if not switches or not all(1 <= i < count for i in switches):
+            problems.append(f"a break needs switches (or first_different) between 1 and {count - 1}: the index of each "
+                            "crop at which a different person starts")
+            switches = [i for i in switches if 1 <= i < count]
+    elif first is not None or given:
+        problems.append("first_different and switches must be empty unless the verdict is 'break'")
+    marks = {}
+    for name in STRIP_MARKS:
+        indices = answer.get(name, [])
+        if not isinstance(indices, list) or not all(_is_int(i) and 0 <= i < count for i in indices):
+            problems.append(f"{name} must be a list of crop indices in 0..{count - 1}")
+            indices = []
+        marks[name] = sorted(set(indices))
+    for a, b in (("unclear", "not_person"), ("unclear", "mixed"), ("not_person", "mixed")):
+        if set(marks[a]) & set(marks[b]):
+            problems.append(f"a crop can be {a} or {b}, not both")
+    cleaned = {"verdict": verdict, "switches": switches if verdict == "break" else [],
+               "first_different": switches[0] if verdict == "break" and switches else None}
+    who = answer.get("who") or {}
+    if not isinstance(who, dict):
+        problems.append("who must be an object {switch index: an earlier person's number | 'new'}")
+        who = {}
+    cleaned_who = {}
+    segments = {segment["start"]: segment for segment in strip_segments(count, {**cleaned, "who": who})}
+    for key, value in who.items():
+        segment = segments.get(int(key)) if str(key).lstrip("-").isdigit() else None
+        if segment is None or segment["said"] == "first":
+            problems.append(f"who: {key} is not a crop at which a different person starts")
+        elif value == "new" and segment["options"]:
+            cleaned_who[str(key)] = "new"
+        elif _is_int(value) and value in segment["options"]:
+            cleaned_who[str(key)] = int(value)
+        elif value is not None and not (value == "new" and not segment["options"]):
+            problems.append(f"who: the person at crop {int(key) + 1} can be one of {segment['options'] or 'nobody earlier'} "
+                            f"or 'new' (got {value!r}); the person just before is a different one by definition")
+    return {**cleaned, "who": cleaned_who, **marks, "notes": _notes(answer, problems)}
 
 
 IMAGE_EXCLUSIONS = ("other_person", "mixed", "not_person", "unsure")

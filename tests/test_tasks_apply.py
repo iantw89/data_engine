@@ -14,6 +14,7 @@ import pytest
 from data_engine.db import Database
 from data_engine.stages import tasks as stage_tasks
 from data_engine.tasks.apply import apply_task_answer
+from data_engine.web.validate import AnswerError, strip_segments, validate_answer
 from data_engine.workspace import Workspace
 
 REF = ["0/10/0", "0/20/1", "0/30/0"]
@@ -542,3 +543,86 @@ def test_a_question_left_open_as_unsure_is_not_asked_again_with_the_same_images(
     db.set_task_status(task["id"], "applied", applied_round=2)
     result = stage_tasks.run(context)
     assert result.metrics["created_total"] == 0 and result.metrics["not_repeated_after_unsure"] == 1
+
+
+# --------------------------------------------------------------------------- strips: several switches, marks on crops
+def strip_rows(workspace):
+    return [(row["kind"], row["a"], row["b"]) for row in constraints(workspace)]
+
+
+def test_strip_several_switches_cut_at_each_and_keep_neighbours_apart(workspace):
+    """The tracker hopped onto someone else and later onto a third person: two cuts. Nothing is said about
+    the first and the third run - they may or may not be the same person."""
+    payload, keys = strip_payload(8)
+    answer = validate_answer("strip", payload, {"verdict": "break", "switches": [5, 2]})
+    assert answer["switches"] == [2, 5] and answer["first_different"] == 2 and answer["who"] == {}
+    task = make_task(workspace, "continuity", "s", payload, answer)
+    assert apply_task_answer(workspace, task, 2) == {"constraints": 5, "decided": True}
+    assert strip_rows(workspace) == [
+        ("split", keys[0:2], keys[2:5]), ("split", keys[2:5], keys[5:8]),
+        ("same", [keys[0]], [keys[1]]), ("same", [keys[2]], keys[3:5]), ("same", [keys[5]], keys[6:8])]
+    assert [row["detail"].get("first_different") for row in constraints(workspace)[:2]] == [2, 5]
+
+
+def test_strip_a_later_run_can_be_an_earlier_person_again(workspace):
+    """Person 1, somebody else for a moment, person 1 again."""
+    payload, keys = strip_payload(6)
+    answer = validate_answer("strip", payload, {"verdict": "break", "switches": [2, 4], "who": {"4": 1}})
+    assert answer["who"] == {"4": 1}
+    assert [(s["person"], s["said"]) for s in strip_segments(6, answer)] == [(1, "first"), (2, "switch"), (1, "back")]
+    task = make_task(workspace, "continuity", "s", payload, answer)
+    apply_task_answer(workspace, task, 2)
+    assert strip_rows(workspace)[-1] == ("same", [keys[0]], keys[4:6]), "joined across the stretch that shows someone else"
+    assert ("split", keys[2:4], keys[4:6]) in strip_rows(workspace)
+
+
+def test_strip_a_later_run_can_be_nobody_seen_before(workspace):
+    payload, keys = strip_payload(6)
+    answer = validate_answer("strip", payload, {"verdict": "break", "switches": [2, 4], "who": {"4": "new"}})
+    task = make_task(workspace, "continuity", "s", payload, answer)
+    apply_task_answer(workspace, task, 2)
+    assert strip_rows(workspace)[-1] == ("different", keys[4:6], keys[0:2]), "the run just before is apart by the split"
+    # with four runs: the fourth can be person 1 or 2 again, never the third (a switch means a different person)
+    payload, keys = strip_payload(8)
+    with pytest.raises(AnswerError, match=r"one of \[1, 2\]"):
+        validate_answer("strip", payload, {"verdict": "break", "switches": [2, 4, 6], "who": {"6": 3}})
+    with pytest.raises(AnswerError, match="not a crop at which a different person starts"):
+        validate_answer("strip", payload, {"verdict": "break", "switches": [2, 4], "who": {"3": 1}})
+    # the second run cannot be anybody seen before: saying "new" there is accepted and adds nothing
+    assert validate_answer("strip", payload, {"verdict": "break", "switches": [2], "who": {"2": "new"}})["who"] == {}
+
+
+def test_strip_crops_can_be_marked_not_a_person_or_two_people_in_one_pose(workspace):
+    payload, keys = strip_payload(6)
+    answer = validate_answer("strip", payload, {"verdict": "break", "switches": [3], "not_person": [1], "mixed": [3],
+                                                "unclear": [5]})
+    task = make_task(workspace, "continuity", "s", payload, answer)
+    apply_task_answer(workspace, task, 2)
+    rows = constraints(workspace)
+    assert [(r["kind"], r["a"], r["detail"]["problem"], r["detail"]["scope"]) for r in rows[:2]] == [
+        ("not_person", [keys[1]], "not_person", "detection"), ("not_person", [keys[3]], "mixed_pose", "detection")]
+    # marked crops are on neither side: the cut is at the first judged crop of the later run
+    assert strip_rows(workspace)[2:] == [("split", [keys[0], keys[2]], [keys[4]]), ("same", [keys[0]], [keys[2]])]
+    with pytest.raises(AnswerError, match="not both"):
+        validate_answer("strip", payload, {"verdict": "continuous", "not_person": [1], "mixed": [1]})
+
+
+def test_strip_marks_are_recorded_whatever_the_verdict(workspace):
+    payload, keys = strip_payload(4)
+    task = make_task(workspace, "continuity", "a", payload, validate_answer("strip", payload, {"verdict": "unclear", "mixed": [2]}))
+    assert apply_task_answer(workspace, task, 2) == {"constraints": 1, "decided": False}
+    task = make_task(workspace, "continuity", "b", payload, validate_answer("strip", payload, {"verdict": "continuous", "not_person": [0]}))
+    assert apply_task_answer(workspace, task, 2) == {"constraints": 2, "decided": True}
+    assert strip_rows(workspace)[-1] == ("same", [keys[1]], keys[2:])
+    # every crop is not a person: the tracklet they are samples of
+    everything = validate_answer("strip", payload, {"verdict": "unclear", "not_person": [0, 1, 2, 3]})
+    task = make_task(workspace, "continuity", "c", payload, everything)
+    apply_task_answer(workspace, task, 2)
+    assert [row["detail"]["scope"] for row in constraints(workspace)[-4:]] == ["tracklet"] * 4
+
+
+def test_strip_answers_given_before_several_switches_existed_keep_their_meaning(workspace):
+    payload, keys = strip_payload()
+    assert strip_segments(5, {"verdict": "break", "first_different": 3})[1]["start"] == 3
+    cleaned = validate_answer("strip", payload, {"verdict": "break", "first_different": 3})
+    assert cleaned["switches"] == [3] and cleaned["first_different"] == 3 and cleaned["not_person"] == []

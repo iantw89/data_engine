@@ -140,8 +140,9 @@ IMAGE_FLAGS = {
 }
 # Version of the 'reference_candidates' answer the server understands
 # (1: reference_ok / none_of_these / problems; 2: flags on single images; 3: 'unsure' image flag, swap check 'both';
-# 4: flags on the comparison images of a swap check).
-ANSWER_MODEL = 4
+# 4: flags on the comparison images of a swap check; 5: a strip takes several switches and marks 'not a person'
+# and 'two people in one pose' on single crops).
+ANSWER_MODEL = 5
 
 # --------------------------------------------------------------------------- task types
 
@@ -181,11 +182,17 @@ TASK_TYPES: dict[str, TaskType] = {task.name: task for task in [
         "Human checkpoints are published as a human-confirmed frame_alignment set and bound the generator's search."),
     TaskType(
         "continuity", "Tracklet continuity",
-        "Do all crops show the same person? If not, click the first crop showing a different person.",
+        "Do all crops show the same person? If not, mark every crop at which a different person starts.",
         "strip",
-        {"verdict": "continuous | break | unclear", "first_different": "int index into payload.panels (break)",
-         "unclear": "[int] crop indices that cannot be judged", "notes": "str"},
-        ("same", "split", "different"),
+        {"verdict": "continuous | break | unclear",
+         "switches": "[int] indices into payload.panels at which a different person starts (break); several possible",
+         "first_different": "int = switches[0] (answers given before several switches could be marked carry only this)",
+         "who": "{switch index: an earlier person's number (the same person again) | 'new' (nobody seen before in "
+                "the strip)} - optional, for a switch after the first; people are numbered in order of appearance",
+         "unclear": "[int] crop indices that cannot be judged",
+         "not_person": "[int] crops that do not show a person", "mixed": "[int] crops whose pose takes joints from two people",
+         "notes": "str"},
+        ("same", "split", "different", "not_person"),
         "Break locations label tracker risk events; they tune the over-split rule and the BoT-SORT match threshold."),
     TaskType(
         "cross_view_match", "Cross-camera match",

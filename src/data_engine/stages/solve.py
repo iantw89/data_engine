@@ -497,8 +497,8 @@ def left_behind(solved: Solved, constraints: Constraints, seen: set | None = Non
                                   "same single-camera track next to it are still in it. Either the single-camera "
                                   "track changes person here, or all of these crops show the flagged crop's "
                                   "person and they all leave the track",
-                           "resolve_by": "a human clicks the first crop that shows a different person than crop 1, "
-                                         "or says they all show one person"}})
+                           "resolve_by": "a human marks every crop at which a different person starts, or says "
+                                         "they all show one person"}})
     return found
 
 
@@ -538,7 +538,7 @@ def human_unknowns(solved: Solved, constraints: Constraints) -> dict[str, list[d
                                "why": "a reviewer marked the first and the last of these crops as different people, "
                                       "and both belong to one single-camera track: the track changes person "
                                       "somewhere in between",
-                               "resolve_by": "a human clicks the first crop that shows the other person"}})
+                               "resolve_by": "a human marks every crop at which a different person starts"}})
     purity.extend(left_behind(solved, constraints))
     quality = []
     for camera_index, row in sorted(set(constraints.bad_pose)):

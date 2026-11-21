@@ -93,7 +93,7 @@ it needs a skeleton editor.
 | `operator_decision` | A policy or input decision | `undeterminable` / `alignment` constraint |
 | `calibration_review` | Which calibration should this camera use? | `calibration` constraint → calibration stage |
 | `alignment_review` | Which frame shows the same instant? | `alignment` constraint |
-| `continuity` | Do all crops show one person? | `same` or `split` (+ `different`) |
+| `continuity` | Do all crops show one person? If not, where does a different person start (several places possible)? | `same`; per switch `split` (+ `different`), `same` within each run and for a person who comes back; `not_person` for marked crops |
 | `cross_view_match` | Which tracked person, if any, is the person in A? (one) | `same` / `different`; none and no further candidate: single-camera track |
 | `reidentify` | Which earlier tracks are A's person? (several possible) | `same` / `different`; none and no further candidate: separate person |
 | `swap_check` | Which candidate (after) is A (before)? (one, neither, or both) | no swap: `same`; swap: `same` + `split`; neither: `split`; both: `same` twice, then for the other track before the moment `same` (one person tracked twice) or `split` (it moved onto this person) |
@@ -181,6 +181,19 @@ said about). At the next round the answer is applied: an image flagged "someone 
 not share a track with the rest of its group (cannot-link in the association), so its piece
 leaves the track; an image left out as "unsure" is not shown again where the track has
 another one.
+
+**Strips** (`continuity`; `validate.strip_segments`, `tasks/apply.py: _strip`). A strip is
+a time-ordered row of crops of one single-camera tracklet. The person marks every crop at
+which a different person starts; the crops between two marks are one run. A run is one
+person (`same`), neighbouring runs are different people (`split`: the tracklet is cut at
+the first judged crop of the later run, and the two are kept apart). The tracker can hop
+onto a passer-by and back, so a run from the third on can be said to show an earlier
+person again (`same` across the stretch in between) or nobody seen before in the strip
+(`different` from every earlier one); when neither is said, nothing is recorded between
+runs that are not neighbours. Single crops can be taken out, as images can in a group:
+unclear (nothing recorded), not a person, two people in one pose (`not_person` for that
+detection; for the tracklet when every crop is marked not a person). Marked crops are on
+neither side of a switch.
 
 The piece is the part of the camera's tracklet the solver handles as a unit; the
 single-camera tracker may have followed the same box for longer. When, after the solve,
@@ -535,6 +548,11 @@ would close `pose_quality`.
   images left out as "unsure" are not shown again where the track has others: the
   reviewer was flagging the same image of a candidate track in question after question
   (9 of 58 flags on felix), because answers take effect only at the next round.
+* **2026-11-21 - a strip takes several switches and marks on single crops (answer model 5).**
+  One "first different crop" could not describe a tracker that hops onto someone and back,
+  or two changes in a row, and a crop that was a mixed pose or not a person could only be
+  called unclear. Non-neighbouring runs are left unrelated unless the person says who it
+  is: "different from the run before" does not say "different from the run before that".
 * **2026-11-20 - questions show the clearest frame of the same piece; a control share keeps
   the nearest.** The reviewer found many images hard (slivers, cut or overlapped poses) and
   asked whether easier images would hide the problems being caught. Measured on the 720

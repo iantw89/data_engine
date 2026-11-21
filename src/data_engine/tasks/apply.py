@@ -199,10 +199,32 @@ def _reference_candidates(workspace: Workspace, task: dict, round_number: int) -
 
 
 def _strip(workspace: Workspace, task: dict, round_number: int) -> tuple[int, bool]:
+    """A time-ordered strip of crops of one single-camera tracklet.
+
+    * a crop marked not a person / two people in one pose: not_person(that detection), as on any image;
+      a crop marked unclear: nothing. Marked crops take no part in what follows;
+    * "all one person": same(first, rest);
+    * one or more switches: the crops between two switches show one person (same), neighbouring runs show
+      different people (split: the tracklet is cut at the first crop of the later run, and the two are kept
+      apart). A later run can be said to show an earlier person again (same) or nobody seen before in the
+      strip (different from every earlier one); when neither is said, nothing is recorded between runs that
+      are not neighbours.
+    """
+    from ..web.validate import strip_segments
+
     payload, answer = task["payload"], task["answer"]
     keys = [panel["highlight"][0] for panel in payload.get("panels", []) if panel.get("highlight")]
-    unclear = set(answer.get("unclear") or [])
-    clear = [key for index, key in enumerate(keys) if index not in unclear]
+    not_person, mixed = set(answer.get("not_person") or []), set(answer.get("mixed") or [])
+    out = set(answer.get("unclear") or []) | not_person | mixed
+    created = 0
+    everything = bool(keys) and len(not_person) == len(keys)  # the whole strip is not a person: its tracklet
+    for index in sorted(not_person | mixed):
+        if index < len(keys):
+            _add(workspace, "not_person", [keys[index]], None, task, round_number,
+                 problem="mixed_pose" if index in mixed else "not_person",
+                 scope="tracklet" if everything and index in not_person else "detection")
+            created += 1
+    clear = [key for index, key in enumerate(keys) if index not in out]
     if answer.get("verdict") == "continuous" and len(clear) >= 2:
         new = _add(workspace, "same", [clear[0]], clear[1:], task, round_number)
         # A later explicit answer supersedes an earlier one it contradicts: a 'someone else' flag between two
@@ -210,23 +232,46 @@ def _strip(workspace: Workspace, task: dict, round_number: int) -> tuple[int, bo
         for old in workspace.db.constraints("different"):
             if old["source"] == "human" and old["a"] and old["b"] and set(old["a"]) | set(old["b"]) <= set(clear):
                 workspace.db.supersede_constraint(old["id"], new)
-        return 1, True
-    if answer.get("verdict") == "break" and answer.get("first_different"):
-        index = int(answer["first_different"])
-        before = [key for i, key in enumerate(keys[:index]) if i not in unclear]
-        after = [key for i, key in enumerate(keys[index:], start=index) if i not in unclear]
-        if before and after:
-            # 'split' cuts the tracklet at the first different crop and keeps the sides apart.
-            _add(workspace, "split", before, after, task, round_number, first_different=index)
-            created = 1
-            # The screen shows the answer as "crops 1..n-1 one person, crops n.. another": each side is one
-            # person, so the pieces of a side stay together (a crop marked unclear is on neither side).
-            for side in (before, after):
-                if len(side) > 1:
-                    _add(workspace, "same", [side[0]], side[1:], task, round_number, reason="one side of a confirmed break")
-                    created += 1
-            return created, True
-    return 0, False
+        return created + 1, True
+    if answer.get("verdict") != "break":
+        return created, False
+    segments = strip_segments(len(keys), answer)
+    for segment in segments:
+        segment["keys"] = [keys[i] for i in range(segment["start"], min(segment["stop"], len(keys))) if i not in out]
+    decided = False
+    for before, after in zip(segments, segments[1:]):
+        if before["keys"] and after["keys"]:
+            # 'split' cuts the tracklet at the first crop of the later run and keeps the two runs apart.
+            _add(workspace, "split", before["keys"], after["keys"], task, round_number, first_different=after["start"])
+            created, decided = created + 1, True
+    if not decided:
+        return created, False  # no switch with a judged crop on both sides: nothing about people is recorded
+    people: dict[int, list[dict]] = {}
+    for segment in segments:
+        if not segment["keys"]:
+            continue
+        # The screen shows a run as one person: its pieces stay together.
+        if len(segment["keys"]) > 1:
+            _add(workspace, "same", [segment["keys"][0]], segment["keys"][1:], task, round_number,
+                 reason="one side of a confirmed break")
+            created += 1
+        people.setdefault(segment["person"], []).append(segment)
+    for runs in people.values():
+        for later in runs[1:]:
+            _add(workspace, "same", [runs[0]["keys"][0]], later["keys"], task, round_number,
+                 reason="the same person again later in the strip")
+            created += 1
+    for position, segment in enumerate(segments):
+        if segment["said"] != "new" or not segment["keys"]:
+            continue
+        # Nobody seen before in the strip (the run just before is kept apart by the split already).
+        earlier = [key for other in segments[:max(position - 1, 0)] if other["person"] != segment["person"]
+                   for key in other["keys"]]
+        if earlier:
+            _add(workspace, "different", segment["keys"], earlier, task, round_number,
+                 reason="not one of the people seen earlier in the strip")
+            created += 1
+    return created, True
 
 
 def _decision(workspace: Workspace, task: dict, round_number: int) -> tuple[int, bool]:
