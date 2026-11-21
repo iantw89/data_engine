@@ -103,6 +103,24 @@ def test_skeleton_drawn_only_for_confident_joints():
     assert coloured_pixels(weak[:-40], green) == 0  # nothing drawn below the 0.3 peak gate
 
 
+def test_web_mode_leaves_skeleton_to_the_overlay():
+    green = COLORS_BGR["green"]
+    workspace = FakeWorkspace(keypoints=[person_keypoints(350, 250, 0.9)])
+    panel = {"camera": "c", "frame": 0, "box": [300, 100, 400, 400], "highlight": ["c/0/0"], "others": False,
+             "label": ""}
+    bare = decode(render_panel(workspace, panel, max_side=600, skeletons=False))
+    assert coloured_pixels(bare[:-40], green) == 0
+    overlay = render.panel_overlay(workspace, panel, max_side=600)
+    assert overlay["color"] == "#5ae65a" and overlay["bones"] == render.SKELETON
+    assert overlay["size"] == [bare.shape[1], bare.shape[0]]
+    (skeleton,) = overlay["skeletons"]
+    assert not skeleton["dashed"] and len(skeleton["joints"]) == 17
+    assert all(0 <= v <= 1 for joint in skeleton["joints"] for v in joint)
+    weak = FakeWorkspace(keypoints=[person_keypoints(350, 250, 0.29)])
+    render.clear_cache()
+    assert render.panel_overlay(weak, panel, max_side=600)["skeletons"] == []  # same 0.3 peak gate
+
+
 def test_others_drawn_faintly_only_when_requested():
     boxes = [(300, 100, 400, 400, 0.9), (500, 120, 600, 420, 0.8)]
     keypoints = [person_keypoints(350, 250, 0.9), person_keypoints(550, 270, 0.9)]

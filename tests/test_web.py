@@ -249,6 +249,9 @@ def test_panel_endpoint_returns_jpeg_or_placeholder(env):
     assert response.status_code == 200 and response.headers["content-type"] == "image/jpeg"
     assert response.headers.get("x-render-error")
     assert client.get(url("/panel"), params={"spec": "{not json"}).status_code == 422
+    overlay = client.get(url("/panel_overlay"), params={"spec": spec, "w": 300})
+    assert overlay.status_code == 200 and overlay.json()["skeletons"] == []  # failed render: nothing to draw
+    assert client.get(url("/panel_overlay"), params={"spec": "{not json"}).status_code == 422
 
 
 def test_pages_and_static(env):

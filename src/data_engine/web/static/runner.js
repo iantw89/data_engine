@@ -1,5 +1,5 @@
 // Task runner: one task at a time, keyboard first, images load progressively.
-import { h, setChildren, api, ApiError, panelUrl, toast, setCrumbs, reviewer, fmtDuration } from './util.js';
+import { h, setChildren, api, ApiError, panelUrl, panelOverlayUrl, toast, setCrumbs, reviewer, fmtDuration } from './util.js';
 
 const PREF = {
   get(key, fallback) { try { const v = localStorage.getItem(`de.${key}`); return v === null ? fallback : JSON.parse(v); } catch (_) { return fallback; } },
@@ -312,61 +312,162 @@ function hideLens() { if (lensNode) { lensNode.remove(); lensNode = null; } }
 
 function closeLightbox() { if (lightbox) { lightbox.remove(); lightbox = null; } }
 
+// The lightbox has no magnifier, so in both crop and room view the skeleton hides while the cursor is over it.
 function openLightbox(ctx, panel, full) {
   closeLightbox();
   let showFull = full;
   const img = h('img', { alt: 'Enlarged evidence image' });
-  const set = () => { img.src = panelUrl(ctx.id, panel, { w: showFull ? 2400 : 1800, full: showFull }); toggle.textContent = showFull ? 'Show crop' : 'Show room'; };
+  const layer = skeletonLayer(img);
+  const stage = h('div', { class: 'lightbox-stage' }, img, layer.svg);
+  const set = () => {
+    const opts = { w: showFull ? 2400 : 1800, full: showFull };
+    layer.load(panelOverlayUrl(ctx.id, panel, opts));
+    img.onload = () => layer.ready();
+    img.src = panelUrl(ctx.id, panel, opts);
+    toggle.textContent = showFull ? 'Show crop' : 'Show room';
+  };
   const toggle = h('button', { type: 'button', class: 'btn small', onclick: (e) => { e.stopPropagation(); showFull = !showFull; set(); } });
+  stage.addEventListener('mousemove', (e) => layer.setHidden(layer.over(e.clientX, e.clientY)));
+  stage.addEventListener('mouseleave', () => layer.setHidden(false));
   lightbox = h('div', { class: 'overlay lightbox', role: 'dialog', 'aria-label': 'Enlarged image', onclick: closeLightbox },
     h('div', { class: 'lightbox-bar' }, h('span', {}, `${panel.camera}  frame ${panel.frame} ${panel.label || ''}`), toggle,
-      h('button', { type: 'button', class: 'btn small', onclick: closeLightbox }, 'Close (Esc)')), img);
+      h('button', { type: 'button', class: 'btn small', onclick: closeLightbox }, 'Close (Esc)')), stage);
   set();
   document.body.append(lightbox);
+}
+
+// ---- skeleton overlay: panel images are skeleton-free and the skeletons are SVG, so hovering can hide them.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs) { const n = document.createElementNS(SVG_NS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; }
+
+// Same look as render.draw_skeleton: dark halo under a thin coloured line, dots at joints, dashed for projections.
+function drawSkeletons(svg, overlay) {
+  svg.replaceChildren();
+  const [W, H] = overlay.size || [1, 1];
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const t = overlay.thickness || 1, r = overlay.radius || 2, color = overlay.color || '#5ae65a', halo = '#141414';
+  for (const sk of overlay.skeletons || []) {
+    const P = sk.joints.map((j) => (j ? [j[0] * W, j[1] * H] : null));
+    const dash = sk.dashed ? { 'stroke-dasharray': '9 6' } : {};
+    for (const [stroke, width] of [[halo, t + 2], [color, t]]) {
+      for (const [a, b] of overlay.bones || []) {
+        if (P[a] && P[b]) svg.append(svgEl('line', { x1: P[a][0], y1: P[a][1], x2: P[b][0], y2: P[b][1], stroke, 'stroke-width': width, ...dash }));
+      }
+    }
+    for (const p of P) {
+      if (!p) continue;
+      if (sk.dashed) {
+        svg.append(svgEl('circle', { cx: p[0], cy: p[1], r: r + 1, fill: 'none', stroke: halo, 'stroke-width': 1 }));
+        svg.append(svgEl('circle', { cx: p[0], cy: p[1], r, fill: 'none', stroke: color, 'stroke-width': 1 }));
+      } else {
+        svg.append(svgEl('circle', { cx: p[0], cy: p[1], r: r + 1, fill: halo }));
+        svg.append(svgEl('circle', { cx: p[0], cy: p[1], r, fill: color }));
+      }
+    }
+  }
+}
+
+// Joint bounding boxes ([x0, y0, x1, y1] fractions); "over the skeleton" means inside one (plus a margin).
+function skeletonBoxes(overlay) {
+  return (overlay.skeletons || []).map((sk) => {
+    const js = sk.joints.filter(Boolean);
+    if (!js.length) return null;
+    const xs = js.map((j) => j[0]), ys = js.map((j) => j[1]);
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  }).filter(Boolean);
+}
+
+// An SVG skeleton layer kept exactly over ``img`` (same offset parent). load() fetches the geometry, ready()
+// reveals it once the image is shown, over() says whether a client point is on a skeleton (box + margin).
+function skeletonLayer(img) {
+  const svg = svgEl('svg', { class: 'skel pending', 'aria-hidden': 'true', preserveAspectRatio: 'none' });
+  const layer = { svg, overlay: { skeletons: [] }, boxes: [], hidden: false, token: 0 };
+  layer.place = () => {
+    svg.style.left = `${img.offsetLeft}px`; svg.style.top = `${img.offsetTop}px`;
+    svg.style.width = `${img.offsetWidth}px`; svg.style.height = `${img.offsetHeight}px`;
+  };
+  if (window.ResizeObserver) new ResizeObserver(layer.place).observe(img);
+  layer.load = (url) => {
+    const t = ++layer.token;
+    svg.classList.add('pending'); svg.replaceChildren(); layer.overlay = { skeletons: [] }; layer.boxes = []; layer.setHidden(false);
+    fetch(url).then((r) => (r.ok ? r.json() : null)).then((data) => {
+      if (t !== layer.token || !data) return;
+      layer.overlay = data; layer.boxes = skeletonBoxes(data); drawSkeletons(svg, data);
+    }).catch(() => { /* no overlay: the image alone is still useful */ });
+    return t;
+  };
+  layer.ready = () => { layer.place(); svg.classList.remove('pending'); };
+  layer.setHidden = (value) => { layer.hidden = value; svg.classList.toggle('hidden', value); };
+  layer.over = (clientX, clientY, pad = 14) => {
+    const r = img.getBoundingClientRect();
+    const x = clientX - r.left, y = clientY - r.top;
+    if (x < 0 || y < 0 || x > r.width || y > r.height) return false;
+    return layer.boxes.some(([x0, y0, x1, y1]) => x >= x0 * r.width - pad && x <= x1 * r.width + pad && y >= y0 * r.height - pad && y <= y1 * r.height + pad);
+  };
+  return layer;
 }
 
 function panelFigure(ctx, panel, o = {}) {
   const lo = o.lo || 480, hi = o.hi || 800;
   let full = ctx.context, token = 0;
   const img = h('img', { alt: `${panel.camera} frame ${panel.frame}${panel.label ? ', ' + panel.label : ''}`, draggable: 'false', class: 'loading' });
+  const layer = skeletonLayer(img), svg = layer.svg;
   const roomBtn = h('button', { type: 'button', class: 'fig-btn', title: 'Toggle room view for this image', 'aria-label': 'Toggle room view for this image', 'aria-pressed': String(full),
     onclick: (e) => { e.stopPropagation(); fig.setFull(!full); } }, '▣');
   const zoomBtn = h('button', { type: 'button', class: 'fig-btn zoom', title: 'Enlarge', 'aria-label': 'Enlarge image', onclick: (e) => { e.stopPropagation(); openLightbox(ctx, panel, full); } }, '⤢');
-  const fig = h('figure', { class: `pfig ${o.cls || ''}` }, img, o.noButtons ? null : [roomBtn, zoomBtn]);
+  const fig = h('figure', { class: `pfig ${o.cls || ''}` }, img, svg, o.noButtons ? null : [roomBtn, zoomBtn]);
 
   function load() {
     const t = ++token;
     const scale = full ? 1.5 : 1;
-    const loUrl = panelUrl(ctx.id, panel, { w: Math.round((o.lo || lo) * scale), full });
+    const loW = Math.round((o.lo || lo) * scale);
+    const loUrl = panelUrl(ctx.id, panel, { w: loW, full });
     const hiUrl = hi > lo ? panelUrl(ctx.id, panel, { w: Math.round(hi * scale), full }) : null;
     img.classList.add('loading'); img.classList.remove('failed'); img.dataset.res = 'lo';
+    layer.load(panelOverlayUrl(ctx.id, panel, { w: loW, full }));
     const pre = new Image();
     pre.onload = () => { if (t === token) { img.dataset.res = 'hi'; img.src = hiUrl; } };
-    img.onload = () => { img.classList.remove('loading'); if (img.dataset.res === 'lo' && t === token && hiUrl) pre.src = hiUrl; };
+    img.onload = () => {
+      img.classList.remove('loading'); layer.place();
+      if (t === token) layer.ready();
+      if (img.dataset.res === 'lo' && t === token && hiUrl) pre.src = hiUrl;
+    };
     img.onerror = () => { img.classList.remove('loading'); img.classList.add('failed'); };
     img.src = loUrl;
   }
   fig.setFull = (value) => { if (value === full) return; full = value; roomBtn.setAttribute('aria-pressed', String(full)); fig.classList.toggle('room', full); load(); };
   if (full) fig.classList.add('room');
 
-  if (!o.noLens) {
-    fig.addEventListener('mousemove', (e) => {
-      if (!ctx.lens || !img.complete || img.classList.contains('loading') || img.classList.contains('failed') || e.target.closest('.fig-btn')) return hideLens();
-      const r = img.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      if (x < 0 || y < 0 || x > r.width || y > r.height) return hideLens();
-      const Z = 2.6, size = 230;
-      if (!lensNode) { lensNode = h('div', { class: 'lens', 'aria-hidden': 'true' }); document.body.append(lensNode); }
-      const zoomUrl = panelUrl(ctx.id, panel, { w: 1800, full });
-      if (lensNode.dataset.src !== zoomUrl) { lensNode.dataset.src = zoomUrl; lensNode.style.backgroundImage = `url("${zoomUrl}")`; }
-      lensNode.style.backgroundSize = `${r.width * Z}px ${r.height * Z}px`;
-      lensNode.style.backgroundPosition = `${-(x * Z - size / 2)}px ${-(y * Z - size / 2)}px`;
-      const left = e.clientX + 28 + size > innerWidth ? e.clientX - 28 - size : e.clientX + 28;
-      const top = Math.min(Math.max(8, e.clientY - size / 2), innerHeight - size - 8);
-      lensNode.style.left = `${left}px`; lensNode.style.top = `${top}px`;
-    });
-    fig.addEventListener('mouseleave', hideLens);
-  }
+  fig.addEventListener('mousemove', (e) => {
+    const r = img.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    const inside = x >= 0 && y >= 0 && x <= r.width && y <= r.height && !e.target.closest('.fig-btn');
+    // Room view: hide the skeleton only while the cursor is over it. Crops keep it; their magnifier is bare.
+    if (full) layer.setHidden(inside && layer.over(e.clientX, e.clientY));
+    if (o.noLens) return;
+    if (!ctx.lens || !inside || !img.complete || img.classList.contains('loading') || img.classList.contains('failed')) return hideLens();
+    const Z = 2.6, size = 230;
+    if (!lensNode) { lensNode = h('div', { class: 'lens', 'aria-hidden': 'true' }); document.body.append(lensNode); }
+    const zoomUrl = panelUrl(ctx.id, panel, { w: 1800, full });
+    if (lensNode.dataset.src !== zoomUrl) { lensNode.dataset.src = zoomUrl; lensNode.style.backgroundImage = `url("${zoomUrl}")`; }
+    const ox = -(x * Z - size / 2), oy = -(y * Z - size / 2);
+    lensNode.style.backgroundSize = `${r.width * Z}px ${r.height * Z}px`;
+    lensNode.style.backgroundPosition = `${ox}px ${oy}px`;
+    // Room view: the magnifier mirrors the image (skeleton shown unless the cursor is over it).
+    let lensSvg = lensNode.firstChild;
+    const overlay = layer.overlay;
+    if (full && !layer.hidden && overlay.skeletons && overlay.skeletons.length) {
+      if (!lensSvg || lensSvg._overlay !== overlay) {
+        lensSvg = svgEl('svg', { class: 'skel', preserveAspectRatio: 'none' }); lensSvg._overlay = overlay;
+        drawSkeletons(lensSvg, overlay); lensNode.replaceChildren(lensSvg);
+      }
+      Object.assign(lensSvg.style, { left: `${ox}px`, top: `${oy}px`, width: `${r.width * Z}px`, height: `${r.height * Z}px` });
+    } else if (lensSvg) lensNode.replaceChildren();
+    const left = e.clientX + 28 + size > innerWidth ? e.clientX - 28 - size : e.clientX + 28;
+    const top = Math.min(Math.max(8, e.clientY - size / 2), innerHeight - size - 8);
+    lensNode.style.left = `${left}px`; lensNode.style.top = `${top}px`;
+  });
+  fig.addEventListener('mouseleave', () => { layer.setHidden(false); if (!o.noLens) hideLens(); });
   if (o.clickZoom !== false) fig.addEventListener('click', () => openLightbox(ctx, panel, full));
   ctx.figures.add(fig);
   load();
@@ -656,10 +757,13 @@ function buildReference(ctx, task, sizes) {
   });
   const verdictBtns = mode !== 'person' ? [] : [['person', 'Real person', 'same'], ['not_person', 'Not a person', 'different'], ['unsure', 'Unsure', 'unsure']].map(([v, label, cls]) =>
     h('button', { type: 'button', class: `choice ${cls}`, 'aria-pressed': 'false', dataset: { value: v }, onclick: () => { s.verdict = s.verdict === v ? null : v; refresh(); } }, label));
+  // Better, in order: the box holds the whole person and no one else; then, if both do, the better keypoints.
+  const betterHint = '1. Whole person in the box, no one else · 2. If both, better keypoints · Keypoints still wrong? Also flag Bad pose (P)';
   const betterBtns = mode !== 'duplicate' || !ids.length ? [] : [[refId, `${refId} is better`], [ids[0], `${ids[0]} is better`], ['equal', 'No difference']].map(([v, label]) =>
-    h('button', { type: 'button', class: 'choice better', 'aria-pressed': 'false', dataset: { value: v }, onclick: () => { s.better = v; refresh(); } }, label));
-  const betterRow = betterBtns.length ? h('div', { class: 'better-row' }, h('span', {}, 'They are one person. Which pose should be used?'),
-    h('div', { class: 'seg', role: 'group', 'aria-label': 'Which pose is better' }, betterBtns)) : null;
+    h('button', { type: 'button', class: 'choice better', 'aria-pressed': 'false', title: betterHint, dataset: { value: v }, onclick: () => { s.better = v; refresh(); } }, label));
+  const betterRow = betterBtns.length ? h('div', { class: 'better-row' }, h('span', {}, 'They are one person. Which is better?'),
+    h('div', { class: 'seg', role: 'group', 'aria-label': 'Which pose is better' }, betterBtns),
+    h('div', { class: 'better-hint muted' }, betterHint)) : null;
   const beforeBtns = !otherBefore ? [] : [['same', 'Same person', 'same'], ['different', 'Someone else', 'different'], ['unsure', 'Unsure', 'unsure']].map(([v, label, cls]) =>
     h('button', { type: 'button', class: `choice ${cls}`, 'aria-pressed': 'false', dataset: { value: v }, onclick: () => { s.otherBefore = s.otherBefore === v ? null : v; refresh(); } }, label));
   const beforeRow = beforeBtns.length ? h('div', { class: 'better-row' }, h('span', {}, `${refId} is both candidates. Did track ${otherBefore.track} show this person before the moment too (these images)?`),

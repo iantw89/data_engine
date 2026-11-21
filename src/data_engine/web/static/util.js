@@ -56,8 +56,15 @@ export async function api(path, options = {}) {
   return data;
 }
 
-export function panelUrl(datasetId, panel, { w = 720, full = false } = {}) {
-  return `/api/datasets/${encodeURIComponent(datasetId)}/panel?spec=${encodeURIComponent(JSON.stringify(panel))}&full=${full ? 1 : 0}&w=${w}`;
+// Panel images come without skeletons by default: panelFigure draws them from panelOverlayUrl so it can
+// hide them on hover. Pass skeletons: true for an image with the skeletons burned in.
+export function panelUrl(datasetId, panel, { w = 720, full = false, skeletons = false } = {}) {
+  return `/api/datasets/${encodeURIComponent(datasetId)}/panel?spec=${encodeURIComponent(JSON.stringify(panel))}&full=${full ? 1 : 0}&w=${w}&skeletons=${skeletons ? 1 : 0}`;
+}
+
+// Skeleton geometry for a panel image: joints as fractions of the image plus the stroke style.
+export function panelOverlayUrl(datasetId, panel, { w = 720, full = false } = {}) {
+  return `/api/datasets/${encodeURIComponent(datasetId)}/panel_overlay?spec=${encodeURIComponent(JSON.stringify(panel))}&full=${full ? 1 : 0}&w=${w}`;
 }
 
 // ---- formatting

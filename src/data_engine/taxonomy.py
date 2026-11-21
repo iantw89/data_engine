@@ -239,7 +239,7 @@ TASK_TYPES: dict[str, TaskType] = {task.name: task for task in [
         "reference_candidates",
         {"images": "{detection key: {'exclude': ..., 'bad_pose': bool}}",
          "candidates": "{'B': 'same' (one person) | 'different' (two people) | 'unsure'}",
-         "better": "'A' | 'B' | 'equal' - which pose to use when they are one person", "notes": "str"},
+         "better": "'A' | 'B' | 'equal' - when one person, which to use: first the box holding the whole person and no one else, then better keypoints; still-wrong keypoints go in bad_pose", "notes": "str"},
         ("duplicate", "different", "not_person", "bad_pose"),
         "Duplicate/mixed-pose labels tune the near-identical-pose suppression threshold."),
     TaskType(

@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config import Site, load_site
 from ..engine import STAGES, Engine
-from ..render import error_image, render_panel
+from ..render import error_image, panel_overlay, render_panel
 from ..taxonomy import ANSWER_MODEL, IMAGE_FLAGS, KINDS, TASK_TYPES, UI_KINDS
 from ..workspace import Workspace, list_workspaces
 from .validate import AnswerError, validate_answer
@@ -359,22 +359,36 @@ def create_app(site: Site | None = None) -> FastAPI:
         return {"task": _task_detail(workspace, db.task(task_id)), "remaining_by_type": _open_by_type(workspace)}
 
     # ------------------------------------------------------------------ panels
-    @app.get("/api/datasets/{dataset_id}/panel")
-    def panel(dataset_id: str, spec: str, full: int = 0, w: int = Query(720, ge=64, le=4096),
-              _workspace: Workspace = WS) -> Response:
+    def _panel_spec(spec: str) -> dict:
         try:
             parsed = json.loads(spec)
             if not isinstance(parsed, dict) or "camera" not in parsed or "frame" not in parsed:
                 raise ValueError("spec needs camera and frame")
         except (json.JSONDecodeError, ValueError) as exc:
             raise HTTPException(422, f"bad panel spec: {exc}") from exc
+        return parsed
+
+    @app.get("/api/datasets/{dataset_id}/panel")
+    def panel(dataset_id: str, spec: str, full: int = 0, w: int = Query(720, ge=64, le=4096), skeletons: int = 1,
+              _workspace: Workspace = WS) -> Response:
+        parsed = _panel_spec(spec)
         try:
-            data = render_panel(registry.get(dataset_id), parsed, max_side=w, full=bool(full))
+            data = render_panel(registry.get(dataset_id), parsed, max_side=w, full=bool(full), skeletons=bool(skeletons))
         except Exception as exc:
             # A placeholder (not a 5xx) keeps the review screen usable; never cached.
             return Response(error_image(f"{type(exc).__name__}: {exc}"), media_type="image/jpeg",
                             headers={"Cache-Control": "no-store", "X-Render-Error": type(exc).__name__})
         return Response(data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/datasets/{dataset_id}/panel_overlay")
+    def panel_overlay_route(dataset_id: str, spec: str, full: int = 0, w: int = Query(720, ge=64, le=4096),
+                            _workspace: Workspace = WS) -> dict:
+        """Skeleton geometry for a panel; the UI draws it over the skeleton-free image and hides it on hover."""
+        parsed = _panel_spec(spec)
+        try:
+            return panel_overlay(registry.get(dataset_id), parsed, max_side=w, full=bool(full))
+        except Exception:
+            return {"skeletons": []}  # the image shows the render error; nothing to draw
 
     # ------------------------------------------------------------------ unknowns / constraints
     @app.get("/api/datasets/{dataset_id}/unknowns")

@@ -184,7 +184,7 @@ def make_tasks(workspace: Workspace, round_number: int, rng: random.Random) -> l
             "reference": {"id": "A", "caption": "pose A", "panels": [panel(a, "A", "green")]},
             "candidates": [{"id": "B", "caption": "pose B", "panels": [panel(b, "B", "magenta")], "track": None}],
             "answer_model": 2, "mode": "duplicate", "single_choice": True,
-            "texts": {"same": "One person with two poses: the better pose is used, the other is kept as its duplicate.",
+            "texts": {"same": "One person with two poses: the better one is used, the other is kept as its duplicate.",
                       "different": "Two people: the two poses are kept apart."}}, priority=3 - n)
 
     # visibility check (decision)

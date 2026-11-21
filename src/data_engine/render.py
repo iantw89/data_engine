@@ -29,7 +29,7 @@ PADDING = 0.25
 MAX_UPSCALE = 4.0
 CACHE_ITEMS = 256
 
-_cache: "OrderedDict[str, bytes]" = OrderedDict()
+_cache: "OrderedDict[str, tuple[bytes, dict]]" = OrderedDict()
 _cache_lock = threading.Lock()
 _inflight: dict[str, threading.Lock] = {}
 
@@ -145,7 +145,22 @@ def _rect(canvas, corners, color, thickness) -> None:
     cv2.rectangle(canvas, _ipt(corners[0]), _ipt(corners[1]), color, thickness, cv2.LINE_AA)
 
 
-def _render(workspace, panel: dict, max_side: int, full: bool) -> bytes:
+def _skeleton_geometry(points: np.ndarray, out_w: int, out_h: int, *, dashed: bool,
+                       min_conf: float = JOINT_PEAK) -> dict | None:
+    """A skeleton for the web overlay: joints as [x, y] fractions of the image, ``None`` where not drawn."""
+    points = np.asarray(points, float)
+    ok = np.isfinite(points[:, :2]).all(axis=1)
+    if points.shape[1] >= 3:
+        ok &= points[:, 2] >= min_conf
+    if not ok.any():
+        return None
+    joints = [[round(float(p[0]) / out_w, 5), round(float(p[1]) / out_h, 5)] if good else None
+              for p, good in zip(points, ok)]
+    return {"joints": joints, "dashed": bool(dashed)}
+
+
+def _render(workspace, panel: dict, max_side: int, full: bool, skeletons: bool = True) -> tuple[bytes, dict]:
+    """JPEG bytes plus the skeleton overlay geometry; ``skeletons=False`` leaves them off the JPEG."""
     camera, frame = panel["camera"], int(panel["frame"])
     color = COLORS_BGR.get(panel.get("color", "green"), COLORS_BGR["green"])
     image = np.asarray(workspace.frames.read(camera, frame))
@@ -163,6 +178,17 @@ def _render(workspace, panel: dict, max_side: int, full: bool) -> bytes:
     def to_out(points):
         return (np.asarray(points, float) - [x0, y0]) * scale
 
+    blue, green, red = color
+    overlay = {"size": [out_w, out_h], "color": f"#{red:02x}{green:02x}{blue:02x}", "thickness": thickness,
+               "radius": radius, "bones": SKELETON, "skeletons": []}
+
+    def skeleton(points, dashed=False):
+        geometry = _skeleton_geometry(points, out_w, out_h, dashed=dashed)
+        if geometry is not None:
+            overlay["skeletons"].append(geometry)
+        if skeletons:
+            draw_skeleton(canvas, points, color, thickness=thickness, radius=radius, dashed=dashed)
+
     highlight = list(panel.get("highlight") or [])
     own_rows: set[int] = set()
     for key in highlight:  # measured keypoints of the highlighted detections
@@ -175,8 +201,7 @@ def _render(workspace, panel: dict, max_side: int, full: bool) -> bytes:
             own_rows.add(int(index))
         if whole:  # a thin own-colour outline locates the person in the full frame
             _rect(canvas, to_out([[det_box[0], det_box[1]], [det_box[2], det_box[3]]]), color, 1)
-        draw_skeleton(canvas, np.concatenate([to_out(keypoints[:, :2]), keypoints[:, 2:3]], axis=1), color,
-                      thickness=thickness, radius=radius)
+        skeleton(np.concatenate([to_out(keypoints[:, :2]), keypoints[:, 2:3]], axis=1))
 
     if panel.get("others", True):
         try:
@@ -198,7 +223,7 @@ def _render(workspace, panel: dict, max_side: int, full: bool) -> bytes:
     for track_id in panel.get("project") or []:
         pose = _project_pose(workspace, int(track_id), camera, frame)
         if pose is not None and pose.ndim == 2 and pose.shape[0] == 17:
-            draw_skeleton(canvas, to_out(pose[:, :2]), color, thickness=thickness, radius=radius, dashed=True)
+            skeleton(to_out(pose[:, :2]), dashed=True)
 
     font_scale = 0.45 + side / 1800
     label = str(panel.get("label") or "")
@@ -208,13 +233,29 @@ def _render(workspace, panel: dict, max_side: int, full: bool) -> bytes:
     ok, encoded = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 86])
     if not ok:
         raise RuntimeError("JPEG encoding failed")
-    return encoded.tobytes()
+    return encoded.tobytes(), overlay
 
 
-def render_panel(workspace, panel: dict[str, Any], *, max_side: int = 720, full: bool = False) -> bytes:
-    """JPEG bytes for ``panel``; identical requests are served from an in-memory LRU (thread safe)."""
+def render_panel(workspace, panel: dict[str, Any], *, max_side: int = 720, full: bool = False,
+                 skeletons: bool = True) -> bytes:
+    """JPEG bytes for ``panel``; identical requests are served from an in-memory LRU (thread safe).
+
+    The web UI asks for ``skeletons=False`` and draws them itself from :func:`panel_overlay`, so it can
+    hide them while the reviewer looks at the person.
+    """
+    return _render_cached(workspace, panel, max_side, full, skeletons)[0]
+
+
+def panel_overlay(workspace, panel: dict[str, Any], *, max_side: int = 720, full: bool = False) -> dict:
+    """Skeletons of ``panel`` as JSON-able geometry: joints in image fractions plus the stroke style
+    (``thickness`` / ``radius`` in pixels of an image ``size`` wide) that :func:`draw_skeleton` uses."""
+    return _render_cached(workspace, panel, max_side, full, False)[1]
+
+
+def _render_cached(workspace, panel: dict, max_side: int, full: bool, skeletons: bool) -> tuple[bytes, dict]:
     max_side = int(max(64, min(max_side, 4096)))
-    key = json.dumps([panel, max_side, bool(full), getattr(workspace, "dataset_id", "")], sort_keys=True, default=str)
+    key = json.dumps([panel, max_side, bool(full), bool(skeletons), getattr(workspace, "dataset_id", "")],
+                     sort_keys=True, default=str)
     with _cache_lock:
         hit = _cache.get(key)
         if hit is not None:
@@ -226,7 +267,7 @@ def render_panel(workspace, panel: dict[str, Any], *, max_side: int = 720, full:
             hit = _cache.get(key)
         if hit is None:
             try:
-                hit = _render(workspace, panel, max_side, bool(full))
+                hit = _render(workspace, panel, max_side, bool(full), bool(skeletons))
             finally:
                 with _cache_lock:
                     _inflight.pop(key, None)

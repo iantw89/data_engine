@@ -255,7 +255,7 @@ def ownership_task(context: Context, unknown: dict) -> tuple[str, dict]:
                               "panels": [panel(context, second, label="B", color="magenta")]}]
     payload["reference_keys"] = [first]
     answers(payload, "duplicate",
-            same="One person with two poses: the better pose is used, the other is kept as its duplicate.",
+            same="One person with two poses: the better one is used, the other is kept as its duplicate.",
             different="Two people: the two poses are kept apart.")
     return "pose_ownership", payload
 
